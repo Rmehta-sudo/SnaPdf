@@ -60,7 +60,8 @@ This is the compact entry point for the project. Keep current truth here; route 
   temporary hover cards and click-pinned cards; the Eraser uses a dedicated cursor. Recents is a
   persistent collapsible section and remains startup-frozen.
 - Search is a VS Code-style sidebar view. Contents nodes support individual disclosure controls plus
-  Collapse all/Expand all. Pinch zoom changes only the PDF canvas.
+  Collapse all/Expand all. Physical trackpad pinch changes only the PDF canvas, using native zoom
+  events where available and Ubuntu X11 precision-touchpad gesture events otherwise.
 - An explicit confirmed Save-to-PDF action can persist overlays into the source after creating a
   timestamped backup; normal annotation editing remains non-destructive by default.
 - New highlights no longer retain the temporary blue selection overlay; highlight/comment context

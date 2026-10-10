@@ -162,6 +162,15 @@ beside the source, copies the original to a timestamped backup, and atomically r
 only after export succeeds. Highlight comments become highlight contents, freehand/signature paths
 become PDF path objects, and attachment references become PDF text annotations. Successful saving
 clears the now-embedded overlays before reopening the PDF to prevent double rendering.
+
+## BUG-004: PDF-only trackpad pinch was not recognized on the X11 desktop
+
+The workstation runs an X11 session, where winit does not provide the same dedicated pinch event
+available on Wayland. Ubuntu represents a physical precision-touchpad pinch as point-granularity
+wheel input with a synthetic modifier. Detect that signature alongside native `Event::Zoom`, apply
+it only while the pointer is in the PDF viewport, and exclude line-granularity mouse-wheel events.
+This preserves two-finger trackpad pinch without requiring the user to hold Ctrl and without scaling
+the sidebar or document chrome.
 # 2026-10-10 direct link hit testing and export boundary
 
 - PDF links are now resolved from the latest raw pointer position before the page tool interaction

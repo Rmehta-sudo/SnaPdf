@@ -121,3 +121,11 @@ completion evidence. Do not compare configurations as controlled unless their di
   includes highlights/comments, text, shapes/stamps, ink/signatures, and attachment references.
 - `cargo test --offline`: 12/12 passed. `cargo clippy --offline --all-targets -- -D warnings` passed.
   `cargo build --release --offline` passed; the installed default handler launched successfully.
+
+## 2026-10-11 X11 trackpad-pinch correction
+
+- Confirmed the live Ubuntu desktop uses X11, then added native pinch and X11 precision-touchpad
+  gesture handling scoped to the PDF viewport. Line-based mouse-wheel events remain excluded.
+- Added regression coverage for native pinch, X11 precision pinch, and mouse-wheel rejection.
+- `cargo test`: 14/14 passed. Strict Clippy and the optimized release build passed. The installed
+  binary was replaced and launched successfully on POEU Part I.

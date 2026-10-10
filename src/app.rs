@@ -2195,12 +2195,22 @@ impl CrispPdfApp {
                     return;
                 }
 
-                if ui.rect_contains_pointer(ui.max_rect()) {
-                    let pinch_zoom = ctx.input(|input| input.zoom_delta());
-                    if (pinch_zoom - 1.0).abs() > 0.001 {
-                        self.zoom = (self.zoom * pinch_zoom).clamp(0.2, 8.0);
-                        self.fit_width_requested = false;
-                    }
+                let viewer_rect = ui.clip_rect();
+                let (pointer_position, pinch_zoom) = ctx.input(|input| {
+                    (
+                        input
+                            .pointer
+                            .hover_pos()
+                            .or_else(|| input.pointer.interact_pos()),
+                        trackpad_pinch_factor(&input.events),
+                    )
+                });
+                let gesture_is_over_viewer =
+                    pointer_position.is_none_or(|position| viewer_rect.contains(position));
+                if gesture_is_over_viewer && (pinch_zoom - 1.0).abs() > 0.0001 {
+                    self.zoom = (self.zoom * pinch_zoom).clamp(0.2, 8.0);
+                    self.fit_width_requested = false;
+                    ctx.request_repaint();
                 }
 
                 let available_page_width = (ui.available_width() - 56.0).max(100.0);
@@ -4552,6 +4562,40 @@ fn chrome_zoom(document_zoom: f32, ratio: f32) -> f32 {
     (document_zoom * ratio).clamp(0.28, 5.0)
 }
 
+/// Return only zoom gestures produced by a physical trackpad/touch surface.
+///
+/// Wayland and some X11 drivers emit `Event::Zoom` directly. On X11, precision
+/// touchpad pinches are commonly represented as point-granularity wheel events
+/// with a synthetic Ctrl modifier. A real mouse wheel uses line granularity, so
+/// excluding it here keeps Ctrl+mouse-wheel out of this PDF-only gesture path.
+fn trackpad_pinch_factor(events: &[egui::Event]) -> f32 {
+    let mut native_factor = 1.0_f32;
+    let mut precision_scroll = 0.0_f32;
+
+    for event in events {
+        match event {
+            egui::Event::Zoom(factor) => native_factor *= *factor,
+            egui::Event::MouseWheel {
+                unit: egui::MouseWheelUnit::Point,
+                delta,
+                modifiers,
+                ..
+            } if modifiers.ctrl || modifiers.command => {
+                precision_scroll += delta.x + delta.y;
+            }
+            _ => {}
+        }
+    }
+
+    if (native_factor - 1.0).abs() > f32::EPSILON {
+        native_factor
+    } else if precision_scroll.abs() > f32::EPSILON {
+        (precision_scroll / 200.0).exp()
+    } else {
+        1.0
+    }
+}
+
 fn screen_point_to_pdf(point: egui::Pos2, page_rect: Rect, source_size: [f32; 2]) -> [f32; 2] {
     let x = ((point.x - page_rect.left()) / page_rect.width()).clamp(0.0, 1.0) * source_size[0];
     let y_from_top =
@@ -5369,5 +5413,34 @@ mod tests {
             annotation_at(&annotations, pos2(50.0, 80.0), page, [100.0, 100.0]),
             Some(10)
         );
+    }
+
+    #[test]
+    fn native_trackpad_pinch_changes_pdf_zoom() {
+        let factor = trackpad_pinch_factor(&[egui::Event::Zoom(1.25)]);
+        assert!((factor - 1.25).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn x11_precision_pinch_is_supported_but_mouse_wheel_is_not() {
+        let modifiers = Modifiers {
+            ctrl: true,
+            ..Default::default()
+        };
+        let precision_pinch = egui::Event::MouseWheel {
+            unit: egui::MouseWheelUnit::Point,
+            delta: vec2(0.0, 20.0),
+            phase: egui::TouchPhase::Move,
+            modifiers,
+        };
+        let mouse_wheel = egui::Event::MouseWheel {
+            unit: egui::MouseWheelUnit::Line,
+            delta: vec2(0.0, 3.0),
+            phase: egui::TouchPhase::Move,
+            modifiers,
+        };
+
+        assert!(trackpad_pinch_factor(&[precision_pinch]) > 1.0);
+        assert_eq!(trackpad_pinch_factor(&[mouse_wheel]), 1.0);
     }
 }

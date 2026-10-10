@@ -27,6 +27,8 @@ Use stable IDs, concise statements, status, one canonical destination, and inspe
 | BUG-003 | current | Highlight creation now clears its temporary blue text selection, and annotation hit regions prevent the page layer from stealing highlight/comment context clicks. | `topics/DECISIONS_AND_INCIDENTS.md` | User report and interaction fix, 2026-10-10 |
 | REQ-008 | current | The toolbar uses scrollable, separated path/action and tool rows; path breadcrumbs copy the full path directly; neutral browse mode has no visible Select button. | `topics/GOALS_AND_DOMAIN.md` | User request and implementation, 2026-10-10 |
 | RUN-005 | current | The annotation/chrome correction passed 11 tests, strict Clippy, and an optimized release build with visual QA at 140% UI scale. | `topics/RUNS_AND_RESULTS.md` | Local validation, 2026-10-10 |
+| BUG-004 | current | Physical trackpad pinch now uses native zoom events on Wayland and precision point-wheel gesture events on X11; line-based mouse-wheel input is excluded. | `topics/DECISIONS_AND_INCIDENTS.md` | User report and X11 backend inspection, 2026-10-11 |
+| RUN-006 | current | The trackpad-pinch correction passed 14 tests, strict Clippy, an optimized release build, install, and launch on the active POEU PDF. | `topics/RUNS_AND_RESULTS.md` | Local validation, 2026-10-11 |
 
 Statuses: `current`, `historical`, `superseded`, `unverified`, `transient`.
 Use prefixes appropriate to the project, for example `REQ`, `RUN`, `BUG`, `INF`, `ART`, `MEM`.
