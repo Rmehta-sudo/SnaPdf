@@ -64,6 +64,13 @@ struct SearchScanResult {
     matches: Vec<PdfFileSearchMatches>,
 }
 
+#[derive(Clone, Copy)]
+struct PinchAnchor {
+    page: usize,
+    fraction: egui::Vec2,
+    cursor: egui::Pos2,
+}
+
 fn poll_search_scan(receiver: &mut Option<Receiver<SearchScanResult>>) -> Option<SearchScanResult> {
     let result = match receiver.as_ref()?.try_recv() {
         Ok(result) => Some(result),
@@ -240,6 +247,7 @@ pub struct SnapPdfApp {
     vertical_arrow_hold: f32,
     horizontal_arrow_hold: f32,
     horizontal_page_repeat: f32,
+    project_shortcut_armed_until: Option<f64>,
     jump_to_page: Option<usize>,
     rename_target: Option<RenameTarget>,
     rename_buffer: String,
@@ -260,6 +268,8 @@ pub struct SnapPdfApp {
     toolbar_visible: bool,
     reader_mode: bool,
     presentation_mode: bool,
+    /// The document zoom to restore after leaving Reader or Presentation mode.
+    mode_zoom_restore: Option<f32>,
     outline: Vec<PdfOutlineItem>,
     collapsed_outline_items: HashSet<usize>,
     open_with_path: Option<PathBuf>,
@@ -270,13 +280,19 @@ pub struct SnapPdfApp {
     search_query: String,
     search_matches: Vec<PdfSearchMatch>,
     search_index: usize,
+    search_navigation_index: usize,
     search_request_id: u64,
     tab_search_matches: Vec<PdfFileSearchMatches>,
     workspace_search_matches: Vec<PdfFileSearchMatches>,
     tab_search_scan: Option<Receiver<SearchScanResult>>,
     workspace_search_scan: Option<Receiver<SearchScanResult>>,
+    search_current_expanded: bool,
+    search_tabs_expanded: bool,
+    search_project_expanded: bool,
     native_pinch: Option<crate::gestures::NativePinch>,
     pending_native_pinches: Vec<crate::gestures::NativePinchEvent>,
+    page_rects: Vec<(usize, Rect)>,
+    pinch_anchor: Option<PinchAnchor>,
     show_search: bool,
     print_dialog: Option<PrintDialog>,
     browser_directory: Option<PathBuf>,
@@ -338,6 +354,7 @@ impl SnapPdfApp {
             vertical_arrow_hold: 0.0,
             horizontal_arrow_hold: 0.0,
             horizontal_page_repeat: 0.0,
+            project_shortcut_armed_until: None,
             jump_to_page: None,
             rename_target: None,
             rename_buffer: String::new(),
@@ -358,6 +375,7 @@ impl SnapPdfApp {
             toolbar_visible: true,
             reader_mode: false,
             presentation_mode: false,
+            mode_zoom_restore: None,
             outline: Vec::new(),
             collapsed_outline_items: HashSet::new(),
             open_with_path: None,
@@ -368,13 +386,19 @@ impl SnapPdfApp {
             search_query: String::new(),
             search_matches: Vec::new(),
             search_index: 0,
+            search_navigation_index: 0,
             search_request_id: 0,
             tab_search_matches: Vec::new(),
             workspace_search_matches: Vec::new(),
             tab_search_scan: None,
             workspace_search_scan: None,
+            search_current_expanded: true,
+            search_tabs_expanded: false,
+            search_project_expanded: false,
             native_pinch: crate::gestures::listen(creation),
             pending_native_pinches: Vec::new(),
+            page_rects: Vec::new(),
+            pinch_anchor: None,
             show_search: false,
             print_dialog: None,
             browser_directory: None,
@@ -427,6 +451,7 @@ impl SnapPdfApp {
         self.text_selection = None;
         self.search_matches.clear();
         self.search_index = 0;
+        self.search_navigation_index = 0;
         self.annotation_undo.clear();
         self.annotation_redo.clear();
         self.tool_mode = ToolMode::Select;
@@ -1032,6 +1057,7 @@ impl SnapPdfApp {
         self.search_request_id = self.search_request_id.wrapping_add(1);
         self.search_matches.clear();
         self.search_index = 0;
+        self.search_navigation_index = 0;
         self.tab_search_matches.clear();
         self.workspace_search_matches.clear();
         if self.search_query.trim().is_empty() {
@@ -1044,6 +1070,7 @@ impl SnapPdfApp {
             request_id: self.search_request_id,
         });
         self.start_scoped_search(SearchScope::OpenTabs, ctx);
+        self.start_scoped_search(SearchScope::Workspace, ctx);
     }
 
     fn start_scoped_search(&mut self, scope: SearchScope, ctx: &egui::Context) {
@@ -1053,7 +1080,7 @@ impl SnapPdfApp {
         }
         let paths = match scope {
             SearchScope::OpenTabs => self.state.open_documents.clone(),
-            SearchScope::Workspace => self.workspace_pdf_paths(),
+            SearchScope::Workspace => self.current_project_pdf_paths(),
         };
         let (sender, receiver) = mpsc::channel();
         match scope {
@@ -1062,7 +1089,7 @@ impl SnapPdfApp {
         }
         let repaint = ctx.clone();
         std::thread::spawn(move || {
-            let matches = search_pdf_files(&paths, &query, 80).unwrap_or_default();
+            let matches = search_pdf_files(&paths, &query, 40).unwrap_or_default();
             let _ = sender.send(SearchScanResult {
                 scope,
                 query,
@@ -1072,70 +1099,167 @@ impl SnapPdfApp {
         });
     }
 
-    fn workspace_pdf_paths(&self) -> Vec<PathBuf> {
-        let mut roots = self
+    fn current_project_pdf_paths(&self) -> Vec<PathBuf> {
+        let Some(current) = self.current_path.as_ref() else {
+            return Vec::new();
+        };
+        let root = self
             .state
             .projects
             .iter()
+            .filter(|project| current.starts_with(&project.root))
+            .max_by_key(|project| project.root.components().count())
             .map(|project| project.root.clone())
+            .or_else(|| current.parent().map(Path::to_path_buf));
+        let Some(root) = root else {
+            return Vec::new();
+        };
+        let mut paths = WalkDir::new(root)
+            .follow_links(false)
+            .into_iter()
+            .filter_map(Result::ok)
+            .filter(|entry| entry.file_type().is_file() && is_pdf(entry.path()))
+            .map(|entry| entry.into_path())
             .collect::<Vec<_>>();
-        if let Some(workspace) = dirs::home_dir().map(|home| home.join("workspace"))
-            && workspace.is_dir()
-        {
-            roots.push(workspace);
-        }
-        let mut seen = HashSet::new();
-        let mut paths = Vec::new();
-        for root in roots {
-            for entry in WalkDir::new(root)
-                .follow_links(false)
-                .into_iter()
-                .filter_map(Result::ok)
-            {
-                let path = entry.path();
-                if entry.file_type().is_file() && is_pdf(path) && seen.insert(path.to_path_buf()) {
-                    paths.push(path.to_path_buf());
-                }
-            }
-        }
         paths.sort();
         paths
     }
 
-    fn step_search(&mut self, direction: isize) {
-        if self.search_matches.is_empty() {
+    fn apply_pinch_zoom(&mut self, factor: f32, cursor: Option<egui::Pos2>, ctx: &egui::Context) {
+        if (factor - 1.0).abs() <= 0.0001 {
             return;
         }
-        let len = self.search_matches.len() as isize;
-        self.search_index = (self.search_index as isize + direction).rem_euclid(len) as usize;
-        let result = &self.search_matches[self.search_index];
-        self.jump_to_page = Some(result.page_index);
+        if self.presentation_mode
+            && factor < 1.0
+            && self.zoom <= self.mode_zoom_restore.unwrap_or(self.zoom)
+        {
+            return;
+        }
+        self.pinch_anchor = cursor.and_then(|cursor| {
+            self.page_rects
+                .iter()
+                .find(|(_, rect)| rect.contains(cursor))
+                .map(|(page, rect)| PinchAnchor {
+                    page: *page,
+                    fraction: vec2(
+                        (cursor.x - rect.left()) / rect.width().max(1.0),
+                        (cursor.y - rect.top()) / rect.height().max(1.0),
+                    ),
+                    cursor,
+                })
+        });
+        let minimum = if self.presentation_mode {
+            self.mode_zoom_restore.unwrap_or(self.zoom)
+        } else {
+            0.2
+        };
+        self.zoom = (self.zoom * factor).clamp(minimum, 8.0);
+        self.fit_width_requested = false;
+        ctx.request_repaint();
+    }
+
+    fn step_search(&mut self, direction: isize) {
+        let mut targets = Vec::new();
+        if let Some(path) = self.current_path.as_ref() {
+            targets.extend(
+                self.search_matches
+                    .iter()
+                    .enumerate()
+                    .map(|(index, result)| (path.clone(), result.page_index, Some(index))),
+            );
+        }
+        for file in &self.tab_search_matches {
+            targets.extend(
+                file.matches
+                    .iter()
+                    .map(|result| (file.path.clone(), result.page_index, None)),
+            );
+        }
+        for file in &self.workspace_search_matches {
+            targets.extend(
+                file.matches
+                    .iter()
+                    .map(|result| (file.path.clone(), result.page_index, None)),
+            );
+        }
+        if targets.is_empty() {
+            return;
+        }
+        let len = targets.len() as isize;
+        self.search_navigation_index =
+            (self.search_navigation_index as isize + direction).rem_euclid(len) as usize;
+        let (path, page, current_match) = targets[self.search_navigation_index].clone();
+        if self.current_path.as_deref() == Some(path.as_path()) {
+            if let Some(index) = current_match {
+                self.search_index = index;
+            }
+            self.jump_to_page = Some(page);
+        } else {
+            self.open_document(path);
+            self.jump_to_page = Some(page);
+        }
         self.status = format!(
             "Match {} of {} · page {}",
-            self.search_index + 1,
-            self.search_matches.len(),
-            result.page_index + 1
+            self.search_navigation_index + 1,
+            targets.len(),
+            page + 1
         );
     }
 
+    fn search_navigation_len(&self) -> usize {
+        self.search_matches.len()
+            + self
+                .tab_search_matches
+                .iter()
+                .map(|file| file.matches.len())
+                .sum::<usize>()
+            + self
+                .workspace_search_matches
+                .iter()
+                .map(|file| file.matches.len())
+                .sum::<usize>()
+    }
+
     fn set_reader_mode(&mut self, enabled: bool) {
-        self.reader_mode = enabled;
-        self.sidebar_visible = !enabled;
-        self.toolbar_visible = !enabled;
+        if enabled {
+            if self.mode_zoom_restore.is_none() {
+                self.mode_zoom_restore = Some(self.zoom);
+            }
+            self.reader_mode = true;
+            self.sidebar_visible = false;
+            self.toolbar_visible = false;
+        } else if !self.presentation_mode {
+            self.reader_mode = false;
+            self.sidebar_visible = true;
+            self.toolbar_visible = true;
+            if let Some(zoom) = self.mode_zoom_restore.take() {
+                self.zoom = zoom;
+            }
+        }
     }
 
     fn set_presentation_mode(&mut self, ctx: &egui::Context, enabled: bool) {
-        self.presentation_mode = enabled;
         if enabled {
+            if self.mode_zoom_restore.is_none() {
+                self.mode_zoom_restore = Some(self.zoom);
+            }
+            self.presentation_mode = true;
             self.set_reader_mode(true);
         } else {
-            self.set_reader_mode(false);
+            self.presentation_mode = false;
+            self.reader_mode = false;
+            self.sidebar_visible = true;
+            self.toolbar_visible = true;
+            if let Some(zoom) = self.mode_zoom_restore.take() {
+                self.zoom = zoom;
+            }
         }
         ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(enabled));
     }
 
     fn keyboard_shortcuts(&mut self, ctx: &egui::Context) {
         let open = KeyboardShortcut::new(Modifiers::CTRL, Key::O);
+        let new_project_prefix = KeyboardShortcut::new(Modifiers::CTRL, Key::K);
         let zoom_in = KeyboardShortcut::new(Modifiers::CTRL, Key::Plus);
         let zoom_out = KeyboardShortcut::new(Modifiers::CTRL, Key::Minus);
         let copy = KeyboardShortcut::new(Modifiers::CTRL, Key::C);
@@ -1161,16 +1285,43 @@ impl SnapPdfApp {
             if exit {
                 self.set_presentation_mode(ctx, false);
             } else if previous {
-                self.jump_to_page = Some(self.current_page.saturating_sub(1));
+                self.current_page = self.current_page.saturating_sub(1);
+                self.jump_to_page = None;
             } else if next && !self.page_sizes.is_empty() {
-                self.jump_to_page =
-                    Some((self.current_page + 1).min(self.page_sizes.len().saturating_sub(1)));
+                self.current_page =
+                    (self.current_page + 1).min(self.page_sizes.len().saturating_sub(1));
+                self.jump_to_page = None;
             }
             return;
         }
 
+        if self.reader_mode
+            && ctx.input_mut(|input| input.consume_key(Modifiers::NONE, Key::Escape))
+        {
+            self.set_reader_mode(false);
+            return;
+        }
+
+        if ctx.input_mut(|input| input.consume_shortcut(&new_project_prefix)) {
+            self.project_shortcut_armed_until = Some(ctx.input(|input| input.time + 1.5));
+            self.status = "Ctrl+K pressed — press Ctrl+O to add a project folder.".to_owned();
+        }
+        let project_shortcut_armed = self
+            .project_shortcut_armed_until
+            .is_some_and(|until| ctx.input(|input| input.time) <= until);
         if ctx.input_mut(|input| input.consume_shortcut(&open)) {
-            self.open_file_dialog();
+            if project_shortcut_armed {
+                self.project_shortcut_armed_until = None;
+                self.add_project_dialog();
+            } else {
+                self.open_file_dialog();
+            }
+        }
+        if self
+            .project_shortcut_armed_until
+            .is_some_and(|until| ctx.input(|input| input.time) > until)
+        {
+            self.project_shortcut_armed_until = None;
         }
         if ctx.input_mut(|input| input.consume_shortcut(&zoom_in)) {
             let previous = self.state.ui_scale;
@@ -1934,7 +2085,7 @@ impl SnapPdfApp {
                                 Color32::TRANSPARENT
                             })
                             .corner_radius(CornerRadius::same(6))
-                            .inner_margin(Margin::symmetric(8, 4))
+                            .inner_margin(Margin::symmetric(6, 1))
                             .show(ui, |ui| {
                                 ui.horizontal(|ui| {
                                     if ui
@@ -1944,7 +2095,7 @@ impl SnapPdfApp {
                                                     &self.state.display_name(path),
                                                     28,
                                                 ))
-                                                .size(13.0),
+                                                .size(11.8),
                                             )
                                             .frame(false),
                                         )
@@ -1955,7 +2106,7 @@ impl SnapPdfApp {
                                     }
                                     if ui
                                         .add(
-                                            egui::Button::new(RichText::new("×").size(16.0))
+                                            egui::Button::new(RichText::new("×").size(12.5))
                                                 .frame(false),
                                         )
                                         .on_hover_text("Close tab")
@@ -1983,6 +2134,13 @@ impl SnapPdfApp {
     }
 
     fn search_sidebar(&mut self, ui: &mut egui::Ui) {
+        ScrollArea::vertical()
+            .id_salt("search-results-scroll")
+            .auto_shrink([false, false])
+            .show(ui, |ui| self.search_sidebar_contents(ui));
+    }
+
+    fn search_sidebar_contents(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
             ui.label(
                 RichText::new("SEARCH")
@@ -2008,35 +2166,25 @@ impl SnapPdfApp {
                 .hint_text("Search PDFs")
                 .margin(Margin::symmetric(8, 6)),
         );
-        // `lost_focus()` is not reliable here because egui keeps a single-line
-        // editor focused after submit. Consume Enter while this field owns focus.
-        let submit = response.has_focus()
-            && ui.input_mut(|input| input.consume_key(Modifiers::NONE, Key::Enter));
-        if submit {
+        if response.changed() {
             self.run_search(ui.ctx());
         }
-        ui.add_space(6.0);
+        // Enter remains a convenient explicit re-run, while each edit searches live.
+        if response.has_focus()
+            && ui.input_mut(|input| input.consume_key(Modifiers::NONE, Key::Enter))
+        {
+            self.run_search(ui.ctx());
+        }
         ui.horizontal(|ui| {
-            if ui.button("Search current + tabs").clicked() {
-                self.run_search(ui.ctx());
-            }
-            if ui.button("Search workspace").clicked() && !self.search_query.trim().is_empty() {
-                self.workspace_search_matches.clear();
-                self.start_scoped_search(SearchScope::Workspace, ui.ctx());
-            }
-        });
-        ui.horizontal(|ui| {
+            let has_navigation = self.search_navigation_len() > 0;
             if ui
-                .add_enabled(
-                    !self.search_matches.is_empty(),
-                    egui::Button::new("Previous"),
-                )
+                .add_enabled(has_navigation, egui::Button::new("Previous"))
                 .clicked()
             {
                 self.step_search(-1);
             }
             if ui
-                .add_enabled(!self.search_matches.is_empty(), egui::Button::new("Next"))
+                .add_enabled(has_navigation, egui::Button::new("Next"))
                 .clicked()
             {
                 self.step_search(1);
@@ -2045,66 +2193,73 @@ impl SnapPdfApp {
         ui.add_space(10.0);
         if self.search_query.trim().is_empty() {
             ui.label(
-                RichText::new("Search the current PDF and every open tab. Use Workspace only when you need every PDF beneath your workspace and project folders.")
-                    .size(12.0)
-                    .color(theme::MUTED),
+                RichText::new(
+                    "Results update as you type: current file, open tabs, and the current project.",
+                )
+                .size(12.0)
+                .color(theme::MUTED),
             );
             return;
         }
 
-        sidebar_section_header(
+        if collapsible_section_header(
             ui,
             "CURRENT FILE",
-            &format!("{} results", self.search_matches.len()),
-            theme::MUTED,
-        );
-        if self.search_matches.is_empty() {
-            ui.label(
-                RichText::new("No matches in the open PDF.")
-                    .size(12.0)
-                    .color(theme::MUTED),
-            );
-        } else {
-            let matches = self.search_matches.clone();
-            for (index, result) in matches.iter().enumerate() {
-                let response = search_result_row(
-                    ui,
-                    &format!("Page {}", result.page_index + 1),
-                    &result.excerpt,
-                    index == self.search_index,
+            self.search_matches.len(),
+            self.search_current_expanded,
+        )
+        .clicked()
+        {
+            self.search_current_expanded = !self.search_current_expanded;
+        }
+        if self.search_current_expanded {
+            if self.search_matches.is_empty() {
+                ui.label(
+                    RichText::new("No matches in the open PDF.")
+                        .size(12.0)
+                        .color(theme::MUTED),
                 );
-                if response.clicked() {
-                    self.search_index = index;
-                    self.jump_to_page = Some(result.page_index);
+            } else {
+                let matches = self.search_matches.clone();
+                for (index, result) in matches.iter().enumerate() {
+                    let response = search_result_row(
+                        ui,
+                        &format!("Page {}", result.page_index + 1),
+                        &result.excerpt,
+                        index == self.search_index,
+                    );
+                    if response.clicked() {
+                        self.search_index = index;
+                        self.jump_to_page = Some(result.page_index);
+                    }
                 }
             }
         }
 
-        ui.add_space(8.0);
+        ui.add_space(4.0);
         let tab_result_count = self
             .tab_search_matches
             .iter()
             .map(|result| result.matches.len())
             .sum::<usize>();
-        sidebar_section_header(
-            ui,
-            "OPEN TABS",
-            &format!("{} results", tab_result_count),
-            theme::MUTED,
-        );
-        if self.tab_search_scan.is_some() {
+        if collapsible_section_header(ui, "OPEN TABS", tab_result_count, self.search_tabs_expanded)
+            .clicked()
+        {
+            self.search_tabs_expanded = !self.search_tabs_expanded;
+        }
+        if self.search_tabs_expanded && self.tab_search_scan.is_some() {
             ui.label(
                 RichText::new("Searching open tabs...")
                     .size(12.0)
                     .color(theme::MUTED),
             );
-        } else if self.tab_search_matches.is_empty() {
+        } else if self.search_tabs_expanded && self.tab_search_matches.is_empty() {
             ui.label(
                 RichText::new("No matches in open tabs.")
                     .size(12.0)
                     .color(theme::MUTED),
             );
-        } else {
+        } else if self.search_tabs_expanded {
             let matches = self.tab_search_matches.clone();
             let mut activate = None;
             for file in &matches {
@@ -2130,33 +2285,35 @@ impl SnapPdfApp {
             }
         }
 
-        ui.add_space(8.0);
-        let workspace_result_count = self
+        ui.add_space(4.0);
+        let project_result_count = self
             .workspace_search_matches
             .iter()
             .map(|result| result.matches.len())
             .sum::<usize>();
-        sidebar_section_header(
+        if collapsible_section_header(
             ui,
-            "WORKSPACE",
-            &format!("{} results", workspace_result_count),
-            theme::MUTED,
-        );
-        if self.workspace_search_scan.is_some() {
+            "CURRENT PROJECT",
+            project_result_count,
+            self.search_project_expanded,
+        )
+        .clicked()
+        {
+            self.search_project_expanded = !self.search_project_expanded;
+        }
+        if self.search_project_expanded && self.workspace_search_scan.is_some() {
             ui.label(
-                RichText::new("Searching workspace PDFs...")
+                RichText::new("Searching project PDFs...")
                     .size(12.0)
                     .color(theme::MUTED),
             );
-        } else if self.workspace_search_matches.is_empty() {
+        } else if self.search_project_expanded && self.workspace_search_matches.is_empty() {
             ui.label(
-                RichText::new(
-                    "Use Search workspace to include nested PDFs in your workspace and projects.",
-                )
-                .size(12.0)
-                .color(theme::MUTED),
+                RichText::new("No matches in the current project.")
+                    .size(12.0)
+                    .color(theme::MUTED),
             );
-        } else {
+        } else if self.search_project_expanded {
             let matches = self.workspace_search_matches.clone();
             let mut activate = None;
             for file in &matches {
@@ -2191,13 +2348,11 @@ impl SnapPdfApp {
             .frame(
                 Frame::new()
                     .fill(theme::PANEL_BG)
-                    .inner_margin(Margin::symmetric(12, 7)),
+                    .inner_margin(Margin::symmetric(8, 1)),
             )
             .show(root, |ui| {
                 self.document_tabs(ui);
-                ui.add_space(3.0);
                 ui.separator();
-                ui.add_space(2.0);
                 let mut breadcrumb_action = None;
                 let breadcrumb_path = self
                     .browser_directory
@@ -2329,9 +2484,7 @@ impl SnapPdfApp {
                     None => {}
                 }
                 if self.current_path.is_some() {
-                    ui.add_space(5.0);
                     ui.separator();
-                    ui.add_space(4.0);
                     ScrollArea::horizontal()
                         .id_salt("viewer-tools-scroll")
                         .auto_shrink([false, true])
@@ -2373,7 +2526,7 @@ impl SnapPdfApp {
                                 if !self.page_sizes.is_empty() {
                                     let mut page = self.current_page + 1;
                                     let response = ui.add_sized(
-                                        [45.0, 28.0],
+                                        [38.0, 20.0],
                                         egui::DragValue::new(&mut page)
                                             .range(1..=self.page_sizes.len())
                                             .speed(1),
@@ -2544,9 +2697,7 @@ impl SnapPdfApp {
                 let gesture_is_over_viewer =
                     pointer_position.is_none_or(|position| viewer_rect.contains(position));
                 if gesture_is_over_viewer && (pinch_zoom - 1.0).abs() > 0.0001 {
-                    self.zoom = (self.zoom * pinch_zoom).clamp(0.2, 8.0);
-                    self.fit_width_requested = false;
-                    ctx.request_repaint();
+                    self.apply_pinch_zoom(pinch_zoom, pointer_position, &ctx);
                 }
                 // Gesture events arrive directly from XInput for this window. The
                 // event coordinates vary with the X compositor, so use egui's
@@ -2564,9 +2715,7 @@ impl SnapPdfApp {
                     .map(|event| event.factor)
                     .product::<f32>();
                 if pointer_is_over_viewer && (native_pinch_zoom - 1.0).abs() > 0.0001 {
-                    self.zoom = (self.zoom * native_pinch_zoom).clamp(0.2, 8.0);
-                    self.fit_width_requested = false;
-                    ctx.request_repaint();
+                    self.apply_pinch_zoom(native_pinch_zoom, pointer_position, &ctx);
                 }
 
                 let available_page_width = (ui.available_width() - 56.0).max(100.0);
@@ -2582,6 +2731,14 @@ impl SnapPdfApp {
                 let zoom = self.zoom;
                 let frame_number = self.frame_number;
                 let mut visible_page = self.current_page;
+                let page_gap = if self.presentation_mode {
+                    0.0
+                } else if self.reader_mode {
+                    6.0
+                } else {
+                    PAGE_GAP
+                };
+                let presentation_page = self.current_page;
                 // Keep a real horizontal canvas when a pinched page is wider than
                 // the viewport. `ScrollArea::both` then maps a two-finger slide to
                 // natural vertical and horizontal panning instead of clipping it.
@@ -2604,13 +2761,16 @@ impl SnapPdfApp {
                             ui.scroll_with_delta(vec2(0.0, self.keyboard_scroll));
                             self.keyboard_scroll = 0.0;
                         }
-                        ui.add_space(PAGE_GAP);
+                        ui.add_space(page_gap);
                         let mut laid_out_pages = Vec::with_capacity(page_sizes.len());
                         for (index, source_size) in page_sizes.iter().enumerate() {
+                            if self.presentation_mode && index != presentation_page {
+                                continue;
+                            }
                             let display_size = vec2(source_size[0] * zoom, source_size[1] * zoom);
                             let row_width = canvas_width;
                             let (row_rect, _) = ui.allocate_exact_size(
-                                vec2(row_width, display_size.y + PAGE_GAP),
+                                vec2(row_width, display_size.y + page_gap),
                                 Sense::hover(),
                             );
                             let page_rect = Rect::from_min_size(
@@ -2619,7 +2779,20 @@ impl SnapPdfApp {
                             );
                             laid_out_pages.push((index, page_rect));
                         }
-                        ui.add_space(PAGE_GAP);
+                        if let Some(anchor) = self.pinch_anchor.take()
+                            && let Some((_, rect)) =
+                                laid_out_pages.iter().find(|(page, _)| *page == anchor.page)
+                        {
+                            let target = pos2(
+                                rect.left() + rect.width() * anchor.fraction.x,
+                                rect.top() + rect.height() * anchor.fraction.y,
+                            );
+                            // Offset the scroll area by exactly the point's movement,
+                            // keeping the PDF coordinate under the trackpad cursor fixed.
+                            ui.scroll_with_delta(target - anchor.cursor);
+                        }
+                        self.page_rects = laid_out_pages.clone();
+                        ui.add_space(page_gap);
 
                         let mut jumped_to_page = false;
                         if let Some(target) = self.jump_to_page.take()
@@ -3089,23 +3262,41 @@ impl SnapPdfApp {
         let bounds = ctx.content_rect();
         egui::Area::new(egui::Id::new("reading-mode-controls"))
             .order(egui::Order::Foreground)
-            .fixed_pos(pos2(bounds.right() - 190.0, bounds.top() + 10.0))
+            .fixed_pos(pos2(bounds.left() + 8.0, bounds.top() + 8.0))
             .show(ctx, |ui| {
                 Frame::new()
                     .fill(Color32::from_rgba_unmultiplied(29, 29, 29, 232))
                     .stroke(Stroke::new(1.0, Color32::from_rgb(70, 70, 70)))
                     .corner_radius(CornerRadius::same(7))
-                    .inner_margin(Margin::symmetric(7, 5))
+                    .inner_margin(Margin::same(2))
                     .show(ui, |ui| {
                         if self.presentation_mode {
-                            if ui.button("Exit presentation · Esc").clicked() {
+                            if mini_mode_icon_button(
+                                ui,
+                                ModeControlIcon::Exit,
+                                "Exit presentation (Esc)",
+                            )
+                            .clicked()
+                            {
                                 self.set_presentation_mode(ctx, false);
                             }
                         } else if self.reader_mode {
-                            if ui.button("Exit reader mode").clicked() {
+                            if mini_mode_icon_button(
+                                ui,
+                                ModeControlIcon::Exit,
+                                "Exit reader mode (Esc)",
+                            )
+                            .clicked()
+                            {
                                 self.set_reader_mode(false);
                             }
-                        } else if ui.button("Show toolbar").clicked() {
+                        } else if mini_mode_icon_button(
+                            ui,
+                            ModeControlIcon::ShowToolbar,
+                            "Show toolbar",
+                        )
+                        .clicked()
+                        {
                             self.toolbar_visible = true;
                         }
                     });
@@ -4708,10 +4899,54 @@ enum ToolbarIcon {
     Present,
 }
 
+#[derive(Clone, Copy)]
+enum ModeControlIcon {
+    Exit,
+    ShowToolbar,
+}
+
+fn mini_mode_icon_button(ui: &mut egui::Ui, icon: ModeControlIcon, help: &str) -> Response {
+    let (rect, response) = ui.allocate_exact_size(vec2(21.0, 21.0), Sense::click());
+    if response.hovered() {
+        ui.painter()
+            .rect_filled(rect, CornerRadius::same(5), Color32::from_rgb(54, 54, 54));
+    }
+    let color = Color32::from_rgb(214, 214, 214);
+    let center = rect.center();
+    match icon {
+        ModeControlIcon::Exit => {
+            ui.painter().line_segment(
+                [center + vec2(-4.0, -4.0), center + vec2(4.0, 4.0)],
+                Stroke::new(1.45, color),
+            );
+            ui.painter().line_segment(
+                [center + vec2(4.0, -4.0), center + vec2(-4.0, 4.0)],
+                Stroke::new(1.45, color),
+            );
+        }
+        ModeControlIcon::ShowToolbar => {
+            ui.painter().line_segment(
+                [center + vec2(-5.0, -4.0), center + vec2(5.0, -4.0)],
+                Stroke::new(1.3, color),
+            );
+            ui.painter().add(egui::Shape::convex_polygon(
+                vec![
+                    center + vec2(-4.0, 0.0),
+                    center + vec2(4.0, 0.0),
+                    center + vec2(0.0, 4.5),
+                ],
+                color,
+                Stroke::NONE,
+            ));
+        }
+    }
+    response.on_hover_text(help)
+}
+
 fn compact_text_button(ui: &mut egui::Ui, text: &str, help: &str) -> Response {
     ui.add_sized(
-        [28.0, 28.0],
-        egui::Button::new(RichText::new(text).size(16.0)).frame(false),
+        [22.0, 20.0],
+        egui::Button::new(RichText::new(text).size(13.0)).frame(false),
     )
     .on_hover_text(help)
 }
@@ -4738,7 +4973,7 @@ fn icon_button(
     enabled: bool,
     help: &str,
 ) -> Response {
-    let (rect, response) = ui.allocate_exact_size(vec2(30.0, 28.0), Sense::click());
+    let (rect, response) = ui.allocate_exact_size(vec2(24.0, 20.0), Sense::click());
     if selected || response.hovered() {
         ui.painter().rect_filled(
             rect,

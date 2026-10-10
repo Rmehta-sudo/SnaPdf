@@ -38,6 +38,7 @@ In presentation mode, move between pages with `Space` / `Backspace`, `Right` / `
 | Shortcut | Action |
 |---|---|
 | `Ctrl+O` | Open a PDF |
+| `Ctrl+K`, then `Ctrl+O` | Add a project folder |
 | `Ctrl+F` | Open search |
 | `Ctrl+P` | Print |
 | `Ctrl+W` | Close current tab |
