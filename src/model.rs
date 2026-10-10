@@ -18,6 +18,16 @@ pub struct AppState {
     /// CrispPDF-owned overlay annotations. Original PDF files are never modified.
     #[serde(default)]
     pub annotations: HashMap<PathBuf, Vec<Annotation>>,
+    /// Open document tabs, restored across launches.
+    #[serde(default)]
+    pub open_documents: Vec<PathBuf>,
+    #[serde(default)]
+    pub active_document: Option<PathBuf>,
+    /// Zero-based last visible page for each document.
+    #[serde(default)]
+    pub reading_positions: HashMap<PathBuf, usize>,
+    #[serde(default = "default_ui_scale")]
+    pub ui_scale: f32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -46,6 +56,30 @@ pub enum AnnotationKind {
         position: [f32; 2],
         text: String,
         color: [u8; 4],
+        /// Optional highlight this comment belongs to.
+        #[serde(default)]
+        parent: Option<u64>,
+    },
+    TextBox {
+        /// PDF-coordinate rectangle: left, bottom, right, top.
+        rect: [f32; 4],
+        text: String,
+        color: [u8; 4],
+    },
+    Shape {
+        rect: [f32; 4],
+        color: [u8; 4],
+        width: f32,
+        ellipse: bool,
+    },
+    Stamp {
+        position: [f32; 2],
+        text: String,
+        color: [u8; 4],
+    },
+    Attachment {
+        position: [f32; 2],
+        path: PathBuf,
     },
 }
 
@@ -67,6 +101,10 @@ pub struct RecentDocument {
 
 fn default_true() -> bool {
     true
+}
+
+fn default_ui_scale() -> f32 {
+    1.0
 }
 
 impl Project {
@@ -139,6 +177,10 @@ impl AppState {
             upsert_recent(&mut project.recent_documents, recent, 8);
         }
         self.last_document = Some(path.to_path_buf());
+        self.active_document = Some(path.to_path_buf());
+        if !self.open_documents.iter().any(|open| open == path) {
+            self.open_documents.push(path.to_path_buf());
+        }
     }
 
     /// Normalizes recents once during startup. The UI takes a snapshot after this call,
@@ -200,6 +242,20 @@ impl AppState {
         }
         self.file_aliases.retain(|path, _| path.is_file());
         self.annotations.retain(|path, _| path.is_file());
+        self.open_documents.retain(|path| path.is_file());
+        self.reading_positions.retain(|path, _| path.is_file());
+        if self
+            .active_document
+            .as_ref()
+            .is_some_and(|path| !path.is_file())
+        {
+            self.active_document = None;
+        }
+        self.ui_scale = if self.ui_scale <= 0.0 {
+            1.0
+        } else {
+            self.ui_scale.clamp(0.7, 1.8)
+        };
         if self
             .last_document
             .as_ref()

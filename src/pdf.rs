@@ -19,6 +19,17 @@ pub enum RenderCommand {
         page_index: usize,
         generation: u64,
     },
+    Search {
+        query: String,
+        generation: u64,
+        request_id: u64,
+    },
+    ExportAnnotated {
+        source: PathBuf,
+        destination: PathBuf,
+        annotations: Vec<Annotation>,
+        generation: u64,
+    },
     RenderRegion {
         page_index: usize,
         /// PDF coordinates: left, bottom, right, top.
@@ -56,6 +67,12 @@ pub struct PdfOutlineItem {
     pub target: Option<LinkTarget>,
 }
 
+#[derive(Debug, Clone)]
+pub struct PdfSearchMatch {
+    pub page_index: usize,
+    pub excerpt: String,
+}
+
 #[derive(Debug)]
 pub enum RenderEvent {
     Ready,
@@ -78,6 +95,18 @@ pub enum RenderEvent {
         generation: u64,
         glyphs: Vec<TextGlyph>,
         links: Vec<PdfLinkRegion>,
+    },
+    SearchCompleted {
+        generation: u64,
+        request_id: u64,
+        query: String,
+        matches: Vec<PdfSearchMatch>,
+    },
+    ExportCompleted {
+        generation: u64,
+        destination: PathBuf,
+        exported: usize,
+        skipped: usize,
     },
     RegionRendered {
         generation: u64,
@@ -342,6 +371,268 @@ fn worker_loop(
                 }
                 repaint.request_repaint();
             }
+            RenderCommand::Search {
+                query,
+                generation,
+                request_id,
+            } => {
+                if generation != active_generation
+                    || generation != desired_generation.load(Ordering::Relaxed)
+                {
+                    continue;
+                }
+                let Some(document) = document.as_ref() else {
+                    continue;
+                };
+                let needle = query.to_lowercase();
+                let mut matches = Vec::new();
+                if !needle.trim().is_empty() {
+                    for (page_index, page) in document.pages().iter().enumerate() {
+                        let Ok(text) = page.text() else {
+                            continue;
+                        };
+                        let original = text.all();
+                        let lower = original.to_lowercase();
+                        let excerpt = original
+                            .lines()
+                            .find(|line| line.to_lowercase().contains(&needle))
+                            .unwrap_or(&original)
+                            .split_whitespace()
+                            .take(22)
+                            .collect::<Vec<_>>()
+                            .join(" ");
+                        for _ in lower.match_indices(&needle) {
+                            matches.push(PdfSearchMatch {
+                                page_index,
+                                excerpt: excerpt.clone(),
+                            });
+                            if matches.len() >= 500 {
+                                break;
+                            }
+                        }
+                        if matches.len() >= 500 {
+                            break;
+                        }
+                    }
+                }
+                let _ = events.send(RenderEvent::SearchCompleted {
+                    generation,
+                    request_id,
+                    query,
+                    matches,
+                });
+                repaint.request_repaint();
+            }
+            RenderCommand::ExportAnnotated {
+                source,
+                destination,
+                annotations,
+                generation,
+            } => {
+                if generation != active_generation {
+                    continue;
+                }
+                let result = (|| -> Result<(usize, usize), String> {
+                    let mut exported_document = pdfium
+                        .load_pdf_from_file(&source, None)
+                        .map_err(|error| error.to_string())?;
+                    let mut exported = 0;
+                    let mut skipped = 0;
+                    for annotation in &annotations {
+                        let mut page = exported_document
+                            .pages_mut()
+                            .get(annotation.page as i32)
+                            .map_err(|error| error.to_string())?;
+                        match &annotation.kind {
+                            AnnotationKind::Highlight { rects, color } => {
+                                if rects.is_empty() {
+                                    skipped += 1;
+                                    continue;
+                                }
+                                let mut highlight = page
+                                    .annotations_mut()
+                                    .create_highlight_annotation()
+                                    .map_err(|error| error.to_string())?;
+                                let left =
+                                    rects.iter().map(|rect| rect[0]).fold(f32::MAX, f32::min);
+                                let bottom =
+                                    rects.iter().map(|rect| rect[1]).fold(f32::MAX, f32::min);
+                                let right =
+                                    rects.iter().map(|rect| rect[2]).fold(f32::MIN, f32::max);
+                                let top = rects.iter().map(|rect| rect[3]).fold(f32::MIN, f32::max);
+                                highlight
+                                    .set_bounds(PdfRect::new_from_values(bottom, left, top, right))
+                                    .map_err(|error| error.to_string())?;
+                                highlight
+                                    .set_stroke_color(PdfColor::new(
+                                        color[0], color[1], color[2], color[3],
+                                    ))
+                                    .map_err(|error| error.to_string())?;
+                                for rect in rects {
+                                    highlight
+                                        .attachment_points_mut()
+                                        .create_attachment_point_at_end(
+                                            PdfQuadPoints::new_from_values(
+                                                rect[0], rect[1], rect[2], rect[1], rect[2],
+                                                rect[3], rect[0], rect[3],
+                                            ),
+                                        )
+                                        .map_err(|error| error.to_string())?;
+                                }
+                                if let Some(comment) =
+                                    annotations
+                                        .iter()
+                                        .find_map(|candidate| match &candidate.kind {
+                                            AnnotationKind::Note {
+                                                text,
+                                                parent: Some(parent),
+                                                ..
+                                            } if *parent == annotation.id => Some(text.as_str()),
+                                            _ => None,
+                                        })
+                                {
+                                    highlight
+                                        .set_contents(comment)
+                                        .map_err(|error| error.to_string())?;
+                                }
+                                highlight
+                                    .set_creator("CrispPDF")
+                                    .map_err(|error| error.to_string())?;
+                                highlight
+                                    .set_is_printed(true)
+                                    .map_err(|error| error.to_string())?;
+                                exported += 1;
+                            }
+                            AnnotationKind::Note {
+                                position,
+                                text,
+                                color,
+                                ..
+                            } => {
+                                let mut note = page
+                                    .annotations_mut()
+                                    .create_text_annotation(text)
+                                    .map_err(|error| error.to_string())?;
+                                note.set_bounds(PdfRect::new_from_values(
+                                    position[1] - 9.0,
+                                    position[0] - 9.0,
+                                    position[1] + 9.0,
+                                    position[0] + 9.0,
+                                ))
+                                .map_err(|error| error.to_string())?;
+                                note.set_stroke_color(PdfColor::new(
+                                    color[0], color[1], color[2], color[3],
+                                ))
+                                .map_err(|error| error.to_string())?;
+                                note.set_creator("CrispPDF")
+                                    .map_err(|error| error.to_string())?;
+                                note.set_is_printed(true)
+                                    .map_err(|error| error.to_string())?;
+                                exported += 1;
+                            }
+                            AnnotationKind::TextBox { rect, text, color } => {
+                                let mut text_box = page
+                                    .annotations_mut()
+                                    .create_free_text_annotation(text)
+                                    .map_err(|error| error.to_string())?;
+                                text_box
+                                    .set_bounds(PdfRect::new_from_values(
+                                        rect[1], rect[0], rect[3], rect[2],
+                                    ))
+                                    .map_err(|error| error.to_string())?;
+                                text_box
+                                    .set_stroke_color(PdfColor::new(
+                                        color[0], color[1], color[2], color[3],
+                                    ))
+                                    .map_err(|error| error.to_string())?;
+                                text_box
+                                    .set_is_printed(true)
+                                    .map_err(|error| error.to_string())?;
+                                exported += 1;
+                            }
+                            AnnotationKind::Shape {
+                                rect,
+                                color,
+                                ellipse,
+                                ..
+                            } => {
+                                let bounds =
+                                    PdfRect::new_from_values(rect[1], rect[0], rect[3], rect[2]);
+                                let mut shape = page
+                                    .annotations_mut()
+                                    .create_square_annotation()
+                                    .map_err(|error| error.to_string())?;
+                                shape
+                                    .set_bounds(bounds)
+                                    .map_err(|error| error.to_string())?;
+                                shape
+                                    .set_contents(if *ellipse { "Ellipse" } else { "Rectangle" })
+                                    .map_err(|error| error.to_string())?;
+                                shape
+                                    .set_stroke_color(PdfColor::new(
+                                        color[0], color[1], color[2], color[3],
+                                    ))
+                                    .map_err(|error| error.to_string())?;
+                                shape
+                                    .set_is_printed(true)
+                                    .map_err(|error| error.to_string())?;
+                                exported += 1;
+                            }
+                            AnnotationKind::Stamp {
+                                position,
+                                text,
+                                color,
+                            } => {
+                                let mut stamp = page
+                                    .annotations_mut()
+                                    .create_free_text_annotation(&text.to_uppercase())
+                                    .map_err(|error| error.to_string())?;
+                                stamp
+                                    .set_bounds(PdfRect::new_from_values(
+                                        position[1] - 28.0,
+                                        position[0],
+                                        position[1],
+                                        position[0] + (text.len() as f32 * 8.0 + 16.0).max(72.0),
+                                    ))
+                                    .map_err(|error| error.to_string())?;
+                                stamp
+                                    .set_stroke_color(PdfColor::new(
+                                        color[0], color[1], color[2], color[3],
+                                    ))
+                                    .map_err(|error| error.to_string())?;
+                                stamp
+                                    .set_is_printed(true)
+                                    .map_err(|error| error.to_string())?;
+                                exported += 1;
+                            }
+                            AnnotationKind::Ink { .. } | AnnotationKind::Attachment { .. } => {
+                                skipped += 1
+                            }
+                        }
+                    }
+                    exported_document
+                        .save_to_file(&destination)
+                        .map_err(|error| error.to_string())?;
+                    Ok((exported, skipped))
+                })();
+                match result {
+                    Ok((exported, skipped)) => {
+                        let _ = events.send(RenderEvent::ExportCompleted {
+                            generation,
+                            destination,
+                            exported,
+                            skipped,
+                        });
+                    }
+                    Err(message) => {
+                        let _ = events.send(RenderEvent::Error {
+                            generation,
+                            message: format!("Could not export annotated PDF: {message}"),
+                        });
+                    }
+                }
+                repaint.request_repaint();
+            }
             RenderCommand::RenderRegion {
                 page_index,
                 bounds,
@@ -450,3 +741,4 @@ fn append_bookmarks(
         bookmark = next;
     }
 }
+use crate::model::{Annotation, AnnotationKind};

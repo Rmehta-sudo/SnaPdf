@@ -96,3 +96,49 @@ destinations through the same safe-link/page-jump handler.
 Use neutral dark surfaces, thin separators, compact row heights, one restrained blue accent, and
 hover/selection states rather than persistent multicolor cards. Library and Contents are sidebar
 views, while project folders and files retain hierarchy through indentation and typography.
+
+## BUG-002: valid TOC links gated by the active tool
+
+The POEU Part III contents pages do contain native `/Link` annotations with valid same-document
+`/GoTo` destinations. Direct PDFium inspection resolved 31 links on page 4 and 35 on page 5. The
+viewer nevertheless registered link hit regions only in Select mode, so switching to any annotation
+tool made them appear inert. Register link interactions in every tool mode and retain the outline/text
+fallback only for genuinely unannotated documents.
+
+## DEC-011: annotation interaction and z-order
+
+Paint highlights first, ink second, and comments last. Register annotation context targets that offer
+Add comment/Delete highlight for highlights and type-specific Delete for comments and drawings. The
+Eraser uses annotation hit-testing for direct click-and-drag removal with undo history; it never uses
+the OCR snip rectangle. Comments created from highlights anchor just beyond the highlight's top-right
+edge.
+
+## DEC-012: external application chooser
+
+Discover visible `.desktop` entries that advertise `application/pdf`, exclude CrispPDF itself and
+duplicate IDs, present them in a conventional top-right-close dialog, and launch the chosen entry
+through `gio launch` rather than parsing or executing its `Exec=` line directly.
+
+## BUG-003: transient selection obscured highlights and page hit layer stole context clicks
+
+After a highlight was committed, its source text selection remained active and painted blue above
+the saved annotation until the next click. Clear that transient selection immediately after saving.
+The full-page tool interaction was also registered over annotation responses, preventing reliable
+secondary-click menus. Detect annotation hits first and suppress the broad page interaction there
+(except for active erasing), so highlight and comment menus receive right-clicks independently.
+
+## DEC-013: zoom-resilient document chrome
+
+Keep document tabs, path/actions, and tools as distinct rows with separators. The path and tool rows
+are horizontally scrollable with visible scrollbars, so whole-interface zoom cannot overlap or hide
+controls. Render the path as Obsidian-style component breadcrumbs; clicking any component copies the
+full path. Browse/text-selection remains the internal default but has no visible Select button;
+clicking an active annotation tool again returns to that neutral mode.
+# 2026-10-10 direct link hit testing and export boundary
+
+- PDF links are now resolved from the latest raw pointer position before the page tool interaction
+  layer. This avoids response-order competition between link rectangles, text selection, and active
+  annotation tools; link hover always gets the pointing-hand cursor and primary click activation.
+- Annotated-copy export uses PDFium-native annotations for highlights, comments, free text, shapes,
+  and stamps. Freehand ink/signatures and local attachment references remain in CrispPDF state until
+  a reliable cross-viewer PDF representation is implemented.

@@ -37,12 +37,29 @@ per-project recents, and recursively discovered PDFs; it never lists non-PDF fil
 - Rename, comment, and OCR result windows use conventional top-right close controls.
 - Existing PDF links and inferred contents-page/printed-URL links should open websites safely or
   navigate to the destination page within the PDF.
+- Links stay interactive in every annotation mode. Highlights provide right-click add-comment and
+  delete actions; comments and drawings provide right-click delete actions. Comments paint above
+  highlights, while the Erase tool directly removes annotations by clicking or dragging over them.
+- Any PDF shown in the sidebar or viewer can be opened in another installed PDF-capable application
+  through an in-app chooser.
+- Neutral browse/text-selection is implicit rather than exposed as a selected tool. Path components
+  copy the full path when clicked, and path/actions/tools remain usable at high interface zoom via
+  separated horizontal scrolling rows.
 
 ## Remaining later phases
 
-- In-document search.
-- Printing and print ranges.
-- Embedding overlays into an exported annotated PDF rather than retaining them only in CrispPDF.
-- Additional Firefox/Edge parity such as print UI, signature placement, shapes, and attachment tools.
+- Validate printing with a physical printer and exported annotations in third-party viewers.
+- Export PDF-native freehand ink/signatures and attachment representations.
+- Revisit local mathematical OCR quality and latency after the formula model acquisition succeeds.
 
 Provenance: user request, 2026-10-10.
+# 2026-10-10 completed viewer/UI expansion
+
+- Project folders render as the real nested filesystem hierarchy while filtering out non-PDFs.
+- Open PDFs persist as tabs, each document restores its last visible page, and the full absolute path
+  is visible, selectable, and copyable.
+- `Ctrl++`, `Ctrl+-`, and `Ctrl+0` scale the complete interface rather than only page content.
+- Search, CUPS printing, richer overlay annotation tools, and annotated-copy export are part of the
+  viewer. Highlights and comments have contextual add/edit/delete actions; active tools toggle off.
+- The visual target is the supplied Obsidian PDF-viewer reference: neutral dark surfaces, narrow icon
+  rail, understated nested tree, compact tabs/path/actions, and a centered continuous PDF canvas.

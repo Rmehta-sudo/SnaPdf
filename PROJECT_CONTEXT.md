@@ -18,6 +18,8 @@ This is the compact entry point for the project. Keep current truth here; route 
 
 - Native `egui`/`eframe` UI with a dedicated PDFium worker thread. Pages are rendered on demand at
   the current DPI/zoom and retained in a bounded texture cache.
+- Obsidian-inspired chrome uses an icon rail, nested PDF-only project tree, persistent document
+  tabs, selectable path bar, compact document controls, and neutral dark surfaces.
 - App state is JSON in `~/.config/crisppdf/state.json`; project discovery recursively includes only
   `.pdf` files. Project names and PDF aliases are presentation-only metadata in this state.
 - The Recents UI snapshots the latest 15 PDFs once at startup; opens are persisted for the next
@@ -45,6 +47,15 @@ This is the compact entry point for the project. Keep current truth here; route 
   matching visible TOC text is made clickable when a PDF omits link annotations.
 - Persistent highlights, ink and comments are app-owned overlays. Snip OCR uses embedded text first
   and local PP-OCRv5 for image text; Math OCR always routes image crops to the formula recognizer.
+- PDF links remain interactive in every tool mode. Annotation layers are ordered highlight → ink →
+  comment; right-click menus add/edit/delete highlight comments or delete annotations, and the
+  eraser removes annotations directly by click or drag. Open with lists other installed PDF handlers.
+- Multiple tabs, reading-position restore, nested directories, document search, CUPS print controls,
+  whole-interface zoom, richer overlay tools, and annotated-copy export are implemented.
+- New highlights no longer retain the temporary blue selection overlay; highlight/comment context
+  targets remain independently right-clickable. The path/action and tool rows scroll horizontally at
+  high UI zoom, path breadcrumbs copy the full path directly, and browse mode has no visible Select
+  control.
 
 ## Stable identities and paths
 
@@ -63,12 +74,11 @@ This is the compact entry point for the project. Keep current truth here; route 
 
 ## Open questions and next decisions
 
-- Validate rendering, inferred TOC hit regions, and restrained UI against representative large and
-  text-heavy PDFs.
+- Validate printing against a physical printer and exported annotations across third-party viewers.
 - Formula-model acquisition stalled on the workstation network and remains unverified; the code path
   is implemented, but mathematical OCR quality and latency must be measured after the model arrives.
-- Later phases: in-document search, printing, export of annotations into a PDF, multiple document
-  tabs, restored reading positions, signatures, shapes, and attachments.
+- Freehand ink/signatures and attachment references remain local overlays when exporting; PDF-native
+  export currently covers highlights, comments, text boxes, shapes, and stamps.
 
 ## Retrieval and freshness
 
