@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=CrispPDF
+Comment=Fast project-oriented PDF viewer
+Exec=@EXEC@ %F
+Icon=io.crisppdf.CrispPDF
+Terminal=false
+Categories=Office;Viewer;
+MimeType=application/pdf;
+StartupNotify=true
+Keywords=PDF;Document;Viewer;Research;
+

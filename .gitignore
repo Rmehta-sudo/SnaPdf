@@ -1,0 +1,27 @@
+# project-memory managed ignores
+/tmp/
+/temp/
+/.tmp/
+/.agents/
+/.codex/
+/project-memory/.build/
+/project-memory/raw/
+/cache/
+/logs/
+/renders/
+/rendered/
+/extracted/
+__pycache__/
+*.py[cod]
+
+# Rust and packaging outputs
+/target/
+/dist/
+*.AppImage
+*.deb
+
+# Editor and local runtime state
+/.idea/
+/.vscode/
+*.swp
+*.tmp

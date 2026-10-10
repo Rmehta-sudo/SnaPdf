@@ -1,0 +1,194 @@
+use crossbeam_channel::{Receiver, Sender, unbounded};
+use pdfium_bundled::pdfium_render::prelude::*;
+use std::path::PathBuf;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+
+#[derive(Debug)]
+pub enum RenderCommand {
+    Open {
+        path: PathBuf,
+        generation: u64,
+    },
+    RenderPage {
+        page_index: usize,
+        target_width: u16,
+        generation: u64,
+    },
+    Shutdown,
+}
+
+#[derive(Debug)]
+pub enum RenderEvent {
+    Ready,
+    DocumentOpened {
+        path: PathBuf,
+        generation: u64,
+        page_sizes: Vec<[f32; 2]>,
+    },
+    PageRendered {
+        page_index: usize,
+        generation: u64,
+        target_width: u16,
+        width: usize,
+        height: usize,
+        rgba: Vec<u8>,
+    },
+    Error {
+        generation: u64,
+        message: String,
+    },
+}
+
+pub struct RenderWorker {
+    pub commands: Sender<RenderCommand>,
+    pub events: Receiver<RenderEvent>,
+    focused_page: Arc<AtomicUsize>,
+    desired_generation: Arc<AtomicU64>,
+}
+
+impl RenderWorker {
+    pub fn spawn(repaint: eframe::egui::Context) -> Self {
+        let (command_tx, command_rx) = unbounded();
+        let (event_tx, event_rx) = unbounded();
+        let focused_page = Arc::new(AtomicUsize::new(0));
+        let desired_generation = Arc::new(AtomicU64::new(0));
+        let worker_focus = focused_page.clone();
+        let worker_generation = desired_generation.clone();
+
+        std::thread::Builder::new()
+            .name("crisppdf-renderer".to_owned())
+            .spawn(move || {
+                worker_loop(
+                    command_rx,
+                    event_tx,
+                    repaint,
+                    worker_focus,
+                    worker_generation,
+                )
+            })
+            .expect("could not start PDF renderer thread");
+
+        Self {
+            commands: command_tx,
+            events: event_rx,
+            focused_page,
+            desired_generation,
+        }
+    }
+
+    pub fn focus_page(&self, page: usize) {
+        self.focused_page.store(page, Ordering::Relaxed);
+    }
+
+    pub fn expect_generation(&self, generation: u64) {
+        self.desired_generation.store(generation, Ordering::Relaxed);
+    }
+}
+
+fn worker_loop(
+    commands: Receiver<RenderCommand>,
+    events: Sender<RenderEvent>,
+    repaint: eframe::egui::Context,
+    focused_page: Arc<AtomicUsize>,
+    desired_generation: Arc<AtomicU64>,
+) {
+    let pdfium = match pdfium_bundled::bind_bundled() {
+        Ok(pdfium) => pdfium,
+        Err(error) => {
+            let _ = events.send(RenderEvent::Error {
+                generation: 0,
+                message: format!("Could not initialize PDFium: {error}"),
+            });
+            repaint.request_repaint();
+            return;
+        }
+    };
+
+    let _ = events.send(RenderEvent::Ready);
+    repaint.request_repaint();
+
+    let mut document = None;
+    let mut active_generation = 0;
+
+    while let Ok(command) = commands.recv() {
+        match command {
+            RenderCommand::Open { path, generation } => {
+                active_generation = generation;
+                match pdfium.load_pdf_from_file(&path, None) {
+                    Ok(opened) => {
+                        let page_sizes = opened
+                            .pages()
+                            .iter()
+                            .map(|page| [page.width().value, page.height().value])
+                            .collect();
+                        document = Some(opened);
+                        let _ = events.send(RenderEvent::DocumentOpened {
+                            path,
+                            generation,
+                            page_sizes,
+                        });
+                    }
+                    Err(error) => {
+                        document = None;
+                        let _ = events.send(RenderEvent::Error {
+                            generation,
+                            message: format!("Could not open PDF: {error}"),
+                        });
+                    }
+                }
+                repaint.request_repaint();
+            }
+            RenderCommand::RenderPage {
+                page_index,
+                target_width,
+                generation,
+            } => {
+                let focus = focused_page.load(Ordering::Relaxed);
+                if generation != active_generation
+                    || generation != desired_generation.load(Ordering::Relaxed)
+                    || page_index.abs_diff(focus) > 2
+                {
+                    continue;
+                }
+                let Some(document) = document.as_ref() else {
+                    continue;
+                };
+
+                let rendered = (|| -> Result<_, PdfiumError> {
+                    let page = document.pages().get(page_index as i32)?;
+                    let bitmap = page.render_with_config(
+                        &PdfRenderConfig::new().set_target_width(target_width as i32),
+                    )?;
+                    let image = bitmap.as_image()?.to_rgba8();
+                    Ok((
+                        image.width() as usize,
+                        image.height() as usize,
+                        image.into_raw(),
+                    ))
+                })();
+
+                match rendered {
+                    Ok((width, height, rgba)) => {
+                        let _ = events.send(RenderEvent::PageRendered {
+                            page_index,
+                            generation,
+                            target_width,
+                            width,
+                            height,
+                            rgba,
+                        });
+                    }
+                    Err(error) => {
+                        let _ = events.send(RenderEvent::Error {
+                            generation,
+                            message: format!("Could not render page {}: {error}", page_index + 1),
+                        });
+                    }
+                }
+                repaint.request_repaint();
+            }
+            RenderCommand::Shutdown => break,
+        }
+    }
+}
