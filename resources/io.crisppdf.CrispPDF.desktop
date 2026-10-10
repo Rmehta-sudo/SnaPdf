@@ -8,5 +8,5 @@ Terminal=false
 Categories=Office;Viewer;
 MimeType=application/pdf;
 StartupNotify=true
+StartupWMClass=io.crisppdf.CrispPDF
 Keywords=PDF;Document;Viewer;Research;
-

@@ -15,7 +15,31 @@ pub enum RenderCommand {
         target_width: u16,
         generation: u64,
     },
+    ExtractText {
+        page_index: usize,
+        generation: u64,
+    },
     Shutdown,
+}
+
+#[derive(Debug, Clone)]
+pub struct TextGlyph {
+    pub text: String,
+    /// PDF coordinates: left, bottom, right, top.
+    pub bounds: Option<[f32; 4]>,
+}
+
+#[derive(Debug, Clone)]
+pub enum LinkTarget {
+    Uri(String),
+    Page(usize),
+}
+
+#[derive(Debug, Clone)]
+pub struct PdfLinkRegion {
+    /// PDF coordinates: left, bottom, right, top.
+    pub bounds: [f32; 4],
+    pub target: LinkTarget,
 }
 
 #[derive(Debug)]
@@ -33,6 +57,12 @@ pub enum RenderEvent {
         width: usize,
         height: usize,
         rgba: Vec<u8>,
+    },
+    TextExtracted {
+        page_index: usize,
+        generation: u64,
+        glyphs: Vec<TextGlyph>,
+        links: Vec<PdfLinkRegion>,
     },
     Error {
         generation: u64,
@@ -183,6 +213,105 @@ fn worker_loop(
                         let _ = events.send(RenderEvent::Error {
                             generation,
                             message: format!("Could not render page {}: {error}", page_index + 1),
+                        });
+                    }
+                }
+                repaint.request_repaint();
+            }
+            RenderCommand::ExtractText {
+                page_index,
+                generation,
+            } => {
+                let focus = focused_page.load(Ordering::Relaxed);
+                if generation != active_generation
+                    || generation != desired_generation.load(Ordering::Relaxed)
+                    || page_index.abs_diff(focus) > 2
+                {
+                    continue;
+                }
+                let Some(document) = document.as_ref() else {
+                    continue;
+                };
+
+                let extracted =
+                    (|| -> Result<(Vec<TextGlyph>, Vec<PdfLinkRegion>), PdfiumError> {
+                        let page = document.pages().get(page_index as i32)?;
+                        let text = page.text()?;
+                        let glyphs = text
+                            .chars()
+                            .iter()
+                            .filter_map(|character| {
+                                let text = character.unicode_string()?;
+                                let bounds = character.loose_bounds().ok().map(|rect| {
+                                    [
+                                        rect.left().value,
+                                        rect.bottom().value,
+                                        rect.right().value,
+                                        rect.top().value,
+                                    ]
+                                });
+                                Some(TextGlyph { text, bounds })
+                            })
+                            .collect();
+                        let links = page
+                            .links()
+                            .iter()
+                            .filter_map(|link| {
+                                let rect = link.rect().ok()?;
+                                let target = link
+                                    .action()
+                                    .and_then(|action| {
+                                        if let Some(uri_action) = action.as_uri_action() {
+                                            uri_action.uri().ok().map(LinkTarget::Uri)
+                                        } else if let Some(local_action) =
+                                            action.as_local_destination_action()
+                                        {
+                                            local_action
+                                                .destination()
+                                                .ok()?
+                                                .page_index()
+                                                .ok()
+                                                .map(|page| LinkTarget::Page(page as usize))
+                                        } else {
+                                            None
+                                        }
+                                    })
+                                    .or_else(|| {
+                                        link.destination()?
+                                            .page_index()
+                                            .ok()
+                                            .map(|page| LinkTarget::Page(page as usize))
+                                    })?;
+                                Some(PdfLinkRegion {
+                                    bounds: [
+                                        rect.left().value,
+                                        rect.bottom().value,
+                                        rect.right().value,
+                                        rect.top().value,
+                                    ],
+                                    target,
+                                })
+                            })
+                            .collect();
+                        Ok((glyphs, links))
+                    })();
+
+                match extracted {
+                    Ok((glyphs, links)) => {
+                        let _ = events.send(RenderEvent::TextExtracted {
+                            page_index,
+                            generation,
+                            glyphs,
+                            links,
+                        });
+                    }
+                    Err(error) => {
+                        let _ = events.send(RenderEvent::Error {
+                            generation,
+                            message: format!(
+                                "Could not extract text from page {}: {error}",
+                                page_index + 1
+                            ),
                         });
                     }
                 }

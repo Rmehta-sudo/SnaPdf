@@ -30,3 +30,37 @@ cancels renders more than two pages from focus, caps pending requests at six and
 textures or 256 MiB of CPU image data. The sidebar replaced unsupported Unicode icon characters
 with vector-drawn icons. Project files remain in stable alphabetical order; recency only affects the
 separate Recents section.
+
+## DEC-002: stable recents and display aliases
+
+The sidebar takes a normalized, 15-item recents snapshot at application startup. Opening a PDF still
+updates persistent timestamps, but the visible order does not change until the next launch. Project
+renames update `Project.name`; PDF renames update a path-keyed alias map. Neither operation renames
+or moves anything in the filesystem.
+
+## DEC-003: selectable text without replacing the renderer
+
+Keep the proven PDFium bitmap renderer and asynchronously extract per-character Unicode values and
+loose glyph bounds for visible pages on the same worker. The UI maps PDF bottom-left coordinates to
+page rectangles, paints selection highlights, and copies the selected character range with
+`Ctrl+C`. This adds a real text layer without putting PDFium calls on the UI thread.
+
+## DEC-004: Ubuntu dock identity
+
+Use `io.crisppdf.CrispPDF` consistently as the eframe app ID, desktop entry ID, icon name, and
+`StartupWMClass`. X11 validation returned that exact WM class, allowing GNOME to group the running
+window with the installed launcher and icon.
+
+## DEC-005: safe clickable links and accelerated navigation
+
+Extract URI and same-document destinations with the visible-page PDFium metadata job. Map their PDF
+rectangles into the rendered page, prioritize link clicks over text selection, open only `http`,
+`https`, and `mailto` externally, and route internal destinations through exact page jumps. Wheel
+motion is multiplied by 1.65; held vertical arrows ramp from 850 to 3,200 points/second while direct
+left/right page jumps remain immediate.
+
+## DEC-006: sidebar actions use hover menus
+
+Every project and PDF row always owns a stable options-button ID, but its ASCII three-dot label is
+painted only while the row is hovered. Clicking opens a rounded, high-contrast popup with clear
+rename/reset/remove grouping. ASCII dots avoid the missing-symbol issue from the first release.

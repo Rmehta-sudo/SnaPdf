@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 use walkdir::WalkDir;
@@ -11,6 +12,9 @@ pub struct AppState {
     pub recent_documents: Vec<RecentDocument>,
     #[serde(default)]
     pub last_document: Option<PathBuf>,
+    /// Display-only names keyed by the real PDF path. Files are never renamed on disk.
+    #[serde(default)]
+    pub file_aliases: HashMap<PathBuf, String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -105,6 +109,54 @@ impl AppState {
         self.last_document = Some(path.to_path_buf());
     }
 
+    /// Normalizes recents once during startup. The UI takes a snapshot after this call,
+    /// so opening documents does not visually reorder the list until the next launch.
+    pub fn normalize_recents(&mut self) {
+        self.recent_documents
+            .sort_by(|left, right| right.opened_at.cmp(&left.opened_at));
+        self.recent_documents.truncate(15);
+        for project in &mut self.projects {
+            project
+                .recent_documents
+                .sort_by(|left, right| right.opened_at.cmp(&left.opened_at));
+            project.recent_documents.truncate(8);
+        }
+    }
+
+    pub fn display_name(&self, path: &Path) -> String {
+        self.file_aliases
+            .get(path)
+            .filter(|alias| !alias.trim().is_empty())
+            .cloned()
+            .unwrap_or_else(|| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .unwrap_or("Untitled PDF")
+                    .to_owned()
+            })
+    }
+
+    pub fn set_file_alias(&mut self, path: &Path, alias: String) {
+        let alias = alias.trim();
+        if alias.is_empty() || alias == self.display_name_without_alias(path) {
+            self.file_aliases.remove(path);
+        } else {
+            self.file_aliases
+                .insert(path.to_path_buf(), alias.to_owned());
+        }
+    }
+
+    pub fn clear_file_alias(&mut self, path: &Path) {
+        self.file_aliases.remove(path);
+    }
+
+    fn display_name_without_alias(&self, path: &Path) -> String {
+        path.file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("Untitled PDF")
+            .to_owned()
+    }
+
     pub fn prune_missing(&mut self) {
         self.projects.retain(|project| project.root.is_dir());
         self.recent_documents
@@ -114,6 +166,7 @@ impl AppState {
                 .recent_documents
                 .retain(|document| document.path.is_file());
         }
+        self.file_aliases.retain(|path, _| path.is_file());
         if self
             .last_document
             .as_ref()
@@ -153,5 +206,35 @@ mod tests {
         let root = PathBuf::from("/tmp/course");
         assert!(state.add_project(root.clone()));
         assert!(!state.add_project(root));
+    }
+
+    #[test]
+    fn recents_are_sorted_and_limited_at_startup() {
+        let mut state = AppState {
+            recent_documents: (0..20)
+                .map(|index| RecentDocument {
+                    path: PathBuf::from(format!("/tmp/{index}.pdf")),
+                    opened_at: index,
+                })
+                .rev()
+                .collect(),
+            ..Default::default()
+        };
+        state.recent_documents.reverse();
+        state.normalize_recents();
+        assert_eq!(state.recent_documents.len(), 15);
+        assert_eq!(state.recent_documents[0].opened_at, 19);
+        assert_eq!(state.recent_documents[14].opened_at, 5);
+    }
+
+    #[test]
+    fn file_aliases_do_not_change_real_paths() {
+        let mut state = AppState::default();
+        let path = PathBuf::from("/course/original.pdf");
+        state.set_file_alias(&path, "Readable title".to_owned());
+        assert_eq!(state.display_name(&path), "Readable title");
+        assert_eq!(path, PathBuf::from("/course/original.pdf"));
+        state.clear_file_alias(&path);
+        assert_eq!(state.display_name(&path), "original.pdf");
     }
 }

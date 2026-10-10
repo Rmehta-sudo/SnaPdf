@@ -12,8 +12,15 @@ Codex-style project sidebar with a crisp, continuously scrolling PDF canvas.
 - Zoom controls, fit-to-width, continuous scrolling, page position, and drag-and-drop.
 - Project folders with recursive PDF-only discovery and filename filtering.
 - Stable alphabetical file order inside projects; opening a PDF never reshuffles the project tree.
-- Global and per-project recent documents that persist across launches.
+- The 15 most recently opened PDFs, ordered once at startup so clicking never reshuffles the UI.
+- Display-only project and PDF renaming from each sidebar item's right-click menu.
+- Selectable PDF text with drag selection and `Ctrl+C` copy.
+- Clickable safe web/email links and internal PDF page links.
+- Arrow-key navigation: up/down scroll; left/right move to the previous/next page.
+- Faster animated wheel scrolling with strong acceleration while up/down arrows are held.
+- Hover-only three-dot menus with polished project/PDF actions.
 - Open-from-file-manager support and Ubuntu `application/pdf` integration.
+- Stable Ubuntu app/dock identity with a dedicated CrispPDF icon.
 - Dark, compact project UI inspired by Codex.
 - Vector-drawn sidebar icons, so the UI does not depend on missing Unicode glyphs.
 
@@ -44,6 +51,10 @@ files, and makes it the default PDF viewer. No `sudo` is required.
 | `Ctrl++` | Zoom in |
 | `Ctrl+-` | Zoom out |
 | `Ctrl+0` | Fit width |
+| `Up` / `Down` | Scroll document |
+| `Left` / `Right` | Previous / next page |
+| Drag text, `Ctrl+C` | Select and copy PDF text |
+| Click a PDF link | Open a safe web/email link or jump within the document |
 
 ## State and privacy
 
@@ -52,7 +63,7 @@ not upload documents or telemetry.
 
 ## Planned follow-up features
 
-1. PDF text layer with native selection, copy, and in-document search.
+1. In-document text search.
 2. Printing and page-range controls.
 3. Highlights, comments, annotations, and safe incremental PDF saves.
 4. Region screenshot tool with a right-side OCR/extracted-text panel.

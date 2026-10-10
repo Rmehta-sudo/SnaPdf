@@ -9,15 +9,18 @@ This is the compact entry point for the project. Keep current truth here; route 
 
 - Build a fast, crisp Ubuntu PDF viewer in Rust with a Codex-like project sidebar, PDF-only folder
   discovery, persistent global/per-project recents, and default-app integration.
-- The initial release succeeds when it builds, opens local PDFs smoothly, renders lazily off the UI
-  thread, persists projects/recents, and installs without root access.
+- The current release succeeds when it builds, opens local PDFs smoothly, renders lazily off the UI
+  thread, supports selectable/copyable text and keyboard navigation, keeps recents stable during a
+  session, supports display-only aliases, and installs without root access.
 
 ## Current architecture or operating model
 
 - Native `egui`/`eframe` UI with a dedicated PDFium worker thread. Pages are rendered on demand at
   the current DPI/zoom and retained in a bounded texture cache.
 - App state is JSON in `~/.config/crisppdf/state.json`; project discovery recursively includes only
-  `.pdf` files.
+  `.pdf` files. Project names and PDF aliases are presentation-only metadata in this state.
+- The Recents UI snapshots the latest 15 PDFs once at startup; opens are persisted for the next
+  launch without reshuffling the current session.
 - PDFium is pinned and embedded at build time through `pdfium-bundled`.
 
 ## Repositories and source-of-truth boundaries
@@ -31,6 +34,12 @@ This is the compact entry point for the project. Keep current truth here; route 
 - The viewer survived an automated 220-step rapid scroll down and 220-step rapid scroll up through a
   46-page PDF at high zoom, remaining alive at about 191 MiB RSS.
 - Installed to `~/.local/bin/crisppdf` and registered as the default `application/pdf` handler.
+- The installed desktop ID, icon name, Wayland app ID, and X11 WM class all use
+  `io.crisppdf.CrispPDF`, enabling reliable dock grouping and pinning.
+- Visible pages expose PDFium glyph bounds for drag selection and `Ctrl+C`; arrow up/down scroll and
+  arrow left/right jump to adjacent pages.
+- Visible pages also expose PDFium link rectangles for safe external URLs and internal page jumps.
+  Sidebar actions live in hover-only three-dot popovers; held up/down arrows accelerate scrolling.
 
 ## Stable identities and paths
 
@@ -50,7 +59,10 @@ This is the compact entry point for the project. Keep current truth here; route 
 ## Open questions and next decisions
 
 - Validate rendering and UI against representative large/text-heavy PDFs.
-- Later phases: selectable text/search, printing, annotations/comments, then region capture + OCR.
+- Later phases: in-document search, printing, annotations/comments, then region capture + OCR.
+- For the later local OCR panel, PP-OCRv5 server is the current accuracy-first candidate; Surya is a
+  useful layout-aware alternative and Tesseract remains the lightweight CPU fallback. No OCR engine
+  is perfect, so the UI should expose confidence and allow correction.
 
 ## Retrieval and freshness
 

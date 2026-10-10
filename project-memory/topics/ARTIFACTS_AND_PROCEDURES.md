@@ -11,3 +11,5 @@ operating procedures that cannot be inferred safely from code alone.
 - Icon: `~/.local/share/icons/hicolor/scalable/apps/io.crisppdf.CrispPDF.svg`.
 - Install/update command from the project root: `./scripts/install.sh`.
 - Runtime project/recent state: `~/.config/crisppdf/state.json`.
+- Dock pinning: launch CrispPDF, then right-click its dock icon and choose **Add to Favorites**. The
+  running window is matched to the launcher by `io.crisppdf.CrispPDF`.
