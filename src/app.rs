@@ -1,8 +1,8 @@
 use crate::model::{Annotation, AnnotationKind, AppState, RecentDocument, is_pdf};
 use crate::ocr::{OcrCommand, OcrEvent, OcrWorker};
 use crate::pdf::{
-    LinkTarget, PdfLinkRegion, PdfOutlineItem, PdfSearchMatch, RenderCommand, RenderEvent,
-    RenderWorker, TextGlyph,
+    LinkTarget, PdfFileSearchMatches, PdfLinkRegion, PdfOutlineItem, PdfSearchMatch, RenderCommand,
+    RenderEvent, RenderWorker, TextGlyph, search_pdf_files,
 };
 use crate::{storage, theme};
 use anyhow::{Result, anyhow};
@@ -15,7 +15,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::mpsc::{self, Receiver};
+use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::time::{SystemTime, UNIX_EPOCH};
 use walkdir::WalkDir;
 
@@ -50,6 +50,18 @@ struct BrowserEntry {
 struct BrowserScanResult {
     directory: PathBuf,
     entries: Vec<BrowserEntry>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SearchScope {
+    OpenTabs,
+    Workspace,
+}
+
+struct SearchScanResult {
+    scope: SearchScope,
+    query: String,
+    matches: Vec<PdfFileSearchMatches>,
 }
 
 enum BreadcrumbAction {
@@ -176,22 +188,22 @@ pub fn run() -> Result<()> {
 
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_title("CrispPDF")
-            .with_app_id("io.crisppdf.CrispPDF")
+            .with_title("SnapPDF")
+            .with_app_id("io.snappdf.SnapPDF")
             .with_inner_size([1360.0, 860.0])
             .with_min_inner_size([820.0, 560.0]),
         ..Default::default()
     };
 
     eframe::run_native(
-        "CrispPDF",
+        "SnapPDF",
         options,
-        Box::new(move |creation| Ok(Box::new(CrispPdfApp::new(creation, initial_path)))),
+        Box::new(move |creation| Ok(Box::new(SnapPdfApp::new(creation, initial_path)))),
     )
     .map_err(|error| anyhow!(error.to_string()))
 }
 
-pub struct CrispPdfApp {
+pub struct SnapPdfApp {
     state: AppState,
     /// Frozen at startup so clicking a PDF never reshuffles the visible recent list.
     session_recents: Vec<RecentDocument>,
@@ -245,6 +257,12 @@ pub struct CrispPdfApp {
     search_matches: Vec<PdfSearchMatch>,
     search_index: usize,
     search_request_id: u64,
+    tab_search_matches: Vec<PdfFileSearchMatches>,
+    workspace_search_matches: Vec<PdfFileSearchMatches>,
+    search_scan: Option<Receiver<SearchScanResult>>,
+    search_scan_scope: Option<SearchScope>,
+    native_pinch: Option<crate::gestures::NativePinch>,
+    pending_native_pinches: Vec<crate::gestures::NativePinchEvent>,
     show_search: bool,
     print_dialog: Option<PrintDialog>,
     browser_directory: Option<PathBuf>,
@@ -256,7 +274,7 @@ pub struct CrispPdfApp {
     pending_source_save: Option<(PathBuf, PathBuf)>,
 }
 
-impl CrispPdfApp {
+impl SnapPdfApp {
     fn new(creation: &eframe::CreationContext<'_>, initial_path: Option<PathBuf>) -> Self {
         theme::apply(&creation.egui_ctx);
         let mut state = storage::load();
@@ -333,6 +351,12 @@ impl CrispPdfApp {
             search_matches: Vec::new(),
             search_index: 0,
             search_request_id: 0,
+            tab_search_matches: Vec::new(),
+            workspace_search_matches: Vec::new(),
+            search_scan: None,
+            search_scan_scope: None,
+            native_pinch: crate::gestures::listen(creation),
+            pending_native_pinches: Vec::new(),
             show_search: false,
             print_dialog: None,
             browser_directory: None,
@@ -352,7 +376,7 @@ impl CrispPdfApp {
 
     fn open_document(&mut self, path: PathBuf) {
         if !path.is_file() || !is_pdf(&path) {
-            self.status = "CrispPDF can only open PDF files.".to_owned();
+            self.status = "SnapPDF can only open PDF files.".to_owned();
             return;
         }
 
@@ -413,6 +437,7 @@ impl CrispPdfApp {
             .iter()
             .position(|open| open == path);
         self.state.open_documents.retain(|open| open != path);
+        self.state.record_closed(path);
         if self.current_path.as_deref() == Some(path) {
             let next = index.and_then(|index| {
                 self.state
@@ -433,6 +458,16 @@ impl CrispPdfApp {
             }
         }
         self.persist();
+    }
+
+    fn reopen_last_closed_tab(&mut self) {
+        let Some(path) = self.state.take_most_recent_closed() else {
+            self.status = "No recently closed PDF tabs.".to_owned();
+            return;
+        };
+        let name = self.state.display_name(&path);
+        self.open_document(path);
+        self.status = format!("Reopened {name}.");
     }
 
     fn add_project_dialog(&mut self) {
@@ -578,10 +613,8 @@ impl CrispPdfApp {
             .file_name()
             .and_then(|name| name.to_str())
             .unwrap_or("document.pdf");
-        let temporary = source.with_file_name(format!(
-            ".{name}.crisppdf-saving-{}.pdf",
-            std::process::id()
-        ));
+        let temporary =
+            source.with_file_name(format!(".{name}.snappdf-saving-{}.pdf", std::process::id()));
         let annotations = self.current_annotations().to_vec();
         self.pending_source_save = Some((temporary.clone(), source.clone()));
         self.status = "Writing annotations into the PDF...".to_owned();
@@ -676,6 +709,32 @@ impl CrispPdfApp {
     }
 
     fn handle_events(&mut self, ctx: &egui::Context) {
+        if let Some(pinch) = self.native_pinch.as_ref() {
+            while let Ok(event) = pinch.events.try_recv() {
+                self.pending_native_pinches.push(event);
+            }
+        }
+        if let Some(receiver) = self.search_scan.as_ref() {
+            match receiver.try_recv() {
+                Ok(result) => {
+                    if result.query == self.search_query {
+                        match result.scope {
+                            SearchScope::OpenTabs => self.tab_search_matches = result.matches,
+                            SearchScope::Workspace => {
+                                self.workspace_search_matches = result.matches
+                            }
+                        }
+                    }
+                    self.search_scan = None;
+                    self.search_scan_scope = None;
+                }
+                Err(TryRecvError::Disconnected) => {
+                    self.search_scan = None;
+                    self.search_scan_scope = None;
+                }
+                Err(TryRecvError::Empty) => {}
+            }
+        }
         while let Ok(event) = self.worker.events.try_recv() {
             match event {
                 RenderEvent::Ready => {
@@ -783,8 +842,8 @@ impl CrispPdfApp {
                             .file_stem()
                             .and_then(|name| name.to_str())
                             .unwrap_or("document");
-                        let backup = source
-                            .with_file_name(format!("{stem}.crisppdf-backup-{timestamp}.pdf"));
+                        let backup =
+                            source.with_file_name(format!("{stem}.snappdf-backup-{timestamp}.pdf"));
                         match fs::copy(&source, &backup)
                             .and_then(|_| fs::rename(&temporary, &source))
                         {
@@ -811,7 +870,7 @@ impl CrispPdfApp {
                             )
                         } else {
                             format!(
-                                "Exported {exported} annotations to {}; {skipped} unsupported items remain CrispPDF overlays.",
+                                "Exported {exported} annotations to {}; {skipped} unsupported items remain SnapPDF overlays.",
                                 destination.display()
                             )
                         };
@@ -964,6 +1023,8 @@ impl CrispPdfApp {
         self.search_request_id = self.search_request_id.wrapping_add(1);
         self.search_matches.clear();
         self.search_index = 0;
+        self.tab_search_matches.clear();
+        self.workspace_search_matches.clear();
         if self.search_query.trim().is_empty() {
             return;
         }
@@ -973,6 +1034,59 @@ impl CrispPdfApp {
             generation: self.generation,
             request_id: self.search_request_id,
         });
+        self.start_scoped_search(SearchScope::OpenTabs);
+    }
+
+    fn start_scoped_search(&mut self, scope: SearchScope) {
+        let query = self.search_query.trim().to_owned();
+        if query.is_empty() {
+            return;
+        }
+        let paths = match scope {
+            SearchScope::OpenTabs => self.state.open_documents.clone(),
+            SearchScope::Workspace => self.workspace_pdf_paths(),
+        };
+        let (sender, receiver) = mpsc::channel();
+        self.search_scan = Some(receiver);
+        self.search_scan_scope = Some(scope);
+        std::thread::spawn(move || {
+            let matches = search_pdf_files(&paths, &query, 80).unwrap_or_default();
+            let _ = sender.send(SearchScanResult {
+                scope,
+                query,
+                matches,
+            });
+        });
+    }
+
+    fn workspace_pdf_paths(&self) -> Vec<PathBuf> {
+        let mut roots = self
+            .state
+            .projects
+            .iter()
+            .map(|project| project.root.clone())
+            .collect::<Vec<_>>();
+        if let Some(workspace) = dirs::home_dir().map(|home| home.join("workspace"))
+            && workspace.is_dir()
+        {
+            roots.push(workspace);
+        }
+        let mut seen = HashSet::new();
+        let mut paths = Vec::new();
+        for root in roots {
+            for entry in WalkDir::new(root)
+                .follow_links(false)
+                .into_iter()
+                .filter_map(Result::ok)
+            {
+                let path = entry.path();
+                if entry.file_type().is_file() && is_pdf(path) && seen.insert(path.to_path_buf()) {
+                    paths.push(path.to_path_buf());
+                }
+            }
+        }
+        paths.sort();
+        paths
     }
 
     fn step_search(&mut self, direction: isize) {
@@ -998,6 +1112,8 @@ impl CrispPdfApp {
         let copy = KeyboardShortcut::new(Modifiers::CTRL, Key::C);
         let find = KeyboardShortcut::new(Modifiers::CTRL, Key::F);
         let print = KeyboardShortcut::new(Modifiers::CTRL, Key::P);
+        let close_tab = KeyboardShortcut::new(Modifiers::CTRL, Key::W);
+        let reopen_tab = KeyboardShortcut::new(Modifiers::CTRL | Modifiers::SHIFT, Key::T);
         let undo = KeyboardShortcut::new(Modifiers::CTRL, Key::Z);
         let redo = KeyboardShortcut::new(Modifiers::CTRL | Modifiers::SHIFT, Key::Z);
 
@@ -1036,6 +1152,17 @@ impl CrispPdfApp {
         }
         if ctx.input_mut(|input| input.consume_shortcut(&print)) {
             self.request_print();
+        }
+        if !ctx.egui_wants_keyboard_input()
+            && ctx.input_mut(|input| input.consume_shortcut(&close_tab))
+            && let Some(path) = self.current_path.clone()
+        {
+            self.close_document_tab(&path);
+        }
+        if !ctx.egui_wants_keyboard_input()
+            && ctx.input_mut(|input| input.consume_shortcut(&reopen_tab))
+        {
+            self.reopen_last_closed_tab();
         }
         if ctx.input_mut(|input| input.consume_shortcut(&undo)) {
             self.undo_annotation();
@@ -1796,7 +1923,7 @@ impl CrispPdfApp {
         let response = ui.add_sized(
             [ui.available_width(), 32.0],
             egui::TextEdit::singleline(&mut self.search_query)
-                .hint_text("Search current PDF")
+                .hint_text("Search PDFs")
                 .margin(Margin::symmetric(8, 6)),
         );
         let submit = response.lost_focus() && ui.input(|input| input.key_pressed(Key::Enter));
@@ -1805,9 +1932,15 @@ impl CrispPdfApp {
         }
         ui.add_space(6.0);
         ui.horizontal(|ui| {
-            if ui.button("Search").clicked() {
+            if ui.button("Search current + tabs").clicked() {
                 self.run_search();
             }
+            if ui.button("Search workspace").clicked() && !self.search_query.trim().is_empty() {
+                self.workspace_search_matches.clear();
+                self.start_scoped_search(SearchScope::Workspace);
+            }
+        });
+        ui.horizontal(|ui| {
             if ui
                 .add_enabled(
                     !self.search_matches.is_empty(),
@@ -1825,61 +1958,143 @@ impl CrispPdfApp {
             }
         });
         ui.add_space(10.0);
-        if self.search_matches.is_empty() {
-            let message = if self.search_query.trim().is_empty() {
-                "Type to search inside the current PDF."
-            } else {
-                "No results"
-            };
-            ui.label(RichText::new(message).size(12.0).color(theme::MUTED));
-        } else {
+        if self.search_query.trim().is_empty() {
             ui.label(
-                RichText::new(format!("{} RESULTS", self.search_matches.len()))
-                    .size(10.5)
-                    .strong()
+                RichText::new("Search the current PDF and every open tab. Use Workspace only when you need every PDF beneath your workspace and project folders.")
+                    .size(12.0)
                     .color(theme::MUTED),
             );
-            ui.add_space(4.0);
+            return;
+        }
+
+        sidebar_section_header(
+            ui,
+            "CURRENT FILE",
+            &format!("{} results", self.search_matches.len()),
+            theme::MUTED,
+        );
+        if self.search_matches.is_empty() {
+            ui.label(
+                RichText::new("No matches in the open PDF.")
+                    .size(12.0)
+                    .color(theme::MUTED),
+            );
+        } else {
             let matches = self.search_matches.clone();
-            ScrollArea::vertical()
-                .id_salt("search-results")
-                .auto_shrink([false, false])
-                .show(ui, |ui| {
-                    for (index, result) in matches.iter().enumerate() {
-                        let selected = index == self.search_index;
-                        let (rect, response) = ui
-                            .allocate_exact_size(vec2(ui.available_width(), 54.0), Sense::click());
-                        if selected || response.hovered() {
-                            ui.painter().rect_filled(
-                                rect,
-                                CornerRadius::same(5),
-                                if selected {
-                                    Color32::from_rgb(53, 53, 53)
-                                } else {
-                                    Color32::from_rgb(42, 42, 42)
-                                },
-                            );
-                        }
-                        ui.painter().text(
-                            pos2(rect.left() + 8.0, rect.top() + 10.0),
-                            Align2::LEFT_TOP,
-                            format!("Page {}", result.page_index + 1),
-                            FontId::proportional(11.0),
-                            theme::MUTED,
-                        );
-                        ui.painter().text(
-                            pos2(rect.left() + 8.0, rect.top() + 27.0),
-                            Align2::LEFT_TOP,
-                            elide(&result.excerpt, 42),
-                            FontId::proportional(12.5),
-                            Color32::from_rgb(216, 216, 216),
-                        );
-                        if response.clicked() {
-                            self.search_index = index;
-                            self.jump_to_page = Some(result.page_index);
-                        }
+            for (index, result) in matches.iter().enumerate() {
+                let response = search_result_row(
+                    ui,
+                    &format!("Page {}", result.page_index + 1),
+                    &result.excerpt,
+                    index == self.search_index,
+                );
+                if response.clicked() {
+                    self.search_index = index;
+                    self.jump_to_page = Some(result.page_index);
+                }
+            }
+        }
+
+        ui.add_space(8.0);
+        let tab_result_count = self
+            .tab_search_matches
+            .iter()
+            .map(|result| result.matches.len())
+            .sum::<usize>();
+        sidebar_section_header(
+            ui,
+            "OPEN TABS",
+            &format!("{} results", tab_result_count),
+            theme::MUTED,
+        );
+        if self.search_scan_scope == Some(SearchScope::OpenTabs) {
+            ui.label(
+                RichText::new("Searching open tabs...")
+                    .size(12.0)
+                    .color(theme::MUTED),
+            );
+        } else if self.tab_search_matches.is_empty() {
+            ui.label(
+                RichText::new("No matches in open tabs.")
+                    .size(12.0)
+                    .color(theme::MUTED),
+            );
+        } else {
+            let matches = self.tab_search_matches.clone();
+            let mut activate = None;
+            for file in &matches {
+                for result in &file.matches {
+                    let response = search_result_row(
+                        ui,
+                        &format!(
+                            "{} · p. {}",
+                            elide(&file_name(&file.path), 20),
+                            result.page_index + 1
+                        ),
+                        &result.excerpt,
+                        false,
+                    );
+                    if response.clicked() {
+                        activate = Some((file.path.clone(), result.page_index));
                     }
-                });
+                }
+            }
+            if let Some((path, page)) = activate {
+                self.open_document(path);
+                self.jump_to_page = Some(page);
+            }
+        }
+
+        ui.add_space(8.0);
+        let workspace_result_count = self
+            .workspace_search_matches
+            .iter()
+            .map(|result| result.matches.len())
+            .sum::<usize>();
+        sidebar_section_header(
+            ui,
+            "WORKSPACE",
+            &format!("{} results", workspace_result_count),
+            theme::MUTED,
+        );
+        if self.search_scan_scope == Some(SearchScope::Workspace) {
+            ui.label(
+                RichText::new("Searching workspace PDFs...")
+                    .size(12.0)
+                    .color(theme::MUTED),
+            );
+        } else if self.workspace_search_matches.is_empty() {
+            ui.label(
+                RichText::new(
+                    "Use Search workspace to include nested PDFs in your workspace and projects.",
+                )
+                .size(12.0)
+                .color(theme::MUTED),
+            );
+        } else {
+            let matches = self.workspace_search_matches.clone();
+            let mut activate = None;
+            for file in &matches {
+                for result in &file.matches {
+                    let response = search_result_row(
+                        ui,
+                        &format!(
+                            "{} · p. {}",
+                            elide(&file_name(&file.path), 20),
+                            result.page_index + 1
+                        ),
+                        &result.excerpt,
+                        false,
+                    );
+                    if response.clicked() {
+                        activate = Some((file.path.clone(), result.page_index));
+                    }
+                }
+            }
+            if let Some((path, page)) = activate {
+                self.open_document(path);
+                self.jump_to_page = Some(page);
+            }
         }
     }
 
@@ -2212,6 +2427,26 @@ impl CrispPdfApp {
                     self.fit_width_requested = false;
                     ctx.request_repaint();
                 }
+                // Gesture events arrive directly from XInput for this window. The
+                // event coordinates vary with the X compositor, so use egui's
+                // pointer position only for the region check instead of rejecting
+                // an otherwise valid native pinch because of a coordinate mismatch.
+                let pointer_is_over_viewer = ctx.input(|input| {
+                    input
+                        .pointer
+                        .hover_pos()
+                        .is_none_or(|position| viewer_rect.contains(position))
+                });
+                let native_pinch_zoom = self
+                    .pending_native_pinches
+                    .drain(..)
+                    .map(|event| event.factor)
+                    .product::<f32>();
+                if pointer_is_over_viewer && (native_pinch_zoom - 1.0).abs() > 0.0001 {
+                    self.zoom = (self.zoom * native_pinch_zoom).clamp(0.2, 8.0);
+                    self.fit_width_requested = false;
+                    ctx.request_repaint();
+                }
 
                 let available_page_width = (ui.available_width() - 56.0).max(100.0);
                 if self.fit_width_requested {
@@ -2226,13 +2461,24 @@ impl CrispPdfApp {
                 let zoom = self.zoom;
                 let frame_number = self.frame_number;
                 let mut visible_page = self.current_page;
+                // Keep a real horizontal canvas when a pinched page is wider than
+                // the viewport. `ScrollArea::both` then maps a two-finger slide to
+                // natural vertical and horizontal panning instead of clipping it.
+                let canvas_width = page_sizes
+                    .iter()
+                    .map(|size| size[0] * zoom + 56.0)
+                    .fold(ui.available_width(), f32::max);
 
-                ScrollArea::vertical()
+                ScrollArea::both()
                     .id_salt("document-scroll")
                     .auto_shrink([false, false])
                     .animated(true)
-                    .wheel_scroll_multiplier(vec2(1.0, WHEEL_SCROLL_MULTIPLIER))
+                    .wheel_scroll_multiplier(vec2(
+                        WHEEL_SCROLL_MULTIPLIER,
+                        WHEEL_SCROLL_MULTIPLIER,
+                    ))
                     .show_viewport(ui, |ui, _viewport| {
+                        ui.set_min_width(canvas_width);
                         if self.keyboard_scroll != 0.0 {
                             ui.scroll_with_delta(vec2(0.0, self.keyboard_scroll));
                             self.keyboard_scroll = 0.0;
@@ -2241,7 +2487,7 @@ impl CrispPdfApp {
                         let mut laid_out_pages = Vec::with_capacity(page_sizes.len());
                         for (index, source_size) in page_sizes.iter().enumerate() {
                             let display_size = vec2(source_size[0] * zoom, source_size[1] * zoom);
-                            let row_width = ui.available_width();
+                            let row_width = canvas_width;
                             let (row_rect, _) = ui.allocate_exact_size(
                                 vec2(row_width, display_size.y + PAGE_GAP),
                                 Sense::hover(),
@@ -2897,7 +3143,7 @@ impl CrispPdfApp {
             .collapsible(false)
             .resizable(false)
             .show(ctx, |ui| {
-                ui.label("This changes only the name shown in CrispPDF.");
+                ui.label("This changes only the name shown in SnapPDF.");
                 ui.add_space(6.0);
                 let response = ui.add_sized(
                     [360.0, 30.0],
@@ -3085,7 +3331,7 @@ impl CrispPdfApp {
             .resizable(false)
             .default_width(360.0)
             .show(ctx, |ui| {
-                ui.label("This writes CrispPDF annotations into the PDF on disk so other viewers can see them.");
+                ui.label("This writes SnapPDF annotations into the PDF on disk so other viewers can see them.");
                 ui.add_space(6.0);
                 ui.label(
                     RichText::new("A timestamped backup of the original PDF will be created first.")
@@ -3350,7 +3596,7 @@ impl CrispPdfApp {
     fn empty_state(&self, ui: &mut egui::Ui) {
         ui.centered_and_justified(|ui| {
             ui.vertical_centered(|ui| {
-                ui.label(RichText::new("CrispPDF").size(34.0).strong());
+                ui.label(RichText::new("SnapPDF").size(34.0).strong());
                 ui.add_space(6.0);
                 ui.label(
                     RichText::new("Your PDFs, organized by project.")
@@ -3376,7 +3622,7 @@ impl CrispPdfApp {
     }
 }
 
-impl eframe::App for CrispPdfApp {
+impl eframe::App for SnapPdfApp {
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.frame_number = self.frame_number.wrapping_add(1);
         self.handle_events(ctx);
@@ -3928,6 +4174,36 @@ fn sidebar_section_header(ui: &mut egui::Ui, title: &str, subtitle: &str, accent
     ui.add_space(3.0);
 }
 
+fn search_result_row(ui: &mut egui::Ui, title: &str, excerpt: &str, selected: bool) -> Response {
+    let (rect, response) = ui.allocate_exact_size(vec2(ui.available_width(), 50.0), Sense::click());
+    if selected || response.hovered() {
+        ui.painter().rect_filled(
+            rect,
+            CornerRadius::same(5),
+            if selected {
+                Color32::from_rgb(53, 53, 53)
+            } else {
+                Color32::from_rgb(42, 42, 42)
+            },
+        );
+    }
+    ui.painter().text(
+        pos2(rect.left() + 8.0, rect.top() + 8.0),
+        Align2::LEFT_TOP,
+        title,
+        FontId::proportional(11.0),
+        theme::MUTED,
+    );
+    ui.painter().text(
+        pos2(rect.left() + 8.0, rect.top() + 25.0),
+        Align2::LEFT_TOP,
+        elide(excerpt, 42),
+        FontId::proportional(12.5),
+        Color32::from_rgb(216, 216, 216),
+    );
+    response
+}
+
 fn collapsible_section_header(
     ui: &mut egui::Ui,
     title: &str,
@@ -4337,51 +4613,93 @@ fn paint_toolbar_icon(
     let stroke = Stroke::new(1.45, color);
     match icon {
         ToolbarIcon::Highlight => {
+            // A conventional chisel-tip highlighter: dark outline, light body,
+            // and the yellow ink edge used by familiar PDF viewers.
+            let body = vec![
+                center + vec2(-7.0, 3.0),
+                center + vec2(1.5, -5.5),
+                center + vec2(6.5, -0.5),
+                center + vec2(-2.0, 8.0),
+            ];
+            painter.add(egui::Shape::convex_polygon(
+                body.clone(),
+                color.gamma_multiply(0.9),
+                Stroke::new(1.1, Color32::from_rgb(34, 34, 34)),
+            ));
             painter.line_segment(
-                [center + vec2(-6.0, 4.0), center + vec2(3.5, -5.5)],
-                Stroke::new(4.0, color),
+                [center + vec2(-4.5, 5.5), center + vec2(4.0, -3.0)],
+                Stroke::new(1.1, Color32::from_rgb(112, 112, 112)),
             );
             painter.line_segment(
-                [center + vec2(-7.0, 7.0), center + vec2(7.0, 7.0)],
-                Stroke::new(2.2, Color32::from_rgb(232, 190, 62)),
+                [center + vec2(-7.0, 8.0), center + vec2(7.0, 8.0)],
+                Stroke::new(2.5, Color32::from_rgb(255, 204, 48)),
             );
         }
         ToolbarIcon::Pen => {
+            // Fountain-pen nib rather than a generic diagonal slash.
+            let nib = vec![
+                center + vec2(-6.5, 6.5),
+                center + vec2(-2.5, -6.0),
+                center + vec2(6.0, 2.5),
+            ];
+            painter.add(egui::Shape::convex_polygon(nib, color, Stroke::NONE));
             painter.line_segment(
-                [center + vec2(-5.0, 6.0), center + vec2(5.5, -4.5)],
-                Stroke::new(2.2, color),
+                [center + vec2(-4.5, 4.5), center + vec2(3.0, -3.0)],
+                Stroke::new(1.15, Color32::from_rgb(46, 46, 46)),
             );
-            painter.add(egui::Shape::convex_polygon(
-                vec![
-                    center + vec2(-7.0, 7.0),
-                    center + vec2(-3.0, 5.0),
-                    center + vec2(-5.0, 3.0),
-                ],
-                color,
-                Stroke::NONE,
-            ));
+            painter.circle_filled(
+                center + vec2(-3.8, 3.8),
+                1.15,
+                Color32::from_rgb(46, 46, 46),
+            );
         }
         ToolbarIcon::Eraser => {
-            let rect = Rect::from_center_size(center, vec2(14.0, 9.0));
-            painter.rect(rect, 2.0, Color32::TRANSPARENT, stroke, StrokeKind::Inside);
-            painter.line_segment(
-                [
-                    pos2(rect.center().x, rect.top()),
-                    pos2(rect.center().x, rect.bottom()),
+            let white_half = vec![
+                center + vec2(-7.0, 1.5),
+                center + vec2(-2.0, -6.0),
+                center + vec2(2.0, -2.0),
+                center + vec2(-3.0, 6.0),
+            ];
+            let dark_half = vec![
+                center + vec2(2.0, -2.0),
+                center + vec2(7.0, 2.5),
+                center + vec2(2.0, 7.0),
+                center + vec2(-3.0, 6.0),
+            ];
+            painter.add(egui::Shape::convex_polygon(
+                white_half,
+                Color32::from_rgb(238, 238, 238),
+                Stroke::NONE,
+            ));
+            painter.add(egui::Shape::convex_polygon(
+                dark_half,
+                Color32::from_rgb(145, 151, 160),
+                Stroke::NONE,
+            ));
+            painter.add(egui::Shape::closed_line(
+                vec![
+                    center + vec2(-7.0, 1.5),
+                    center + vec2(-2.0, -6.0),
+                    center + vec2(7.0, 2.5),
+                    center + vec2(2.0, 7.0),
+                    center + vec2(-7.0, 1.5),
                 ],
-                stroke,
-            );
+                Stroke::new(1.0, color.gamma_multiply(0.7)),
+            ));
         }
         ToolbarIcon::Comment => {
-            let bubble = Rect::from_center_size(center - vec2(0.0, 1.0), vec2(15.0, 11.0));
-            painter.rect_stroke(bubble, 3.0, stroke, StrokeKind::Inside);
+            let bubble = Rect::from_center_size(center - vec2(0.0, 1.5), vec2(15.0, 11.0));
+            painter.rect_stroke(bubble, 3.5, stroke, StrokeKind::Inside);
             painter.line_segment(
                 [
-                    bubble.left_bottom() + vec2(3.0, 0.0),
-                    bubble.left_bottom() + vec2(1.0, 4.0),
+                    bubble.left_bottom() + vec2(4.0, 0.0),
+                    bubble.left_bottom() + vec2(1.5, 4.0),
                 ],
                 stroke,
             );
+            for x in [-3.5, 0.0, 3.5] {
+                painter.circle_filled(center + vec2(x, -1.5), 0.85, color);
+            }
         }
         ToolbarIcon::Ocr => {
             painter.text(
@@ -4407,16 +4725,24 @@ fn paint_toolbar_icon(
             } else {
                 1.0
             };
-            let arc = (0..=12)
+            let arc = (0..=16)
                 .map(|step| {
-                    let angle = -2.45 + step as f32 / 12.0 * 4.15;
-                    center + vec2(angle.cos() * 7.0 * flip, angle.sin() * 6.0)
+                    let angle =
+                        205.0_f32.to_radians() - step as f32 / 16.0 * 220.0_f32.to_radians();
+                    center + vec2(angle.cos() * 7.2 * flip, angle.sin() * 6.6)
                 })
                 .collect::<Vec<_>>();
-            painter.add(egui::Shape::line(arc.clone(), stroke));
-            let tip = arc[0];
-            painter.line_segment([tip, tip + vec2(4.0 * flip, -0.5)], stroke);
-            painter.line_segment([tip, tip + vec2(0.5 * flip, 4.0)], stroke);
+            painter.add(egui::Shape::line(arc, Stroke::new(1.65, color)));
+            let arrow_tip = center + vec2(-6.5 * flip, -2.7);
+            painter.add(egui::Shape::convex_polygon(
+                vec![
+                    arrow_tip,
+                    arrow_tip + vec2(4.6 * flip, -3.2),
+                    arrow_tip + vec2(4.6 * flip, 3.2),
+                ],
+                color,
+                Stroke::NONE,
+            ));
         }
         ToolbarIcon::Print => {
             painter.rect_stroke(
@@ -4493,13 +4819,19 @@ fn paint_toolbar_icon(
             painter.line_segment([center + vec2(1.0, -6.0), center + vec2(3.0, -3.0)], stroke);
         }
         ToolbarIcon::Settings => {
-            painter.circle_stroke(center, 6.0, stroke);
-            painter.circle_stroke(center, 2.0, stroke);
-            for angle in [0.0_f32, 90.0, 180.0, 270.0] {
-                let radians = angle.to_radians();
-                let direction = vec2(radians.cos(), radians.sin());
-                painter.line_segment([center + direction * 6.0, center + direction * 8.0], stroke);
-            }
+            // A continuous toothed cog reads as Settings at small sizes more
+            // clearly than the previous sunburst of disconnected lines.
+            let teeth = (0..16)
+                .map(|step| {
+                    let angle = step as f32 / 16.0 * std::f32::consts::TAU;
+                    let radius = if step % 2 == 0 { 8.0 } else { 6.35 };
+                    center + vec2(angle.cos() * radius, angle.sin() * radius)
+                })
+                .collect::<Vec<_>>();
+            painter.add(egui::Shape::convex_polygon(teeth, color, Stroke::NONE));
+            painter.circle_filled(center, 4.35, theme::PANEL_BG);
+            painter.circle_stroke(center, 4.35, Stroke::new(1.05, color));
+            painter.circle_filled(center, 1.5, color);
         }
     }
 }
@@ -5244,7 +5576,7 @@ fn available_pdf_apps() -> Vec<ExternalApp> {
             let Some(id) = path.file_name().and_then(|value| value.to_str()) else {
                 continue;
             };
-            if id == "io.crisppdf.CrispPDF.desktop" || !seen.insert(id.to_owned()) {
+            if id == "io.snappdf.SnapPDF.desktop" || !seen.insert(id.to_owned()) {
                 continue;
             }
             let Ok(contents) = fs::read_to_string(&path) else {

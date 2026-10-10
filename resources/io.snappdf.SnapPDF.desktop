@@ -1,12 +1,12 @@
 [Desktop Entry]
 Type=Application
-Name=CrispPDF
+Name=SnapPDF
 Comment=Fast project-oriented PDF viewer
 Exec=@EXEC@ %F
-Icon=io.crisppdf.CrispPDF
+Icon=io.snappdf.SnapPDF
 Terminal=false
 Categories=Office;Viewer;
 MimeType=application/pdf;
 StartupNotify=true
-StartupWMClass=io.crisppdf.CrispPDF
+StartupWMClass=io.snappdf.SnapPDF
 Keywords=PDF;Document;Viewer;Research;

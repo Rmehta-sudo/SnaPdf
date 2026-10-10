@@ -6,6 +6,11 @@
 /.codex/
 /project-memory/.build/
 /project-memory/raw/
+/project-memory/
+/scripts/project_memory/
+/AGENTS.md
+/PROJECT_CONTEXT.md
+**/*handoff*
 /cache/
 /logs/
 /renders/

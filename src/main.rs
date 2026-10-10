@@ -1,4 +1,5 @@
 mod app;
+mod gestures;
 mod model;
 mod ocr;
 mod pdf;

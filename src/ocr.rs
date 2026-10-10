@@ -44,7 +44,7 @@ impl OcrWorker {
         let (command_tx, command_rx) = unbounded();
         let (event_tx, event_rx) = unbounded();
         std::thread::Builder::new()
-            .name("crisppdf-ocr".to_owned())
+            .name("snappdf-ocr".to_owned())
             .spawn(move || worker_loop(command_rx, event_tx, repaint))
             .expect("could not start OCR worker thread");
         Self {
@@ -64,12 +64,12 @@ impl OcrProcess {
     fn start() -> Result<Self, String> {
         let root = dirs::data_local_dir()
             .unwrap_or_else(|| PathBuf::from("."))
-            .join("crisppdf")
+            .join("snappdf")
             .join("ocr");
         let python = root.join("venv/bin/python");
         let script = root.join("ocr_worker.py");
         if !python.is_file() || !script.is_file() {
-            return Err("Local OCR is not installed. Run scripts/install-ocr.sh from the CrispPDF project once.".to_owned());
+            return Err("Local OCR is not installed. Run scripts/install-ocr.sh from the SnapPDF project once.".to_owned());
         }
         let mut child = Command::new(python)
             .arg(script)
@@ -157,7 +157,7 @@ fn worker_loop(
                     }
                     let cache = dirs::cache_dir()
                         .unwrap_or_else(std::env::temp_dir)
-                        .join("crisppdf");
+                        .join("snappdf");
                     fs::create_dir_all(&cache)
                         .map_err(|error| format!("Could not create OCR cache: {error}"))?;
                     let path = cache.join(format!("snip-{}-{request_id}.ppm", std::process::id()));

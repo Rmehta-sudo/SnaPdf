@@ -73,6 +73,71 @@ pub struct PdfSearchMatch {
     pub excerpt: String,
 }
 
+#[derive(Debug, Clone)]
+pub struct PdfFileSearchMatches {
+    pub path: PathBuf,
+    pub matches: Vec<PdfSearchMatch>,
+}
+
+/// Search PDFs independently of the viewer's single-document render worker.
+/// This keeps open-tab and explicit workspace searches from interrupting page rendering.
+pub fn search_pdf_files(
+    paths: &[PathBuf],
+    query: &str,
+    max_matches_per_file: usize,
+) -> Result<Vec<PdfFileSearchMatches>, String> {
+    let pdfium = pdfium_bundled::bind_bundled().map_err(|error| error.to_string())?;
+    let needle = query.trim().to_lowercase();
+    if needle.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let mut results = Vec::new();
+    for path in paths {
+        let Ok(document) = pdfium.load_pdf_from_file(path, None) else {
+            continue;
+        };
+        let mut matches = Vec::new();
+        for (page_index, page) in document.pages().iter().enumerate() {
+            let Ok(text) = page.text() else {
+                continue;
+            };
+            let original = text.all();
+            let lower = original.to_lowercase();
+            if !lower.contains(&needle) {
+                continue;
+            }
+            let excerpt = original
+                .lines()
+                .find(|line| line.to_lowercase().contains(&needle))
+                .unwrap_or(&original)
+                .split_whitespace()
+                .take(22)
+                .collect::<Vec<_>>()
+                .join(" ");
+            for _ in lower.match_indices(&needle) {
+                matches.push(PdfSearchMatch {
+                    page_index,
+                    excerpt: excerpt.clone(),
+                });
+                if matches.len() >= max_matches_per_file {
+                    break;
+                }
+            }
+            if matches.len() >= max_matches_per_file {
+                break;
+            }
+        }
+        if !matches.is_empty() {
+            results.push(PdfFileSearchMatches {
+                path: path.clone(),
+                matches,
+            });
+        }
+    }
+    Ok(results)
+}
+
 #[derive(Debug)]
 pub enum RenderEvent {
     Ready,
@@ -138,7 +203,7 @@ impl RenderWorker {
         let worker_generation = desired_generation.clone();
 
         std::thread::Builder::new()
-            .name("crisppdf-renderer".to_owned())
+            .name("snappdf-renderer".to_owned())
             .spawn(move || {
                 worker_loop(
                     command_rx,
@@ -496,7 +561,7 @@ fn worker_loop(
                                         .map_err(|error| error.to_string())?;
                                 }
                                 highlight
-                                    .set_creator("CrispPDF")
+                                    .set_creator("SnapPDF")
                                     .map_err(|error| error.to_string())?;
                                 highlight
                                     .set_is_printed(true)
@@ -527,7 +592,7 @@ fn worker_loop(
                                     color[0], color[1], color[2], color[3],
                                 ))
                                 .map_err(|error| error.to_string())?;
-                                note.set_creator("CrispPDF")
+                                note.set_creator("SnapPDF")
                                     .map_err(|error| error.to_string())?;
                                 note.set_is_printed(true)
                                     .map_err(|error| error.to_string())?;
@@ -646,7 +711,7 @@ fn worker_loop(
                                     position[0] + 9.0,
                                 ))
                                 .map_err(|error| error.to_string())?;
-                                note.set_creator("CrispPDF")
+                                note.set_creator("SnapPDF")
                                     .map_err(|error| error.to_string())?;
                                 note.set_is_printed(true)
                                     .map_err(|error| error.to_string())?;

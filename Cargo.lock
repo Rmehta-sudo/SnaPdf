@@ -445,22 +445,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "crisppdf"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "crossbeam-channel",
- "dirs",
- "eframe",
- "image",
- "pdfium-bundled",
- "rfd",
- "serde",
- "serde_json",
- "walkdir",
-]
-
-[[package]]
 name = "crossbeam-channel"
 version = "0.5.17"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2638,6 +2622,24 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "dd538fb6910ac1099850255cf94a94df6551fbdd602454387d0adb2d1ca6dead"
 dependencies = [
  "serde",
+]
+
+[[package]]
+name = "snappdf"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "crossbeam-channel",
+ "dirs",
+ "eframe",
+ "image",
+ "pdfium-bundled",
+ "raw-window-handle",
+ "rfd",
+ "serde",
+ "serde_json",
+ "walkdir",
+ "x11rb",
 ]
 
 [[package]]

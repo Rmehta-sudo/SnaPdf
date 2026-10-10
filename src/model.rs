@@ -15,12 +15,15 @@ pub struct AppState {
     /// Display-only names keyed by the real PDF path. Files are never renamed on disk.
     #[serde(default)]
     pub file_aliases: HashMap<PathBuf, String>,
-    /// CrispPDF-owned overlay annotations. Original PDF files are never modified.
+    /// SnapPDF-owned overlay annotations. Original PDF files are never modified.
     #[serde(default)]
     pub annotations: HashMap<PathBuf, Vec<Annotation>>,
     /// Open document tabs, restored across launches.
     #[serde(default)]
     pub open_documents: Vec<PathBuf>,
+    /// The ten most recently closed tabs, newest first. This powers Ctrl+Shift+T.
+    #[serde(default)]
+    pub closed_documents: Vec<PathBuf>,
     #[serde(default)]
     pub active_document: Option<PathBuf>,
     /// Zero-based last visible page for each document.
@@ -191,6 +194,24 @@ impl AppState {
         }
     }
 
+    pub fn record_closed(&mut self, path: &Path) {
+        // Reopening and closing a tab again should move it to the top rather than
+        // leaving duplicate entries in the restore history.
+        self.closed_documents.retain(|closed| closed != path);
+        self.closed_documents.insert(0, path.to_path_buf());
+        self.closed_documents.truncate(10);
+    }
+
+    pub fn take_most_recent_closed(&mut self) -> Option<PathBuf> {
+        while let Some(path) = self.closed_documents.first().cloned() {
+            self.closed_documents.remove(0);
+            if path.is_file() && is_pdf(&path) {
+                return Some(path);
+            }
+        }
+        None
+    }
+
     /// Normalizes recents once during startup. The UI takes a snapshot after this call,
     /// so opening documents does not visually reorder the list until the next launch.
     pub fn normalize_recents(&mut self) {
@@ -251,6 +272,7 @@ impl AppState {
         self.file_aliases.retain(|path, _| path.is_file());
         self.annotations.retain(|path, _| path.is_file());
         self.open_documents.retain(|path| path.is_file());
+        self.closed_documents.retain(|path| path.is_file());
         self.reading_positions.retain(|path, _| path.is_file());
         if self
             .active_document
@@ -344,5 +366,27 @@ mod tests {
     fn legacy_state_uses_sixty_percent_chrome_ratio() {
         let state: AppState = serde_json::from_str("{}").expect("legacy state should deserialize");
         assert!((state.chrome_scale_ratio - 0.6).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn closed_tabs_keep_the_ten_newest_in_reverse_close_order() {
+        let mut state = AppState::default();
+        for index in 0..11 {
+            state.record_closed(Path::new(&format!("/tmp/{index}.pdf")));
+        }
+        assert_eq!(state.closed_documents.len(), 10);
+        assert_eq!(state.closed_documents[0], PathBuf::from("/tmp/10.pdf"));
+        assert_eq!(state.closed_documents[9], PathBuf::from("/tmp/1.pdf"));
+
+        state.record_closed(Path::new("/tmp/5.pdf"));
+        assert_eq!(state.closed_documents[0], PathBuf::from("/tmp/5.pdf"));
+        assert_eq!(
+            state
+                .closed_documents
+                .iter()
+                .filter(|path| path.as_path() == Path::new("/tmp/5.pdf"))
+                .count(),
+            1
+        );
     }
 }

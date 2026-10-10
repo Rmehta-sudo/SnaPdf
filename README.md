@@ -1,6 +1,6 @@
-# CrispPDF
+# SnapPDF
 
-CrispPDF is a fast, project-oriented PDF viewer for Ubuntu, written in Rust. It combines a
+SnapPDF is a fast, project-oriented PDF viewer for Ubuntu, written in Rust. It combines a
 Codex-style project sidebar with a crisp, continuously scrolling PDF canvas.
 
 ## Features
@@ -9,8 +9,8 @@ Codex-style project sidebar with a crisp, continuously scrolling PDF canvas.
 - Bundled PDFium renderer; no system PDF library is required.
 - Background page rendering so input and scrolling stay responsive.
 - High-DPI page textures, virtualized rendering, and a bounded texture cache.
-- Whole-interface zoom (`Ctrl++`, `Ctrl+-`, `Ctrl+0`), fit-to-width, continuous scrolling,
-  restored reading position, and drag-and-drop.
+- Whole-interface zoom (`Ctrl++`, `Ctrl+-`, `Ctrl+0`), native two-finger trackpad pinch zoom for
+  the PDF canvas, continuous scrolling, restored reading position, and drag-and-drop.
 - Project folders with recursive PDF-only discovery and filename filtering.
 - Stable alphabetical file order inside projects; opening a PDF never reshuffles the project tree.
 - The 15 most recently opened PDFs, ordered once at startup so clicking never reshuffles the UI.
@@ -24,7 +24,7 @@ Codex-style project sidebar with a crisp, continuously scrolling PDF canvas.
 - Faster animated wheel scrolling with strong acceleration while up/down arrows are held.
 - Hover-only three-dot menus with polished project/PDF actions.
 - Open-from-file-manager support and Ubuntu `application/pdf` integration.
-- Stable Ubuntu app/dock identity with a dedicated CrispPDF icon.
+- Stable Ubuntu app/dock identity with a dedicated SnapPDF icon.
 - Obsidian-inspired dark UI with a narrow icon rail, nested file tree, document tabs, selectable
   copyable path bar, quiet surfaces, and restrained hover/selection states.
 - Vector-drawn sidebar icons, so the UI does not depend on missing Unicode glyphs.
@@ -35,7 +35,7 @@ Codex-style project sidebar with a crisp, continuously scrolling PDF canvas.
 - Comments always render above highlights. Right-click highlights to add/edit/delete comments;
   right-click comments and other annotations to edit or delete them. The eraser supports direct
   click-and-drag removal, and selecting an active tool again returns to Select mode.
-- Multiple persistent document tabs, in-document search with page highlights, CUPS printing with
+- Multiple persistent document tabs, a ten-item closed-tab restore history, in-document search with page highlights, CUPS printing with
   printer/page-range/copy controls, and export of PDF-native highlights, comments, text boxes,
   shapes, and stamps into a new PDF copy.
 - An in-app **Open with...** chooser lists other installed PDF-capable applications for any sidebar
@@ -61,9 +61,9 @@ the release executable, so installed copies do not need a runtime download.
 ./scripts/install.sh
 ```
 
-This installs into your user account, adds CrispPDF to the application menu, registers it for PDF
+This installs into your user account, adds SnapPDF to the application menu, registers it for PDF
 files, makes it the default PDF viewer, and installs the CPU-only local OCR environment. No `sudo`
-is required. OCR models download once and remain in `~/.local/share/crisppdf/ocr/models`.
+is required. OCR models download once and remain in `~/.local/share/snappdf/ocr/models`.
 
 ## Shortcuts
 
@@ -74,6 +74,8 @@ is required. OCR models download once and remain in `~/.local/share/crisppdf/ocr
 | `Ctrl+-` | Scale the entire app down |
 | `Ctrl+F` | Find text in the current PDF |
 | `Ctrl+P` | Open the print dialog |
+| `Ctrl+W` | Close current PDF tab |
+| `Ctrl+Shift+T` | Reopen the most recently closed PDF tab (up to 10) |
 | `Up` / `Down` | Scroll document |
 | `Left` / `Right` | Previous / next page |
 | Drag text, `Ctrl+C` | Select and copy PDF text |
@@ -83,7 +85,7 @@ is required. OCR models download once and remain in `~/.local/share/crisppdf/ocr
 ## State and privacy
 
 Projects, recent documents, display names, and annotation overlays are stored locally in
-`~/.config/crisppdf/state.json`. OCR runs locally after the one-time model download. CrispPDF does
+`~/.config/snappdf/state.json`. OCR runs locally after the one-time model download. SnapPDF does
 not upload documents or telemetry. Annotation tools do not modify the original PDF by default; the
 explicit Save-to-PDF action creates a timestamped backup before embedding annotations into it.
 
@@ -91,4 +93,4 @@ explicit Save-to-PDF action creates a timestamped backup before embedding annota
 
 Highlights, comments, text boxes, shapes, stamps, ink/signatures, and attachment references can be
 exported into a new annotated PDF. They can also be embedded into the source PDF through the
-explicit confirmed Save-to-PDF action; CrispPDF creates a timestamped backup first.
+explicit confirmed Save-to-PDF action; SnapPDF creates a timestamped backup first.

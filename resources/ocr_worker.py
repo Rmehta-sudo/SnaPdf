@@ -9,7 +9,7 @@ import time
 
 os.environ.setdefault(
     "PADDLE_PDX_CACHE_HOME",
-    os.path.join(os.path.expanduser("~"), ".local", "share", "crisppdf", "ocr", "models"),
+    os.path.join(os.path.expanduser("~"), ".local", "share", "snappdf", "ocr", "models"),
 )
 os.environ.setdefault("PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK", "True")
 os.environ.setdefault("FLAGS_use_mkldnn", "0")
