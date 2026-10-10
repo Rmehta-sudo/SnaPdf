@@ -15,6 +15,38 @@ pub struct AppState {
     /// Display-only names keyed by the real PDF path. Files are never renamed on disk.
     #[serde(default)]
     pub file_aliases: HashMap<PathBuf, String>,
+    /// CrispPDF-owned overlay annotations. Original PDF files are never modified.
+    #[serde(default)]
+    pub annotations: HashMap<PathBuf, Vec<Annotation>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Annotation {
+    pub id: u64,
+    pub page: usize,
+    pub kind: AnnotationKind,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type")]
+pub enum AnnotationKind {
+    Highlight {
+        /// One or more PDF-coordinate rectangles: left, bottom, right, top.
+        rects: Vec<[f32; 4]>,
+        color: [u8; 4],
+    },
+    Ink {
+        /// PDF-coordinate points.
+        points: Vec<[f32; 2]>,
+        color: [u8; 4],
+        width: f32,
+    },
+    Note {
+        /// PDF-coordinate anchor.
+        position: [f32; 2],
+        text: String,
+        color: [u8; 4],
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -167,6 +199,7 @@ impl AppState {
                 .retain(|document| document.path.is_file());
         }
         self.file_aliases.retain(|path, _| path.is_file());
+        self.annotations.retain(|path, _| path.is_file());
         if self
             .last_document
             .as_ref()

@@ -64,3 +64,35 @@ left/right page jumps remain immediate.
 Every project and PDF row always owns a stable options-button ID, but its ASCII three-dot label is
 painted only while the row is hovered. Clicking opens a rounded, high-contrast popup with clear
 rename/reset/remove grouping. ASCII dots avoid the missing-symbol issue from the first release.
+
+## DEC-007: non-destructive annotation overlays
+
+Store highlights, ink paths, and comments in `~/.config/crisppdf/state.json` using PDF coordinates.
+Render them over pages and keep the original PDF byte-for-byte unchanged. Maintain per-document
+in-memory undo/redo snapshots; exporting overlays into a PDF remains separate future work.
+
+## DEC-008: hybrid local OCR
+
+Use exact embedded PDF glyphs as the zero-latency first path. For image-only snips, render only the
+selected region at high resolution and send it to a persistent local Python worker. PP-OCRv5 mobile
+handles normal text; the separate PP-FormulaNet-S mode returns LaTeX for formula crops. The worker
+uses CPU-only PaddlePaddle with oneDNN disabled because PaddlePaddle 3.3.1 raised
+`ConvertPirAttribute2RuntimeAttribute` for the mobile OCR graph when oneDNN was enabled.
+
+Math OCR must not take the embedded-text shortcut used by normal Snip OCR: the selected image region
+is always sent to PP-FormulaNet-S so its output is LaTeX. The formula model download stalled on the
+workstation network, so this path is implemented but not yet quality- or latency-verified.
+
+## DEC-009: outline-backed inferred links
+
+Some course PDFs contain a complete bookmark tree but no `/Annots` entries on their printed contents
+pages. Keep native PDFium link annotations authoritative, then supplement non-overlapping regions by
+normalizing bookmark titles and matching them against extracted glyph text. Also infer visibly
+printed HTTP(S) and `www.` addresses. The Contents sidebar renders the same bookmark tree and routes
+destinations through the same safe-link/page-jump handler.
+
+## DEC-010: restrained visual language
+
+Use neutral dark surfaces, thin separators, compact row heights, one restrained blue accent, and
+hover/selection states rather than persistent multicolor cards. Library and Contents are sidebar
+views, while project folders and files retain hierarchy through indentation and typography.

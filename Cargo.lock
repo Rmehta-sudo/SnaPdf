@@ -452,6 +452,7 @@ dependencies = [
  "crossbeam-channel",
  "dirs",
  "eframe",
+ "image",
  "pdfium-bundled",
  "rfd",
  "serde",

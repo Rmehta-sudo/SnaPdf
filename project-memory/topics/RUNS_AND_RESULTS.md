@@ -33,3 +33,24 @@ completion evidence. Do not compare configurations as controlled unless their di
 - `cargo build --release --offline`: completed successfully and installed with `scripts/install.sh`.
 - Held Down/Up and repeated Left/Right navigation were exercised against
   `Physics_of_the_Early_Universe_Part_III.pdf`; the process remained alive.
+
+## 2026-10-10 local OCR benchmark
+
+- Hardware: Ryzen 7 8845HS CPU, no usable NVIDIA CUDA runtime.
+- Engine: persistent PP-OCRv5 mobile text detection/recognition on CPU, oneDNN disabled.
+- Synthetic 900x180 scientific-text crop result: `Energy E = mc² and ∫ f(x) dx`.
+- Warm inference reported by the worker: 254 ms. Full cold process startup plus model load and one
+  inference was 2.23 seconds and used about 531 MiB peak RSS. This supports a sub-two-second warm
+  crop target but is not a universal latency guarantee.
+
+## 2026-10-10 outline, inferred-link, and restrained-UI release
+
+- Inspected `Physics_of_the_Early_Universe_Part_III.pdf`: it exposes a deep bookmark outline but its
+  first contents pages do not expose PDF link annotations.
+- Added bookmark-backed Contents navigation, inferred clickable TOC/title regions, and printed URL
+  detection while preserving native PDF links as authoritative.
+- Math OCR no longer uses the embedded-text shortcut; formula crops route to the formula engine.
+- `cargo test --offline`: 8/8 tests passed, including inferred outline and printed-URL links.
+- `cargo build --release --offline`: completed successfully; `scripts/install.sh` reinstalled the
+  default PDF handler. The installed app remained alive after launching the POEU Part III PDF.
+- PP-FormulaNet-S acquisition stalled; formula OCR accuracy and latency remain unverified.

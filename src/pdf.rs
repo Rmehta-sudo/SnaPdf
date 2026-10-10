@@ -19,6 +19,13 @@ pub enum RenderCommand {
         page_index: usize,
         generation: u64,
     },
+    RenderRegion {
+        page_index: usize,
+        /// PDF coordinates: left, bottom, right, top.
+        bounds: [f32; 4],
+        generation: u64,
+        request_id: u64,
+    },
     Shutdown,
 }
 
@@ -42,6 +49,13 @@ pub struct PdfLinkRegion {
     pub target: LinkTarget,
 }
 
+#[derive(Debug, Clone)]
+pub struct PdfOutlineItem {
+    pub title: String,
+    pub depth: usize,
+    pub target: Option<LinkTarget>,
+}
+
 #[derive(Debug)]
 pub enum RenderEvent {
     Ready,
@@ -49,6 +63,7 @@ pub enum RenderEvent {
         path: PathBuf,
         generation: u64,
         page_sizes: Vec<[f32; 2]>,
+        outline: Vec<PdfOutlineItem>,
     },
     PageRendered {
         page_index: usize,
@@ -63,6 +78,13 @@ pub enum RenderEvent {
         generation: u64,
         glyphs: Vec<TextGlyph>,
         links: Vec<PdfLinkRegion>,
+    },
+    RegionRendered {
+        generation: u64,
+        request_id: u64,
+        width: usize,
+        height: usize,
+        rgb: Vec<u8>,
     },
     Error {
         generation: u64,
@@ -152,11 +174,14 @@ fn worker_loop(
                             .iter()
                             .map(|page| [page.width().value, page.height().value])
                             .collect();
+                        let mut outline = Vec::new();
+                        append_bookmarks(opened.bookmarks().root(), 0, &mut outline);
                         document = Some(opened);
                         let _ = events.send(RenderEvent::DocumentOpened {
                             path,
                             generation,
                             page_sizes,
+                            outline,
                         });
                     }
                     Err(error) => {
@@ -317,7 +342,111 @@ fn worker_loop(
                 }
                 repaint.request_repaint();
             }
+            RenderCommand::RenderRegion {
+                page_index,
+                bounds,
+                generation,
+                request_id,
+            } => {
+                if generation != active_generation
+                    || generation != desired_generation.load(Ordering::Relaxed)
+                {
+                    continue;
+                }
+                let Some(document) = document.as_ref() else {
+                    continue;
+                };
+                let rendered = (|| -> Result<_, PdfiumError> {
+                    let page = document.pages().get(page_index as i32)?;
+                    let page_width = page.width().value.max(1.0);
+                    let page_height = page.height().value.max(1.0);
+                    let bitmap =
+                        page.render_with_config(&PdfRenderConfig::new().set_target_width(2400))?;
+                    let image = bitmap.as_image()?.to_rgb8();
+                    let [left, bottom, right, top] = bounds;
+                    let x1 = (left.min(right) / page_width * image.width() as f32)
+                        .floor()
+                        .clamp(0.0, image.width().saturating_sub(1) as f32)
+                        as u32;
+                    let x2 = (left.max(right) / page_width * image.width() as f32)
+                        .ceil()
+                        .clamp((x1 + 1) as f32, image.width() as f32)
+                        as u32;
+                    let y1 = ((page_height - top.max(bottom)) / page_height * image.height() as f32)
+                        .floor()
+                        .clamp(0.0, image.height().saturating_sub(1) as f32)
+                        as u32;
+                    let y2 = ((page_height - top.min(bottom)) / page_height * image.height() as f32)
+                        .ceil()
+                        .clamp((y1 + 1) as f32, image.height() as f32)
+                        as u32;
+                    let crop =
+                        image::imageops::crop_imm(&image, x1, y1, x2 - x1, y2 - y1).to_image();
+                    Ok((
+                        crop.width() as usize,
+                        crop.height() as usize,
+                        crop.into_raw(),
+                    ))
+                })();
+                match rendered {
+                    Ok((width, height, rgb)) => {
+                        let _ = events.send(RenderEvent::RegionRendered {
+                            generation,
+                            request_id,
+                            width,
+                            height,
+                            rgb,
+                        });
+                    }
+                    Err(error) => {
+                        let _ = events.send(RenderEvent::Error {
+                            generation,
+                            message: format!("Could not render OCR region: {error}"),
+                        });
+                    }
+                }
+                repaint.request_repaint();
+            }
             RenderCommand::Shutdown => break,
         }
+    }
+}
+
+fn append_bookmarks(
+    mut bookmark: Option<PdfBookmark<'_>>,
+    depth: usize,
+    output: &mut Vec<PdfOutlineItem>,
+) {
+    while let Some(item) = bookmark {
+        let next = item.next_sibling();
+        let target = item
+            .destination()
+            .and_then(|destination| destination.page_index().ok())
+            .map(|page| LinkTarget::Page(page as usize))
+            .or_else(|| {
+                item.action().and_then(|action| {
+                    if let Some(uri_action) = action.as_uri_action() {
+                        uri_action.uri().ok().map(LinkTarget::Uri)
+                    } else if let Some(local_action) = action.as_local_destination_action() {
+                        local_action
+                            .destination()
+                            .ok()?
+                            .page_index()
+                            .ok()
+                            .map(|page| LinkTarget::Page(page as usize))
+                    } else {
+                        None
+                    }
+                })
+            });
+        if let Some(title) = item.title().filter(|title| !title.trim().is_empty()) {
+            output.push(PdfOutlineItem {
+                title,
+                depth: depth.min(8),
+                target,
+            });
+        }
+        append_bookmarks(item.first_child(), depth + 1, output);
+        bookmark = next;
     }
 }

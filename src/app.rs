@@ -1,5 +1,8 @@
-use crate::model::{AppState, RecentDocument, is_pdf};
-use crate::pdf::{LinkTarget, PdfLinkRegion, RenderCommand, RenderEvent, RenderWorker, TextGlyph};
+use crate::model::{Annotation, AnnotationKind, AppState, RecentDocument, is_pdf};
+use crate::ocr::{OcrCommand, OcrEvent, OcrWorker};
+use crate::pdf::{
+    LinkTarget, PdfLinkRegion, PdfOutlineItem, RenderCommand, RenderEvent, RenderWorker, TextGlyph,
+};
 use crate::{storage, theme};
 use anyhow::{Result, anyhow};
 use eframe::egui::{
@@ -9,6 +12,7 @@ use eframe::egui::{
 };
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 const MAX_TEXTURES: usize = 10;
 const MAX_TEXTURE_BYTES: usize = 256 * 1024 * 1024;
@@ -28,6 +32,35 @@ struct TextSelection {
     page_index: usize,
     anchor: usize,
     focus: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ToolMode {
+    Select,
+    Highlight,
+    Pen,
+    Eraser,
+    Note,
+    Ocr,
+    MathOcr,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SidebarTab {
+    Library,
+    Contents,
+}
+
+struct OcrPopup {
+    text: String,
+    detail: String,
+    busy: bool,
+}
+
+struct NoteDraft {
+    page: usize,
+    position: [f32; 2],
+    text: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -73,6 +106,7 @@ pub struct CrispPdfApp {
     /// Frozen at startup so clicking a PDF never reshuffles the visible recent list.
     session_recents: Vec<RecentDocument>,
     worker: RenderWorker,
+    ocr_worker: OcrWorker,
     project_files: HashMap<PathBuf, Vec<PathBuf>>,
     current_path: Option<PathBuf>,
     page_sizes: Vec<[f32; 2]>,
@@ -96,6 +130,18 @@ pub struct CrispPdfApp {
     rename_target: Option<RenameTarget>,
     rename_buffer: String,
     rename_focus_requested: bool,
+    tool_mode: ToolMode,
+    drag_start: Option<egui::Pos2>,
+    ink_points: Vec<[f32; 2]>,
+    note_draft: Option<NoteDraft>,
+    ocr_popup: Option<OcrPopup>,
+    next_ocr_request: u64,
+    annotation_undo: Vec<Vec<Annotation>>,
+    annotation_redo: Vec<Vec<Annotation>>,
+    annotation_color: Color32,
+    math_ocr_requests: HashSet<u64>,
+    sidebar_tab: SidebarTab,
+    outline: Vec<PdfOutlineItem>,
 }
 
 impl CrispPdfApp {
@@ -114,10 +160,13 @@ impl CrispPdfApp {
             .map(|project| (project.root.clone(), project.pdf_files()))
             .collect();
 
+        let ocr_worker = OcrWorker::spawn(creation.egui_ctx.clone());
+        let _ = ocr_worker.commands.send(OcrCommand::Warmup);
         let mut app = Self {
             state,
             session_recents,
             worker: RenderWorker::spawn(creation.egui_ctx.clone()),
+            ocr_worker,
             project_files,
             current_path: None,
             page_sizes: Vec::new(),
@@ -141,6 +190,18 @@ impl CrispPdfApp {
             rename_target: None,
             rename_buffer: String::new(),
             rename_focus_requested: false,
+            tool_mode: ToolMode::Select,
+            drag_start: None,
+            ink_points: Vec::new(),
+            note_draft: None,
+            ocr_popup: None,
+            next_ocr_request: 1,
+            annotation_undo: Vec::new(),
+            annotation_redo: Vec::new(),
+            annotation_color: Color32::from_rgb(255, 211, 74),
+            math_ocr_requests: HashSet::new(),
+            sidebar_tab: SidebarTab::Library,
+            outline: Vec::new(),
         };
 
         if let Some(path) = initial_path {
@@ -163,8 +224,12 @@ impl CrispPdfApp {
         self.pending_pages.clear();
         self.text_layers.clear();
         self.link_layers.clear();
+        self.outline.clear();
         self.pending_text.clear();
         self.text_selection = None;
+        self.annotation_undo.clear();
+        self.annotation_redo.clear();
+        self.tool_mode = ToolMode::Select;
         self.current_page = 0;
         self.zoom = 1.0;
         self.fit_width_requested = true;
@@ -231,8 +296,10 @@ impl CrispPdfApp {
                     path,
                     generation,
                     page_sizes,
+                    outline,
                 } if generation == self.generation => {
                     self.page_sizes = page_sizes;
+                    self.outline = outline;
                     self.status = format!("{} - {} pages", file_name(&path), self.page_sizes.len());
                     self.fit_width_requested = true;
                 }
@@ -278,11 +345,35 @@ impl CrispPdfApp {
                     page_index,
                     generation,
                     glyphs,
-                    links,
+                    mut links,
                 } if generation == self.generation => {
                     self.pending_text.remove(&(page_index, generation));
+                    links.extend(infer_text_links(&glyphs, &self.outline, &links));
                     self.text_layers.insert(page_index, glyphs);
                     self.link_layers.insert(page_index, links);
+                }
+                RenderEvent::RegionRendered {
+                    generation,
+                    request_id,
+                    width,
+                    height,
+                    rgb,
+                } if generation == self.generation => {
+                    let math = self.math_ocr_requests.remove(&request_id);
+                    let _ = self.ocr_worker.commands.send(OcrCommand::Recognize {
+                        request_id,
+                        width,
+                        height,
+                        rgb,
+                        math,
+                    });
+                    if let Some(popup) = self.ocr_popup.as_mut() {
+                        popup.detail = if math {
+                            "Converting formula to LaTeX locally; first use may finish the model download...".to_owned()
+                        } else {
+                            "Reading image locally with PaddleOCR...".to_owned()
+                        };
+                    }
                 }
                 RenderEvent::Error {
                     generation,
@@ -291,6 +382,44 @@ impl CrispPdfApp {
                     self.status = message;
                 }
                 _ => {}
+            }
+        }
+        while let Ok(event) = self.ocr_worker.events.try_recv() {
+            match event {
+                OcrEvent::Ready => {
+                    if self.status == "Preparing local OCR..." {
+                        self.status = "Ready".to_owned();
+                    }
+                }
+                OcrEvent::Result {
+                    request_id,
+                    text,
+                    engine,
+                    elapsed_ms,
+                } => {
+                    self.ocr_popup = Some(OcrPopup {
+                        text,
+                        detail: format!(
+                            "{engine} - {elapsed_ms} ms - processed locally (request {request_id})"
+                        ),
+                        busy: false,
+                    });
+                }
+                OcrEvent::Error {
+                    request_id,
+                    message,
+                } => {
+                    if request_id.is_some() {
+                        self.ocr_popup = Some(OcrPopup {
+                            text: String::new(),
+                            detail: message,
+                            busy: false,
+                        });
+                    } else {
+                        self.status =
+                            "Local OCR unavailable; PDF text snips still work.".to_owned();
+                    }
+                }
             }
         }
     }
@@ -358,6 +487,8 @@ impl CrispPdfApp {
         let zoom_out = KeyboardShortcut::new(Modifiers::CTRL, Key::Minus);
         let fit = KeyboardShortcut::new(Modifiers::CTRL, Key::Num0);
         let copy = KeyboardShortcut::new(Modifiers::CTRL, Key::C);
+        let undo = KeyboardShortcut::new(Modifiers::CTRL, Key::Z);
+        let redo = KeyboardShortcut::new(Modifiers::CTRL | Modifiers::SHIFT, Key::Z);
 
         if ctx.input_mut(|input| input.consume_shortcut(&open)) {
             self.open_file_dialog();
@@ -376,6 +507,12 @@ impl CrispPdfApp {
         {
             ctx.copy_text(text);
             self.status = "Selected text copied.".to_owned();
+        }
+        if ctx.input_mut(|input| input.consume_shortcut(&undo)) {
+            self.undo_annotation();
+        }
+        if ctx.input_mut(|input| input.consume_shortcut(&redo)) {
+            self.redo_annotation();
         }
 
         if !ctx.egui_wants_keyboard_input() && !self.page_sizes.is_empty() {
@@ -423,6 +560,68 @@ impl CrispPdfApp {
         }
     }
 
+    fn current_annotations(&self) -> &[Annotation] {
+        self.current_path
+            .as_ref()
+            .and_then(|path| self.state.annotations.get(path))
+            .map(Vec::as_slice)
+            .unwrap_or_default()
+    }
+
+    fn push_annotation_history(&mut self) {
+        self.annotation_undo
+            .push(self.current_annotations().to_vec());
+        if self.annotation_undo.len() > 64 {
+            self.annotation_undo.remove(0);
+        }
+        self.annotation_redo.clear();
+    }
+
+    fn add_annotation(&mut self, page: usize, kind: AnnotationKind) {
+        let Some(path) = self.current_path.clone() else {
+            return;
+        };
+        self.push_annotation_history();
+        let id = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos() as u64;
+        self.state
+            .annotations
+            .entry(path)
+            .or_default()
+            .push(Annotation { id, page, kind });
+        self.persist();
+    }
+
+    fn replace_annotations(&mut self, annotations: Vec<Annotation>) {
+        let Some(path) = self.current_path.clone() else {
+            return;
+        };
+        self.state.annotations.insert(path, annotations);
+        self.persist();
+    }
+
+    fn undo_annotation(&mut self) {
+        let Some(previous) = self.annotation_undo.pop() else {
+            return;
+        };
+        self.annotation_redo
+            .push(self.current_annotations().to_vec());
+        self.replace_annotations(previous);
+        self.status = "Annotation undone.".to_owned();
+    }
+
+    fn redo_annotation(&mut self) {
+        let Some(next) = self.annotation_redo.pop() else {
+            return;
+        };
+        self.annotation_undo
+            .push(self.current_annotations().to_vec());
+        self.replace_annotations(next);
+        self.status = "Annotation restored.".to_owned();
+    }
+
     fn dropped_files(&mut self, ctx: &egui::Context) {
         let files = ctx.input(|input| input.raw.dropped_files.clone());
         if let Some(path) = files
@@ -449,13 +648,13 @@ impl CrispPdfApp {
             .show(root, |ui| {
                 ui.horizontal(|ui| {
                     ui.vertical(|ui| {
-                        ui.label(RichText::new("CrispPDF").size(21.0).strong());
-                        ui.label(RichText::new("PDF LIBRARY").size(10.0).color(theme::MUTED));
+                        ui.label(RichText::new("CrispPDF").size(20.0).strong());
+                        ui.label(RichText::new("DOCUMENTS").size(9.5).color(theme::MUTED));
                     });
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                         if ui
-                            .button("Add folder")
-                            .on_hover_text("Add a project folder")
+                            .button("Add project")
+                            .on_hover_text("Add a PDF folder")
                             .clicked()
                         {
                             self.add_project_dialog();
@@ -463,6 +662,23 @@ impl CrispPdfApp {
                     });
                 });
                 ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    if sidebar_tab_button(ui, self.sidebar_tab == SidebarTab::Library, "Library")
+                        .clicked()
+                    {
+                        self.sidebar_tab = SidebarTab::Library;
+                    }
+                    if sidebar_tab_button(ui, self.sidebar_tab == SidebarTab::Contents, "Contents")
+                        .clicked()
+                    {
+                        self.sidebar_tab = SidebarTab::Contents;
+                    }
+                });
+                ui.add_space(8.0);
+                if self.sidebar_tab == SidebarTab::Contents {
+                    self.outline_sidebar(ui);
+                    return;
+                }
                 ui.horizontal(|ui| {
                     if ui
                         .button("Open")
@@ -492,7 +708,7 @@ impl CrispPdfApp {
                     .id_salt("sidebar-scroll")
                     .auto_shrink([false, false])
                     .show(ui, |ui| {
-                        ui.label(section_label("PROJECTS"));
+                        sidebar_section_header(ui, "PROJECTS", "Pinned PDF folders", theme::ACCENT);
                         let mut remove_project = None;
                         let mut open_after_ui = None;
                         let mut rename_request = None;
@@ -613,8 +829,13 @@ impl CrispPdfApp {
                             }
                         }
 
-                        ui.add_space(16.0);
-                        ui.label(section_label("RECENTS"));
+                        ui.add_space(18.0);
+                        sidebar_section_header(
+                            ui,
+                            "RECENTS",
+                            "Frozen for this session",
+                            Color32::from_rgb(237, 143, 78),
+                        );
                         let recent = self.session_recents.clone();
                         for item in recent.iter().take(15) {
                             let selected =
@@ -623,7 +844,7 @@ impl CrispPdfApp {
                                 ui,
                                 &self.state.display_name(&item.path),
                                 selected,
-                                NavIcon::Clock,
+                                NavIcon::Recent,
                                 0.0,
                             );
                             row.body
@@ -674,6 +895,104 @@ impl CrispPdfApp {
             });
     }
 
+    fn outline_sidebar(&mut self, ui: &mut egui::Ui) {
+        let title = self
+            .current_path
+            .as_deref()
+            .map(|path| self.state.display_name(path))
+            .unwrap_or_else(|| "No PDF open".to_owned());
+        ui.label(RichText::new(title).size(13.0).strong());
+        ui.add_space(3.0);
+        if self.current_path.is_none() {
+            ui.label(RichText::new("Open a PDF to view its sections.").color(theme::MUTED));
+            return;
+        }
+        if self.outline.is_empty() {
+            ui.label(
+                RichText::new("This PDF does not contain a bookmark outline.")
+                    .size(12.5)
+                    .color(theme::MUTED),
+            );
+            return;
+        }
+        ui.label(
+            RichText::new(format!("{} navigable sections", self.outline.len()))
+                .size(11.0)
+                .color(theme::MUTED),
+        );
+        ui.add_space(9.0);
+        let items = self.outline.clone();
+        let mut activated = None;
+        ScrollArea::vertical()
+            .id_salt("outline-scroll")
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                for (index, item) in items.iter().enumerate() {
+                    let indent = item.depth as f32 * 14.0;
+                    let (rect, response) = ui.allocate_exact_size(
+                        vec2(
+                            ui.available_width(),
+                            if item.depth == 0 { 34.0 } else { 30.0 },
+                        ),
+                        Sense::click(),
+                    );
+                    if response.hovered() {
+                        ui.painter().rect_filled(
+                            rect,
+                            CornerRadius::same(6),
+                            Color32::from_rgb(31, 34, 41),
+                        );
+                    }
+                    let color = if item.target.is_some() {
+                        Color32::from_rgb(218, 220, 226)
+                    } else {
+                        theme::MUTED
+                    };
+                    let max_chars = ((rect.width() - indent - 42.0) / 6.9).max(6.0) as usize;
+                    ui.painter().text(
+                        pos2(rect.left() + 8.0 + indent, rect.center().y),
+                        Align2::LEFT_CENTER,
+                        elide(&item.title, max_chars),
+                        FontId::proportional(if item.depth == 0 { 13.5 } else { 12.8 }),
+                        color,
+                    );
+                    if let Some(LinkTarget::Page(page)) = item.target {
+                        ui.painter().text(
+                            pos2(rect.right() - 6.0, rect.center().y),
+                            Align2::RIGHT_CENTER,
+                            (page + 1).to_string(),
+                            FontId::proportional(10.5),
+                            theme::MUTED,
+                        );
+                    }
+                    response.clone().on_hover_text(&item.title);
+                    if response.clicked() && item.target.is_some() {
+                        activated = item.target.clone();
+                    }
+                    let _ = index;
+                }
+            });
+        if let Some(target) = activated {
+            self.activate_link(target, ui.ctx());
+        }
+    }
+
+    fn activate_link(&mut self, target: LinkTarget, ctx: &egui::Context) {
+        match target {
+            LinkTarget::Uri(uri) if is_safe_external_uri(&uri) => {
+                ctx.open_url(egui::OpenUrl::new_tab(&uri));
+                self.status = format!("Opening {uri}");
+            }
+            LinkTarget::Uri(_) => {
+                self.status = "Blocked an unsupported link type.".to_owned();
+            }
+            LinkTarget::Page(page) => {
+                self.jump_to_page = Some(page.min(self.page_sizes.len().saturating_sub(1)));
+                ctx.request_repaint();
+            }
+        }
+    }
+
     fn toolbar(&mut self, root: &mut egui::Ui) {
         egui::Panel::top("toolbar")
             .frame(
@@ -712,6 +1031,88 @@ impl CrispPdfApp {
                         }
                     });
                 });
+                if self.current_path.is_some() {
+                    ui.add_space(5.0);
+                    ui.horizontal(|ui| {
+                        ui.label(
+                            RichText::new("TOOLS")
+                                .size(10.0)
+                                .strong()
+                                .color(theme::MUTED),
+                        );
+                        tool_button(
+                            ui,
+                            &mut self.tool_mode,
+                            ToolMode::Select,
+                            "Select",
+                            "Select and copy PDF text",
+                        );
+                        tool_button(
+                            ui,
+                            &mut self.tool_mode,
+                            ToolMode::Highlight,
+                            "Highlight",
+                            "Drag across text to highlight it",
+                        );
+                        tool_button(
+                            ui,
+                            &mut self.tool_mode,
+                            ToolMode::Pen,
+                            "Draw",
+                            "Write freehand on the page",
+                        );
+                        tool_button(
+                            ui,
+                            &mut self.tool_mode,
+                            ToolMode::Eraser,
+                            "Erase",
+                            "Click an annotation to remove it",
+                        );
+                        tool_button(
+                            ui,
+                            &mut self.tool_mode,
+                            ToolMode::Note,
+                            "Comment",
+                            "Place a text comment",
+                        );
+                        tool_button(
+                            ui,
+                            &mut self.tool_mode,
+                            ToolMode::Ocr,
+                            "Snip OCR",
+                            "Drag a region; result opens without copying",
+                        );
+                        tool_button(
+                            ui,
+                            &mut self.tool_mode,
+                            ToolMode::MathOcr,
+                            "Math OCR",
+                            "Drag an image formula to convert it to LaTeX locally",
+                        );
+                        ui.separator();
+                        if ui
+                            .add_enabled(
+                                !self.annotation_undo.is_empty(),
+                                egui::Button::new("Undo"),
+                            )
+                            .clicked()
+                        {
+                            self.undo_annotation();
+                        }
+                        if ui
+                            .add_enabled(
+                                !self.annotation_redo.is_empty(),
+                                egui::Button::new("Redo"),
+                            )
+                            .clicked()
+                        {
+                            self.redo_annotation();
+                        }
+                        ui.separator();
+                        ui.label(RichText::new("Color").size(11.0).color(theme::MUTED));
+                        ui.color_edit_button_srgba(&mut self.annotation_color);
+                    });
+                }
             });
     }
 
@@ -863,9 +1264,17 @@ impl CrispPdfApp {
                                 }
                                 self.request_text(index, generation);
 
+                                let page_annotations = self.current_annotations()
+                                    .iter()
+                                    .filter(|annotation| annotation.page == index)
+                                    .cloned()
+                                    .collect::<Vec<_>>();
+                                paint_annotations(ui.painter(), &page_annotations, page_rect, page_sizes[index]);
+
                                 let mut pointer_on_link = false;
                                 let mut activated_link = None;
-                                if let Some(links) = self.link_layers.get(&index).cloned() {
+                                if self.tool_mode == ToolMode::Select
+                                    && let Some(links) = self.link_layers.get(&index).cloned() {
                                     for (link_index, link) in links.iter().enumerate() {
                                         let link_rect = pdf_bounds_screen_rect(
                                             link.bounds,
@@ -910,45 +1319,114 @@ impl CrispPdfApp {
                                     }
                                 }
 
-                                if !pointer_on_link
-                                    && let Some(glyphs) = self.text_layers.get(&index)
-                                {
+                                if !pointer_on_link {
                                     let source_size = page_sizes[index];
                                     let response = ui.interact(
                                         page_rect,
-                                        ui.id().with(("pdf-text-layer", index)),
+                                        ui.id().with(("pdf-tool-layer", index)),
                                         Sense::click_and_drag(),
                                     );
-                                    if let Some(pointer) = response.interact_pointer_pos()
-                                        && let Some(glyph_index) =
-                                            nearest_glyph(glyphs, page_rect, source_size, pointer)
-                                    {
-                                        if response.drag_started() || response.clicked() {
-                                            self.text_selection = Some(TextSelection {
-                                                page_index: index,
-                                                anchor: glyph_index,
-                                                focus: glyph_index,
-                                            });
-                                        } else if response.dragged()
-                                            && let Some(selection) = self.text_selection.as_mut()
-                                            && selection.page_index == index
-                                        {
-                                            selection.focus = glyph_index;
+                                    match self.tool_mode {
+                                        ToolMode::Select | ToolMode::Highlight => {
+                                            if let Some(glyphs) = self.text_layers.get(&index) {
+                                                if let Some(pointer) = response.interact_pointer_pos()
+                                                    && let Some(glyph_index) = nearest_glyph(glyphs, page_rect, source_size, pointer)
+                                                {
+                                                    if response.drag_started() || response.clicked() {
+                                                        self.text_selection = Some(TextSelection { page_index: index, anchor: glyph_index, focus: glyph_index });
+                                                    } else if response.dragged()
+                                                        && let Some(selection) = self.text_selection.as_mut()
+                                                        && selection.page_index == index
+                                                    {
+                                                        selection.focus = glyph_index;
+                                                    }
+                                                    if response.hovered() { ctx.set_cursor_icon(CursorIcon::Text); }
+                                                }
+                                                if let Some(selection) = self.text_selection
+                                                    && selection.page_index == index
+                                                {
+                                                    paint_text_selection(ui.painter(), glyphs, selection, page_rect, source_size);
+                                                    if self.tool_mode == ToolMode::Highlight && response.drag_stopped() {
+                                                        let start = selection.anchor.min(selection.focus);
+                                                        let end = selection.anchor.max(selection.focus);
+                                                        let rects = glyphs.get(start..=end).unwrap_or_default().iter().filter_map(|glyph| glyph.bounds).collect::<Vec<_>>();
+                                                        if !rects.is_empty() {
+                                                            self.add_annotation(index, AnnotationKind::Highlight { rects, color: [self.annotation_color.r(), self.annotation_color.g(), self.annotation_color.b(), 86] });
+                                                            self.status = "Highlight saved locally.".to_owned();
+                                                        }
+                                                    }
+                                                }
+                                            }
                                         }
-                                        if response.hovered() {
-                                            ctx.set_cursor_icon(CursorIcon::Text);
+                                        ToolMode::Pen => {
+                                            if response.hovered() { ctx.set_cursor_icon(CursorIcon::Crosshair); }
+                                            if response.drag_started() { self.ink_points.clear(); }
+                                            if (response.dragged() || response.drag_started())
+                                                && let Some(pointer) = response.interact_pointer_pos()
+                                            {
+                                                self.ink_points.push(screen_point_to_pdf(pointer, page_rect, source_size));
+                                            }
+                                            if !self.ink_points.is_empty() {
+                                                paint_ink_preview(ui.painter(), &self.ink_points, page_rect, source_size, self.annotation_color);
+                                            }
+                                            if response.drag_stopped() && self.ink_points.len() > 1 {
+                                                let points = std::mem::take(&mut self.ink_points);
+                                                self.add_annotation(index, AnnotationKind::Ink { points, color: [self.annotation_color.r(), self.annotation_color.g(), self.annotation_color.b(), 230], width: 2.2 });
+                                                self.status = "Drawing saved locally.".to_owned();
+                                            }
                                         }
-                                    }
-                                    if let Some(selection) = self.text_selection
-                                        && selection.page_index == index
-                                    {
-                                        paint_text_selection(
-                                            ui.painter(),
-                                            glyphs,
-                                            selection,
-                                            page_rect,
-                                            source_size,
-                                        );
+                                        ToolMode::Eraser => {
+                                            if response.hovered() { ctx.set_cursor_icon(CursorIcon::Crosshair); }
+                                            if response.clicked()
+                                                && let Some(pointer) = response.interact_pointer_pos()
+                                                && let Some(id) = annotation_at(&page_annotations, pointer, page_rect, source_size)
+                                            {
+                                                self.push_annotation_history();
+                                                if let Some(path) = self.current_path.clone()
+                                                    && let Some(items) = self.state.annotations.get_mut(&path)
+                                                { items.retain(|annotation| annotation.id != id); }
+                                                self.persist();
+                                                self.status = "Annotation erased.".to_owned();
+                                            }
+                                        }
+                                        ToolMode::Note => {
+                                            if response.hovered() { ctx.set_cursor_icon(CursorIcon::Crosshair); }
+                                            if response.clicked() && let Some(pointer) = response.interact_pointer_pos() {
+                                                self.note_draft = Some(NoteDraft { page: index, position: screen_point_to_pdf(pointer, page_rect, source_size), text: String::new() });
+                                            }
+                                        }
+                                        ToolMode::Ocr | ToolMode::MathOcr => {
+                                            if response.hovered() { ctx.set_cursor_icon(CursorIcon::Crosshair); }
+                                            if response.drag_started() { self.drag_start = response.interact_pointer_pos(); }
+                                            if let (Some(start), Some(end)) = (self.drag_start, response.interact_pointer_pos()) {
+                                                let snip = Rect::from_two_pos(start, end).intersect(page_rect);
+                                                ui.painter().rect_filled(snip, 2.0, Color32::from_rgba_unmultiplied(82, 170, 255, 38));
+                                                ui.painter().rect_stroke(snip, 2.0, Stroke::new(1.5, Color32::from_rgb(82, 170, 255)), StrokeKind::Inside);
+                                                if response.drag_stopped() && snip.width() > 8.0 && snip.height() > 8.0 {
+                                                    self.drag_start = None;
+                                                    let bounds = screen_rect_to_pdf(snip, page_rect, source_size);
+                                                    let embedded = self.text_layers.get(&index).map(|glyphs| text_in_pdf_region(glyphs, bounds)).unwrap_or_default();
+                                                    if self.tool_mode != ToolMode::MathOcr && !embedded.trim().is_empty() {
+                                                        self.ocr_popup = Some(OcrPopup { text: embedded, detail: "Exact PDF text layer - instant - no OCR needed".to_owned(), busy: false });
+                                                    } else {
+                                                        let request_id = self.next_ocr_request;
+                                                        self.next_ocr_request = self.next_ocr_request.wrapping_add(1);
+                                                        let math = self.tool_mode == ToolMode::MathOcr;
+                                                        if math { self.math_ocr_requests.insert(request_id); }
+                                                        self.ocr_popup = Some(OcrPopup {
+                                                            text: String::new(),
+                                                            detail: if math {
+                                                                "Preparing formula crop; first use may finish the one-time model download...".to_owned()
+                                                            } else {
+                                                                "Preparing high-resolution crop...".to_owned()
+                                                            },
+                                                            busy: true,
+                                                        });
+                                                        let _ = self.worker.commands.send(RenderCommand::RenderRegion { page_index: index, bounds, generation, request_id });
+                                                    }
+                                                }
+                                            }
+                                        }
                                     }
                                 }
                             }
@@ -973,8 +1451,9 @@ impl CrispPdfApp {
             RenameTarget::File(_) => "Rename PDF display name",
         };
         let mut save = false;
-        let mut cancel = false;
+        let mut open = true;
         egui::Window::new(title)
+            .open(&mut open)
             .anchor(Align2::CENTER_CENTER, vec2(0.0, -80.0))
             .collapsible(false)
             .resizable(false)
@@ -992,10 +1471,7 @@ impl CrispPdfApp {
                 let enter =
                     response.lost_focus() && ui.input(|input| input.key_pressed(Key::Enter));
                 ui.add_space(8.0);
-                ui.horizontal(|ui| {
-                    if ui.button("Cancel").clicked() {
-                        cancel = true;
-                    }
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                     if ui
                         .add_enabled(
                             !self.rename_buffer.trim().is_empty(),
@@ -1009,7 +1485,7 @@ impl CrispPdfApp {
                 });
             });
 
-        if cancel {
+        if !open {
             self.rename_target = None;
         } else if save {
             match target {
@@ -1024,6 +1500,101 @@ impl CrispPdfApp {
             }
             self.rename_target = None;
             self.persist();
+        }
+    }
+
+    fn note_dialog(&mut self, ctx: &egui::Context) {
+        let Some(draft) = self.note_draft.as_mut() else {
+            return;
+        };
+        let mut save = false;
+        let mut open = true;
+        egui::Window::new("Add comment")
+            .open(&mut open)
+            .anchor(Align2::CENTER_CENTER, vec2(0.0, -40.0))
+            .collapsible(false)
+            .resizable(true)
+            .default_width(380.0)
+            .show(ctx, |ui| {
+                ui.label(RichText::new("Comment stored as a CrispPDF overlay").color(theme::MUTED));
+                ui.add_sized(
+                    [ui.available_width(), 120.0],
+                    egui::TextEdit::multiline(&mut draft.text).hint_text("Write a comment..."),
+                );
+                ui.horizontal(|ui| {
+                    if ui
+                        .add_enabled(
+                            !draft.text.trim().is_empty(),
+                            egui::Button::new("Save comment"),
+                        )
+                        .clicked()
+                    {
+                        save = true;
+                    }
+                });
+            });
+        if !open {
+            self.note_draft = None;
+        }
+        if save && let Some(draft) = self.note_draft.take() {
+            self.add_annotation(
+                draft.page,
+                AnnotationKind::Note {
+                    position: draft.position,
+                    text: draft.text.trim().to_owned(),
+                    color: [
+                        self.annotation_color.r(),
+                        self.annotation_color.g(),
+                        self.annotation_color.b(),
+                        255,
+                    ],
+                },
+            );
+            self.status = "Comment saved locally.".to_owned();
+        }
+    }
+
+    fn ocr_result_dialog(&mut self, ctx: &egui::Context) {
+        let Some(popup) = self.ocr_popup.as_mut() else {
+            return;
+        };
+        let mut open = true;
+        egui::Window::new("Snip OCR")
+            .open(&mut open)
+            .anchor(Align2::CENTER_CENTER, vec2(0.0, 0.0))
+            .collapsible(false)
+            .resizable(true)
+            .default_size([520.0, 310.0])
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    if popup.busy {
+                        ui.spinner();
+                    }
+                    ui.label(RichText::new(&popup.detail).size(12.0).color(theme::MUTED));
+                });
+                ui.add_space(6.0);
+                ui.add_sized(
+                    [ui.available_width(), 220.0],
+                    egui::TextEdit::multiline(&mut popup.text)
+                        .hint_text("Recognized text will appear here..."),
+                );
+                ui.horizontal(|ui| {
+                    if ui
+                        .add_enabled(!popup.text.is_empty(), egui::Button::new("Copy text"))
+                        .clicked()
+                    {
+                        ctx.copy_text(popup.text.clone());
+                        popup.detail = "Copied to clipboard.".to_owned();
+                    }
+                    ui.label(
+                        RichText::new("Nothing is copied automatically.")
+                            .size(11.0)
+                            .color(theme::MUTED),
+                    );
+                });
+            });
+        if !open {
+            self.ocr_popup = None;
         }
     }
 
@@ -1069,17 +1640,20 @@ impl eframe::App for CrispPdfApp {
         self.toolbar(ui);
         self.viewer(ui);
         self.rename_dialog(ui.ctx());
+        self.note_dialog(ui.ctx());
+        self.ocr_result_dialog(ui.ctx());
     }
 
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
         let _ = self.worker.commands.send(RenderCommand::Shutdown);
+        let _ = self.ocr_worker.commands.send(OcrCommand::Shutdown);
         self.persist();
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 enum NavIcon {
-    Clock,
+    Recent,
     File,
 }
 
@@ -1095,10 +1669,6 @@ enum SidebarMenuAction {
     Remove,
 }
 
-fn section_label(text: &str) -> RichText {
-    RichText::new(text).size(11.0).color(theme::MUTED).strong()
-}
-
 fn project_header(
     ui: &mut egui::Ui,
     name: &str,
@@ -1108,10 +1678,14 @@ fn project_header(
     let (rect, response) = ui.allocate_exact_size(vec2(ui.available_width(), 38.0), Sense::click());
     let painter = ui.painter();
     if response.hovered() {
-        painter.rect_filled(rect, CornerRadius::same(8), theme::PANEL_BG);
+        painter.rect_filled(
+            rect.shrink2(vec2(1.0, 1.0)),
+            CornerRadius::same(6),
+            theme::PANEL_BG,
+        );
     }
 
-    let icon_color = Color32::from_rgb(205, 207, 214);
+    let icon_color = theme::MUTED;
     let chevron_x = rect.left() + 8.0;
     let center_y = rect.center().y;
     let chevron = if expanded {
@@ -1131,7 +1705,7 @@ fn project_header(
         chevron.to_vec(),
         Stroke::new(1.5, theme::MUTED),
     ));
-    paint_folder_icon(painter, pos2(rect.left() + 24.0, center_y), icon_color);
+    paint_folder_icon(painter, pos2(rect.left() + 27.0, center_y), icon_color);
 
     let count_text = count.to_string();
     painter.text(
@@ -1143,11 +1717,11 @@ fn project_header(
     );
     let max_chars = ((rect.width() - 112.0) / 7.2).max(4.0) as usize;
     painter.text(
-        pos2(rect.left() + 48.0, center_y),
+        pos2(rect.left() + 51.0, center_y),
         Align2::LEFT_CENTER,
         elide(name, max_chars),
         FontId::proportional(14.0),
-        icon_color,
+        Color32::from_rgb(218, 220, 225),
     );
     let options = sidebar_options_button(ui, rect, &response);
     SidebarRowResponse {
@@ -1186,7 +1760,7 @@ fn nav_row(
     };
     let icon_center = pos2(rect.left() + indent + 13.0, rect.center().y);
     match icon {
-        NavIcon::Clock => paint_clock_icon(painter, icon_center, icon_color),
+        NavIcon::Recent => paint_recent_icon(painter, icon_center, icon_color),
         NavIcon::File => paint_file_icon(painter, icon_center, icon_color),
     }
     let text_left = rect.left() + indent + 28.0;
@@ -1305,29 +1879,93 @@ fn paint_file_icon(painter: &egui::Painter, center: egui::Pos2, color: Color32) 
     );
 }
 
-fn paint_clock_icon(painter: &egui::Painter, center: egui::Pos2, color: Color32) {
-    painter.circle_stroke(center, 6.0, Stroke::new(1.2, color));
-    painter.line_segment(
-        [center, pos2(center.x, center.y - 3.5)],
-        Stroke::new(1.2, color),
+fn paint_recent_icon(painter: &egui::Painter, center: egui::Pos2, color: Color32) {
+    let tile = Rect::from_center_size(center, vec2(14.0, 14.0));
+    painter.rect_stroke(
+        tile,
+        CornerRadius::same(4),
+        Stroke::new(1.0, color.gamma_multiply(0.78)),
+        StrokeKind::Inside,
     );
-    painter.line_segment(
-        [center, pos2(center.x + 2.8, center.y + 1.7)],
-        Stroke::new(1.2, color),
+    painter.rect_filled(
+        Rect::from_min_max(
+            pos2(tile.left() + 3.0, tile.top() + 3.0),
+            pos2(tile.right() - 3.0, tile.top() + 5.0),
+        ),
+        1.0,
+        color,
+    );
+    painter.rect_filled(
+        Rect::from_min_max(
+            pos2(tile.left() + 3.0, tile.top() + 7.0),
+            pos2(tile.right() - 5.0, tile.top() + 9.0),
+        ),
+        1.0,
+        color.gamma_multiply(0.72),
     );
 }
 
 fn paint_folder_icon(painter: &egui::Painter, center: egui::Pos2, color: Color32) {
-    let points = vec![
-        pos2(center.x - 7.0, center.y - 4.0),
-        pos2(center.x - 1.5, center.y - 4.0),
-        pos2(center.x + 0.5, center.y - 2.0),
-        pos2(center.x + 7.0, center.y - 2.0),
-        pos2(center.x + 7.0, center.y + 5.0),
-        pos2(center.x - 7.0, center.y + 5.0),
-        pos2(center.x - 7.0, center.y - 4.0),
-    ];
-    painter.add(egui::Shape::line(points, Stroke::new(1.3, color)));
+    let body = Rect::from_min_max(
+        pos2(center.x - 8.0, center.y - 3.0),
+        pos2(center.x + 8.0, center.y + 6.0),
+    );
+    painter.rect_filled(body, CornerRadius::same(3), color.gamma_multiply(0.9));
+    painter.rect_filled(
+        Rect::from_min_max(
+            pos2(center.x - 7.0, center.y - 6.0),
+            pos2(center.x + 1.0, center.y),
+        ),
+        CornerRadius::same(2),
+        color,
+    );
+    painter.line_segment(
+        [
+            pos2(body.left() + 2.0, body.top() + 2.0),
+            pos2(body.right() - 2.0, body.top() + 2.0),
+        ],
+        Stroke::new(1.0, Color32::from_white_alpha(70)),
+    );
+}
+
+fn sidebar_section_header(ui: &mut egui::Ui, title: &str, subtitle: &str, accent: Color32) {
+    let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), 28.0), Sense::hover());
+    ui.painter().text(
+        pos2(rect.left(), rect.center().y),
+        Align2::LEFT_CENTER,
+        title,
+        FontId::proportional(11.5),
+        accent,
+    );
+    ui.painter().text(
+        pos2(rect.right(), rect.center().y),
+        Align2::RIGHT_CENTER,
+        subtitle,
+        FontId::proportional(10.5),
+        theme::MUTED,
+    );
+    ui.painter().line_segment(
+        [
+            pos2(rect.left(), rect.bottom()),
+            pos2(rect.right(), rect.bottom()),
+        ],
+        Stroke::new(1.0, Color32::from_rgb(39, 42, 49)),
+    );
+    ui.add_space(3.0);
+}
+
+fn sidebar_tab_button(ui: &mut egui::Ui, selected: bool, text: &str) -> Response {
+    let width = (ui.available_width() - ui.spacing().item_spacing.x) * 0.5;
+    ui.add_sized(
+        [width, 30.0],
+        egui::Button::new(RichText::new(text).size(12.5).color(if selected {
+            Color32::WHITE
+        } else {
+            theme::MUTED
+        }))
+        .selected(selected)
+        .corner_radius(CornerRadius::same(6)),
+    )
 }
 
 fn elide(text: &str, max_chars: usize) -> String {
@@ -1340,7 +1978,7 @@ fn elide(text: &str, max_chars: usize) -> String {
 
 fn quantized_render_width(width: f32) -> u16 {
     let clamped = width.round().clamp(256.0, 2600.0) as u32;
-    (((clamped + 127) / 128) * 128).min(2600) as u16
+    (clamped.div_ceil(128) * 128).min(2600) as u16
 }
 
 fn file_name(path: &Path) -> String {
@@ -1448,6 +2086,352 @@ fn paint_text_selection(
     }
 }
 
+fn tool_button(ui: &mut egui::Ui, mode: &mut ToolMode, value: ToolMode, label: &str, help: &str) {
+    let selected = *mode == value;
+    if ui
+        .selectable_label(selected, label)
+        .on_hover_text(help)
+        .clicked()
+    {
+        *mode = value;
+    }
+}
+
+fn screen_point_to_pdf(point: egui::Pos2, page_rect: Rect, source_size: [f32; 2]) -> [f32; 2] {
+    let x = ((point.x - page_rect.left()) / page_rect.width()).clamp(0.0, 1.0) * source_size[0];
+    let y_from_top =
+        ((point.y - page_rect.top()) / page_rect.height()).clamp(0.0, 1.0) * source_size[1];
+    [x, source_size[1] - y_from_top]
+}
+
+fn screen_rect_to_pdf(rect: Rect, page_rect: Rect, source_size: [f32; 2]) -> [f32; 4] {
+    let bottom_left = screen_point_to_pdf(pos2(rect.left(), rect.bottom()), page_rect, source_size);
+    let top_right = screen_point_to_pdf(pos2(rect.right(), rect.top()), page_rect, source_size);
+    [bottom_left[0], bottom_left[1], top_right[0], top_right[1]]
+}
+
+fn pdf_point_to_screen(point: [f32; 2], page_rect: Rect, source_size: [f32; 2]) -> egui::Pos2 {
+    pos2(
+        page_rect.left() + point[0] / source_size[0].max(1.0) * page_rect.width(),
+        page_rect.top()
+            + (source_size[1] - point[1]) / source_size[1].max(1.0) * page_rect.height(),
+    )
+}
+
+fn annotation_color(color: [u8; 4]) -> Color32 {
+    Color32::from_rgba_unmultiplied(color[0], color[1], color[2], color[3])
+}
+
+fn paint_annotations(
+    painter: &egui::Painter,
+    annotations: &[Annotation],
+    page_rect: Rect,
+    source_size: [f32; 2],
+) {
+    for annotation in annotations {
+        match &annotation.kind {
+            AnnotationKind::Highlight { rects, color } => {
+                for bounds in rects {
+                    painter.rect_filled(
+                        pdf_bounds_screen_rect(*bounds, page_rect, source_size)
+                            .expand2(vec2(0.5, 0.3)),
+                        1.0,
+                        annotation_color(*color),
+                    );
+                }
+            }
+            AnnotationKind::Ink {
+                points,
+                color,
+                width,
+            } => {
+                let screen = points
+                    .iter()
+                    .map(|point| pdf_point_to_screen(*point, page_rect, source_size))
+                    .collect::<Vec<_>>();
+                if screen.len() > 1 {
+                    painter.add(egui::Shape::line(
+                        screen,
+                        Stroke::new(*width, annotation_color(*color)),
+                    ));
+                }
+            }
+            AnnotationKind::Note {
+                position,
+                text,
+                color,
+            } => {
+                let center = pdf_point_to_screen(*position, page_rect, source_size);
+                painter.circle_filled(center, 8.0, annotation_color(*color));
+                painter.text(
+                    center,
+                    Align2::CENTER_CENTER,
+                    "!",
+                    FontId::proportional(11.0),
+                    Color32::from_rgb(28, 28, 30),
+                );
+                painter.text(
+                    pos2(center.x + 12.0, center.y),
+                    Align2::LEFT_CENTER,
+                    elide(text, 28),
+                    FontId::proportional(11.5),
+                    Color32::from_rgb(38, 38, 42),
+                );
+            }
+        }
+    }
+}
+
+fn paint_ink_preview(
+    painter: &egui::Painter,
+    points: &[[f32; 2]],
+    page_rect: Rect,
+    source_size: [f32; 2],
+    color: Color32,
+) {
+    let points = points
+        .iter()
+        .map(|point| pdf_point_to_screen(*point, page_rect, source_size))
+        .collect::<Vec<_>>();
+    if points.len() > 1 {
+        painter.add(egui::Shape::line(points, Stroke::new(2.2, color)));
+    }
+}
+
+fn annotation_at(
+    annotations: &[Annotation],
+    point: egui::Pos2,
+    page_rect: Rect,
+    source_size: [f32; 2],
+) -> Option<u64> {
+    annotations
+        .iter()
+        .rev()
+        .find(|annotation| match &annotation.kind {
+            AnnotationKind::Highlight { rects, .. } => rects.iter().any(|bounds| {
+                pdf_bounds_screen_rect(*bounds, page_rect, source_size)
+                    .expand(5.0)
+                    .contains(point)
+            }),
+            AnnotationKind::Ink { points, .. } => points.iter().any(|value| {
+                pdf_point_to_screen(*value, page_rect, source_size).distance(point) < 9.0
+            }),
+            AnnotationKind::Note { position, .. } => {
+                pdf_point_to_screen(*position, page_rect, source_size).distance(point) < 14.0
+            }
+        })
+        .map(|annotation| annotation.id)
+}
+
+fn text_in_pdf_region(glyphs: &[TextGlyph], bounds: [f32; 4]) -> String {
+    let [left, bottom, right, top] = bounds;
+    glyphs
+        .iter()
+        .filter_map(|glyph| {
+            let glyph_bounds = glyph.bounds?;
+            let center_x = (glyph_bounds[0] + glyph_bounds[2]) * 0.5;
+            let center_y = (glyph_bounds[1] + glyph_bounds[3]) * 0.5;
+            (center_x >= left.min(right)
+                && center_x <= left.max(right)
+                && center_y >= bottom.min(top)
+                && center_y <= bottom.max(top))
+            .then_some(glyph.text.as_str())
+        })
+        .collect::<String>()
+}
+
+/// Adds useful links when a PDF exposes an outline or printed URL but omitted
+/// the corresponding page annotations (a common occurrence in generated TOCs).
+fn infer_text_links(
+    glyphs: &[TextGlyph],
+    outline: &[PdfOutlineItem],
+    existing: &[PdfLinkRegion],
+) -> Vec<PdfLinkRegion> {
+    let mut inferred = Vec::new();
+    let (normalized_page, normalized_map) = normalized_glyph_stream(glyphs);
+
+    for item in outline {
+        let Some(target) = item.target.clone() else {
+            continue;
+        };
+        let needle = normalize_link_text(&item.title);
+        if needle.chars().count() < 4 {
+            continue;
+        }
+        for (start, _) in normalized_page.match_indices(&needle) {
+            let end = start + needle.len();
+            let start_char = normalized_page[..start].chars().count();
+            let end_char = normalized_page[..end].chars().count();
+            if let Some(bounds) = union_glyph_bounds(
+                glyphs,
+                &normalized_map[start_char..end_char.min(normalized_map.len())],
+            ) {
+                push_non_overlapping_link(
+                    &mut inferred,
+                    existing,
+                    PdfLinkRegion {
+                        bounds,
+                        target: target.clone(),
+                    },
+                );
+            }
+        }
+    }
+
+    let (raw_page, raw_map) = raw_glyph_stream(glyphs);
+    for (byte_start, token) in raw_page.split_word_bound_indices() {
+        let trimmed = token.trim_matches(|character: char| {
+            character.is_whitespace()
+                || matches!(
+                    character,
+                    '(' | ')' | '[' | ']' | '{' | '}' | '<' | '>' | ',' | ';'
+                )
+        });
+        let trimmed = trimmed.trim_end_matches(['.', ':', '!', '?']);
+        let lower = trimmed.to_ascii_lowercase();
+        if !(lower.starts_with("https://")
+            || lower.starts_with("http://")
+            || lower.starts_with("www."))
+        {
+            continue;
+        }
+        let leading = token.find(trimmed).unwrap_or(0);
+        let start = byte_start + leading;
+        let end = start + trimmed.len();
+        let start_char = raw_page[..start].chars().count();
+        let end_char = raw_page[..end].chars().count();
+        if let Some(bounds) =
+            union_glyph_bounds(glyphs, &raw_map[start_char..end_char.min(raw_map.len())])
+        {
+            let uri = if lower.starts_with("www.") {
+                format!("https://{trimmed}")
+            } else {
+                trimmed.to_owned()
+            };
+            push_non_overlapping_link(
+                &mut inferred,
+                existing,
+                PdfLinkRegion {
+                    bounds,
+                    target: LinkTarget::Uri(uri),
+                },
+            );
+        }
+    }
+    inferred
+}
+
+trait WordBoundIndices {
+    fn split_word_bound_indices(&self) -> Vec<(usize, &str)>;
+}
+
+impl WordBoundIndices for str {
+    fn split_word_bound_indices(&self) -> Vec<(usize, &str)> {
+        let mut result = Vec::new();
+        let mut start = None;
+        for (index, character) in self.char_indices() {
+            if character.is_whitespace() {
+                if let Some(begin) = start.take() {
+                    result.push((begin, &self[begin..index]));
+                }
+            } else if start.is_none() {
+                start = Some(index);
+            }
+        }
+        if let Some(begin) = start {
+            result.push((begin, &self[begin..]));
+        }
+        result
+    }
+}
+
+fn normalized_glyph_stream(glyphs: &[TextGlyph]) -> (String, Vec<usize>) {
+    let mut text = String::new();
+    let mut mapping = Vec::new();
+    let mut previous_was_space = true;
+    for (glyph_index, glyph) in glyphs.iter().enumerate() {
+        for character in glyph.text.chars().flat_map(char::to_lowercase) {
+            if character.is_alphanumeric() {
+                text.push(character);
+                mapping.push(glyph_index);
+                previous_was_space = false;
+            } else if !previous_was_space {
+                text.push(' ');
+                mapping.push(glyph_index);
+                previous_was_space = true;
+            }
+        }
+    }
+    if text.ends_with(' ') {
+        text.pop();
+        mapping.pop();
+    }
+    (text, mapping)
+}
+
+fn normalize_link_text(text: &str) -> String {
+    let glyphs = text
+        .chars()
+        .map(|character| TextGlyph {
+            text: character.to_string(),
+            bounds: None,
+        })
+        .collect::<Vec<_>>();
+    normalized_glyph_stream(&glyphs).0
+}
+
+fn raw_glyph_stream(glyphs: &[TextGlyph]) -> (String, Vec<usize>) {
+    let mut text = String::new();
+    let mut mapping = Vec::new();
+    for (glyph_index, glyph) in glyphs.iter().enumerate() {
+        for character in glyph.text.chars() {
+            text.push(character);
+            mapping.push(glyph_index);
+        }
+    }
+    (text, mapping)
+}
+
+fn union_glyph_bounds(glyphs: &[TextGlyph], indices: &[usize]) -> Option<[f32; 4]> {
+    let mut bounds: Option<[f32; 4]> = None;
+    for index in indices.iter().copied() {
+        let Some(next) = glyphs.get(index).and_then(|glyph| glyph.bounds) else {
+            continue;
+        };
+        bounds = Some(match bounds {
+            None => next,
+            Some([left, bottom, right, top]) => [
+                left.min(next[0]),
+                bottom.min(next[1]),
+                right.max(next[2]),
+                top.max(next[3]),
+            ],
+        });
+    }
+    bounds
+}
+
+fn push_non_overlapping_link(
+    inferred: &mut Vec<PdfLinkRegion>,
+    existing: &[PdfLinkRegion],
+    candidate: PdfLinkRegion,
+) {
+    if existing
+        .iter()
+        .chain(inferred.iter())
+        .any(|link| pdf_bounds_overlap(link.bounds, candidate.bounds))
+    {
+        return;
+    }
+    inferred.push(candidate);
+}
+
+fn pdf_bounds_overlap(a: [f32; 4], b: [f32; 4]) -> bool {
+    let horizontal = a[0].max(b[0]) <= a[2].min(b[2]);
+    let vertical = a[1].max(b[1]) <= a[3].min(b[3]);
+    horizontal && vertical
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1473,5 +2457,45 @@ mod tests {
         assert!(is_safe_external_uri("mailto:reader@example.com"));
         assert!(!is_safe_external_uri("javascript:alert(1)"));
         assert!(!is_safe_external_uri("file:///etc/passwd"));
+    }
+
+    #[test]
+    fn outline_titles_become_clickable_when_pdf_annotations_are_missing() {
+        let glyphs = "Contents  Energy and geodesics"
+            .chars()
+            .enumerate()
+            .map(|(index, character)| TextGlyph {
+                text: character.to_string(),
+                bounds: Some([index as f32, 10.0, index as f32 + 1.0, 20.0]),
+            })
+            .collect::<Vec<_>>();
+        let links = infer_text_links(
+            &glyphs,
+            &[PdfOutlineItem {
+                title: "Energy and geodesics".to_owned(),
+                depth: 1,
+                target: Some(LinkTarget::Page(12)),
+            }],
+            &[],
+        );
+        assert_eq!(links.len(), 1);
+        assert!(matches!(links[0].target, LinkTarget::Page(12)));
+    }
+
+    #[test]
+    fn printed_web_addresses_become_clickable() {
+        let glyphs = "See https://example.com/docs."
+            .chars()
+            .enumerate()
+            .map(|(index, character)| TextGlyph {
+                text: character.to_string(),
+                bounds: Some([index as f32, 0.0, index as f32 + 1.0, 8.0]),
+            })
+            .collect::<Vec<_>>();
+        let links = infer_text_links(&glyphs, &[], &[]);
+        assert_eq!(links.len(), 1);
+        assert!(
+            matches!(&links[0].target, LinkTarget::Uri(uri) if uri == "https://example.com/docs")
+        );
     }
 }

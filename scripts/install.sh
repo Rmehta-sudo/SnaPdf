@@ -24,6 +24,13 @@ command -v update-desktop-database >/dev/null && update-desktop-database "${APP_
 command -v gtk-update-icon-cache >/dev/null && gtk-update-icon-cache -f -t "${HOME}/.local/share/icons/hicolor" >/dev/null 2>&1 || true
 xdg-mime default io.crisppdf.CrispPDF.desktop application/pdf
 
+if [[ ! -x "${HOME}/.local/share/crisppdf/ocr/venv/bin/python" ]] || \
+  ! "${HOME}/.local/share/crisppdf/ocr/venv/bin/python" -c 'import paddle, paddleocr, premailer' >/dev/null 2>&1; then
+  "${PROJECT_ROOT}/scripts/install-ocr.sh"
+else
+  install -m 0644 "${PROJECT_ROOT}/resources/ocr_worker.py" \
+    "${HOME}/.local/share/crisppdf/ocr/ocr_worker.py"
+fi
+
 echo "CrispPDF installed and set as the default PDF viewer."
 echo "Launch it from the application menu or run: crisppdf"
-

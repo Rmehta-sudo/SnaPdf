@@ -1,5 +1,6 @@
 mod app;
 mod model;
+mod ocr;
 mod pdf;
 mod storage;
 mod theme;
