@@ -1,6 +1,7 @@
 use crossbeam_channel::{Receiver, Sender, unbounded};
 use pdfium_bundled::pdfium_render::prelude::*;
 use std::path::PathBuf;
+use std::process::Command;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
@@ -79,14 +80,16 @@ pub struct PdfFileSearchMatches {
     pub matches: Vec<PdfSearchMatch>,
 }
 
-/// Search PDFs independently of the viewer's single-document render worker.
-/// This keeps open-tab and explicit workspace searches from interrupting page rendering.
+/// Search PDFs independently of the viewer's rendering engine.
+///
+/// PDFium is process-global and can only be initialised once, so a second PDFium
+/// worker silently fails after the viewer has started. `pdftotext` is already
+/// provided by Poppler on Ubuntu and gives this background scan its own parser.
 pub fn search_pdf_files(
     paths: &[PathBuf],
     query: &str,
     max_matches_per_file: usize,
 ) -> Result<Vec<PdfFileSearchMatches>, String> {
-    let pdfium = pdfium_bundled::bind_bundled().map_err(|error| error.to_string())?;
     let needle = query.trim().to_lowercase();
     if needle.is_empty() {
         return Ok(Vec::new());
@@ -94,15 +97,20 @@ pub fn search_pdf_files(
 
     let mut results = Vec::new();
     for path in paths {
-        let Ok(document) = pdfium.load_pdf_from_file(path, None) else {
+        let Ok(output) = Command::new("pdftotext")
+            .args(["-layout", "-enc", "UTF-8"])
+            .arg(path)
+            .arg("-")
+            .output()
+        else {
             continue;
         };
+        if !output.status.success() {
+            continue;
+        }
+        let text = String::from_utf8_lossy(&output.stdout);
         let mut matches = Vec::new();
-        for (page_index, page) in document.pages().iter().enumerate() {
-            let Ok(text) = page.text() else {
-                continue;
-            };
-            let original = text.all();
+        for (page_index, original) in text.split('\u{c}').enumerate() {
             let lower = original.to_lowercase();
             if !lower.contains(&needle) {
                 continue;
@@ -110,7 +118,7 @@ pub fn search_pdf_files(
             let excerpt = original
                 .lines()
                 .find(|line| line.to_lowercase().contains(&needle))
-                .unwrap_or(&original)
+                .unwrap_or(original)
                 .split_whitespace()
                 .take(22)
                 .collect::<Vec<_>>()

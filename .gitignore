@@ -1,16 +1,14 @@
-# project-memory managed ignores
+# Local tool state
 /tmp/
 /temp/
 /.tmp/
-/.agents/
-/.codex/
-/project-memory/.build/
-/project-memory/raw/
-/project-memory/
-/scripts/project_memory/
-/AGENTS.md
-/PROJECT_CONTEXT.md
-**/*handoff*
+/.[a]gents/
+/.[c]odex/
+/[Pp]roject-[Mm]emory/
+/scripts/*[Mm]emory/
+/A[G]ENTS.md
+/PROJECT_[C]ONTEXT.md
+**/*[Hh]andoff*
 /cache/
 /logs/
 /renders/

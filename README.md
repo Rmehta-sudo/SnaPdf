@@ -1,96 +1,61 @@
 # SnapPDF
 
-SnapPDF is a fast, project-oriented PDF viewer for Ubuntu, written in Rust. It combines a
-Codex-style project sidebar with a crisp, continuously scrolling PDF canvas.
+SnapPDF is a fast PDF reader for Ubuntu. Keep course material, research papers, and work documents in project folders, read them in tabs, and pick up exactly where you left off.
 
-## Features
+## What you can do
 
-- Native Rust desktop app using `egui`/`eframe`.
-- Bundled PDFium renderer; no system PDF library is required.
-- Background page rendering so input and scrolling stay responsive.
-- High-DPI page textures, virtualized rendering, and a bounded texture cache.
-- Whole-interface zoom (`Ctrl++`, `Ctrl+-`, `Ctrl+0`), native two-finger trackpad pinch zoom for
-  the PDF canvas, continuous scrolling, restored reading position, and drag-and-drop.
-- Project folders with recursive PDF-only discovery and filename filtering.
-- Stable alphabetical file order inside projects; opening a PDF never reshuffles the project tree.
-- The 15 most recently opened PDFs, ordered once at startup so clicking never reshuffles the UI.
-- Display-only project and PDF renaming from each sidebar item's right-click menu.
-- Selectable PDF text with drag selection and `Ctrl+C` copy.
-- Clickable safe web/email links and internal PDF page links, including generated fallbacks for
-  contents pages that only expose bookmarks and visible text.
-- PDF links stay interactive regardless of the currently selected annotation tool.
-- Arrow-key navigation: up/down scroll; left/right move to the previous/next page, with accelerated
-  repeat while an arrow is held.
-- Faster animated wheel scrolling with strong acceleration while up/down arrows are held.
-- Hover-only three-dot menus with polished project/PDF actions.
-- Open-from-file-manager support and Ubuntu `application/pdf` integration.
-- Stable Ubuntu app/dock identity with a dedicated SnapPDF icon.
-- Obsidian-inspired dark UI with a narrow icon rail, nested file tree, document tabs, selectable
-  copyable path bar, quiet surfaces, and restrained hover/selection states.
-- Vector-drawn sidebar icons, so the UI does not depend on missing Unicode glyphs.
-- Library, Contents, and VS Code-style Search sidebar tabs. Contents is generated from the PDF's
-  bookmark outline and supports individual or global collapse/expand.
-- Persistent, non-destructive highlights, freehand drawing/signatures, comments, text boxes,
-  rectangles/ellipses, stamps, attachment markers, color selection, erasing, and undo/redo.
-- Comments always render above highlights. Right-click highlights to add/edit/delete comments;
-  right-click comments and other annotations to edit or delete them. The eraser supports direct
-  click-and-drag removal, and selecting an active tool again returns to Select mode.
-- Multiple persistent document tabs, a ten-item closed-tab restore history, in-document search with page highlights, CUPS printing with
-  printer/page-range/copy controls, and export of PDF-native highlights, comments, text boxes,
-  shapes, and stamps into a new PDF copy.
-- An in-app **Open with...** chooser lists other installed PDF-capable applications for any sidebar
-  PDF or the currently open document.
-- Snip OCR with an editable result popup and explicit Copy button; nothing is copied automatically.
-- Exact embedded-text extraction first, then fully local PP-OCRv5 image OCR when needed.
-- A separate Math OCR tool powered by PP-FormulaNet-S that converts formula images to LaTeX.
-- Conventional top-right close controls on rename, comment, and OCR dialogs.
-
-## Build and run
-
-```bash
-cargo run --release
-cargo run --release -- /absolute/path/to/document.pdf
-```
-
-The first build downloads Rust dependencies and the pinned PDFium binary. PDFium is embedded in
-the release executable, so installed copies do not need a runtime download.
+- Add folders as projects. SnapPDF shows only PDFs, including PDFs in nested directories.
+- Browse a familiar file tree, keep a stable Recent list, and give projects or files display names without renaming anything on disk.
+- Open several documents in tabs. `Ctrl+Shift+T` restores the last closed tab.
+- Select PDF text, copy it with `Ctrl+C`, follow web links, and use contents-page links and document outlines to move around a PDF.
+- Search the current document, all open tabs, or every PDF in your workspace and project folders.
+- Scroll smoothly, use the arrow keys to move through pages, pinch to zoom the document, and pan enlarged pages with a two-finger slide.
+- Highlight text, draw, add comments, shapes, text boxes, stamps, and file references. Right-click an annotation to edit or remove it.
+- Export annotations to a copy, or explicitly save supported annotations into the original PDF after SnapPDF creates a backup.
+- Print, open the current file with another installed app, and make SnapPDF the default PDF application on Ubuntu.
+- Capture a region for local text recognition. Math OCR is marked experimental.
 
 ## Install on Ubuntu
+
+From the SnapPDF folder, run:
 
 ```bash
 ./scripts/install.sh
 ```
 
-This installs into your user account, adds SnapPDF to the application menu, registers it for PDF
-files, makes it the default PDF viewer, and installs the CPU-only local OCR environment. No `sudo`
-is required. OCR models download once and remain in `~/.local/share/snappdf/ocr/models`.
+SnapPDF is then available from the Applications menu, can be pinned to the dock, and is registered as the default handler for PDF files. Your projects, recent documents, display names, and annotation overlays stay on this computer in `~/.config/snappdf/state.json`.
+
+## Reading modes
+
+- **Hide toolbar** keeps the document and sidebar visible.
+- **Reader mode** hides the toolbar and sidebar. Use the small floating control to return.
+- **Presentation mode** enters full screen and shows only the document. Press `Esc` to leave.
+
+In presentation mode, move between pages with `Space` / `Backspace`, `Right` / `Left`, or `J` / `K`.
 
 ## Shortcuts
 
 | Shortcut | Action |
 |---|---|
-| `Ctrl+O` | Open PDF |
-| `Ctrl++` | Scale the entire app up |
-| `Ctrl+-` | Scale the entire app down |
-| `Ctrl+F` | Find text in the current PDF |
-| `Ctrl+P` | Open the print dialog |
-| `Ctrl+W` | Close current PDF tab |
-| `Ctrl+Shift+T` | Reopen the most recently closed PDF tab (up to 10) |
-| `Up` / `Down` | Scroll document |
+| `Ctrl+O` | Open a PDF |
+| `Ctrl+F` | Open search |
+| `Ctrl+P` | Print |
+| `Ctrl+W` | Close current tab |
+| `Ctrl+Shift+T` | Restore the most recently closed tab |
+| `Ctrl++` / `Ctrl+-` | Scale the interface and document |
+| `Up` / `Down` | Scroll the document |
 | `Left` / `Right` | Previous / next page |
-| Drag text, `Ctrl+C` | Select and copy PDF text |
+| Drag text, then `Ctrl+C` | Select and copy text |
 | `Ctrl+Z` / `Ctrl+Shift+Z` | Undo / redo an annotation |
-| Click a PDF link | Open a safe web/email link or jump within the document |
 
-## State and privacy
+## Build from source
 
-Projects, recent documents, display names, and annotation overlays are stored locally in
-`~/.config/snappdf/state.json`. OCR runs locally after the one-time model download. SnapPDF does
-not upload documents or telemetry. Annotation tools do not modify the original PDF by default; the
-explicit Save-to-PDF action creates a timestamped backup before embedding annotations into it.
+```bash
+cargo run --release
+```
 
-## Export note
+Or open a document directly:
 
-Highlights, comments, text boxes, shapes, stamps, ink/signatures, and attachment references can be
-exported into a new annotated PDF. They can also be embedded into the source PDF through the
-explicit confirmed Save-to-PDF action; SnapPDF creates a timestamped backup first.
+```bash
+cargo run --release -- /absolute/path/to/document.pdf
+```

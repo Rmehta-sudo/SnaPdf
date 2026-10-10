@@ -64,6 +64,16 @@ struct SearchScanResult {
     matches: Vec<PdfFileSearchMatches>,
 }
 
+fn poll_search_scan(receiver: &mut Option<Receiver<SearchScanResult>>) -> Option<SearchScanResult> {
+    let result = match receiver.as_ref()?.try_recv() {
+        Ok(result) => Some(result),
+        Err(TryRecvError::Disconnected) => None,
+        Err(TryRecvError::Empty) => return None,
+    };
+    *receiver = None;
+    result
+}
+
 enum BreadcrumbAction {
     Browse(PathBuf),
     Copy(PathBuf),
@@ -246,6 +256,10 @@ pub struct SnapPdfApp {
     annotation_color: Color32,
     math_ocr_requests: HashSet<u64>,
     sidebar_tab: SidebarTab,
+    sidebar_visible: bool,
+    toolbar_visible: bool,
+    reader_mode: bool,
+    presentation_mode: bool,
     outline: Vec<PdfOutlineItem>,
     collapsed_outline_items: HashSet<usize>,
     open_with_path: Option<PathBuf>,
@@ -259,8 +273,8 @@ pub struct SnapPdfApp {
     search_request_id: u64,
     tab_search_matches: Vec<PdfFileSearchMatches>,
     workspace_search_matches: Vec<PdfFileSearchMatches>,
-    search_scan: Option<Receiver<SearchScanResult>>,
-    search_scan_scope: Option<SearchScope>,
+    tab_search_scan: Option<Receiver<SearchScanResult>>,
+    workspace_search_scan: Option<Receiver<SearchScanResult>>,
     native_pinch: Option<crate::gestures::NativePinch>,
     pending_native_pinches: Vec<crate::gestures::NativePinchEvent>,
     show_search: bool,
@@ -340,6 +354,10 @@ impl SnapPdfApp {
             annotation_color: Color32::from_rgb(255, 211, 74),
             math_ocr_requests: HashSet::new(),
             sidebar_tab: SidebarTab::Library,
+            sidebar_visible: true,
+            toolbar_visible: true,
+            reader_mode: false,
+            presentation_mode: false,
             outline: Vec::new(),
             collapsed_outline_items: HashSet::new(),
             open_with_path: None,
@@ -353,8 +371,8 @@ impl SnapPdfApp {
             search_request_id: 0,
             tab_search_matches: Vec::new(),
             workspace_search_matches: Vec::new(),
-            search_scan: None,
-            search_scan_scope: None,
+            tab_search_scan: None,
+            workspace_search_scan: None,
             native_pinch: crate::gestures::listen(creation),
             pending_native_pinches: Vec::new(),
             show_search: false,
@@ -714,26 +732,17 @@ impl SnapPdfApp {
                 self.pending_native_pinches.push(event);
             }
         }
-        if let Some(receiver) = self.search_scan.as_ref() {
-            match receiver.try_recv() {
-                Ok(result) => {
-                    if result.query == self.search_query {
-                        match result.scope {
-                            SearchScope::OpenTabs => self.tab_search_matches = result.matches,
-                            SearchScope::Workspace => {
-                                self.workspace_search_matches = result.matches
-                            }
-                        }
-                    }
-                    self.search_scan = None;
-                    self.search_scan_scope = None;
-                }
-                Err(TryRecvError::Disconnected) => {
-                    self.search_scan = None;
-                    self.search_scan_scope = None;
-                }
-                Err(TryRecvError::Empty) => {}
-            }
+        if let Some(result) = poll_search_scan(&mut self.tab_search_scan)
+            && result.scope == SearchScope::OpenTabs
+            && result.query == self.search_query.trim()
+        {
+            self.tab_search_matches = result.matches;
+        }
+        if let Some(result) = poll_search_scan(&mut self.workspace_search_scan)
+            && result.scope == SearchScope::Workspace
+            && result.query == self.search_query.trim()
+        {
+            self.workspace_search_matches = result.matches;
         }
         while let Ok(event) = self.worker.events.try_recv() {
             match event {
@@ -1019,7 +1028,7 @@ impl SnapPdfApp {
         });
     }
 
-    fn run_search(&mut self) {
+    fn run_search(&mut self, ctx: &egui::Context) {
         self.search_request_id = self.search_request_id.wrapping_add(1);
         self.search_matches.clear();
         self.search_index = 0;
@@ -1034,10 +1043,10 @@ impl SnapPdfApp {
             generation: self.generation,
             request_id: self.search_request_id,
         });
-        self.start_scoped_search(SearchScope::OpenTabs);
+        self.start_scoped_search(SearchScope::OpenTabs, ctx);
     }
 
-    fn start_scoped_search(&mut self, scope: SearchScope) {
+    fn start_scoped_search(&mut self, scope: SearchScope, ctx: &egui::Context) {
         let query = self.search_query.trim().to_owned();
         if query.is_empty() {
             return;
@@ -1047,8 +1056,11 @@ impl SnapPdfApp {
             SearchScope::Workspace => self.workspace_pdf_paths(),
         };
         let (sender, receiver) = mpsc::channel();
-        self.search_scan = Some(receiver);
-        self.search_scan_scope = Some(scope);
+        match scope {
+            SearchScope::OpenTabs => self.tab_search_scan = Some(receiver),
+            SearchScope::Workspace => self.workspace_search_scan = Some(receiver),
+        }
+        let repaint = ctx.clone();
         std::thread::spawn(move || {
             let matches = search_pdf_files(&paths, &query, 80).unwrap_or_default();
             let _ = sender.send(SearchScanResult {
@@ -1056,6 +1068,7 @@ impl SnapPdfApp {
                 query,
                 matches,
             });
+            repaint.request_repaint();
         });
     }
 
@@ -1105,6 +1118,22 @@ impl SnapPdfApp {
         );
     }
 
+    fn set_reader_mode(&mut self, enabled: bool) {
+        self.reader_mode = enabled;
+        self.sidebar_visible = !enabled;
+        self.toolbar_visible = !enabled;
+    }
+
+    fn set_presentation_mode(&mut self, ctx: &egui::Context, enabled: bool) {
+        self.presentation_mode = enabled;
+        if enabled {
+            self.set_reader_mode(true);
+        } else {
+            self.set_reader_mode(false);
+        }
+        ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(enabled));
+    }
+
     fn keyboard_shortcuts(&mut self, ctx: &egui::Context) {
         let open = KeyboardShortcut::new(Modifiers::CTRL, Key::O);
         let zoom_in = KeyboardShortcut::new(Modifiers::CTRL, Key::Plus);
@@ -1116,6 +1145,29 @@ impl SnapPdfApp {
         let reopen_tab = KeyboardShortcut::new(Modifiers::CTRL | Modifiers::SHIFT, Key::T);
         let undo = KeyboardShortcut::new(Modifiers::CTRL, Key::Z);
         let redo = KeyboardShortcut::new(Modifiers::CTRL | Modifiers::SHIFT, Key::Z);
+
+        if self.presentation_mode {
+            let (exit, previous, next) = ctx.input_mut(|input| {
+                (
+                    input.consume_key(Modifiers::NONE, Key::Escape),
+                    input.consume_key(Modifiers::NONE, Key::Backspace)
+                        || input.consume_key(Modifiers::NONE, Key::ArrowLeft)
+                        || input.consume_key(Modifiers::NONE, Key::K),
+                    input.consume_key(Modifiers::NONE, Key::Space)
+                        || input.consume_key(Modifiers::NONE, Key::ArrowRight)
+                        || input.consume_key(Modifiers::NONE, Key::J),
+                )
+            });
+            if exit {
+                self.set_presentation_mode(ctx, false);
+            } else if previous {
+                self.jump_to_page = Some(self.current_page.saturating_sub(1));
+            } else if next && !self.page_sizes.is_empty() {
+                self.jump_to_page =
+                    Some((self.current_page + 1).min(self.page_sizes.len().saturating_sub(1)));
+            }
+            return;
+        }
 
         if ctx.input_mut(|input| input.consume_shortcut(&open)) {
             self.open_file_dialog();
@@ -1375,6 +1427,9 @@ impl SnapPdfApp {
     }
 
     fn navigation_rail(&mut self, root: &mut egui::Ui) {
+        if self.reader_mode || self.presentation_mode {
+            return;
+        }
         egui::Panel::left("navigation-rail")
             .resizable(false)
             .exact_size(48.0)
@@ -1385,34 +1440,61 @@ impl SnapPdfApp {
             )
             .show(root, |ui| {
                 ui.vertical_centered(|ui| {
-                    if rail_button(ui, self.sidebar_tab == SidebarTab::Library, RailIcon::Files)
-                        .on_hover_text("Files")
-                        .clicked()
-                    {
-                        self.sidebar_tab = SidebarTab::Library;
-                    }
-                    if rail_button(
+                    let files = rail_button(
                         ui,
-                        self.sidebar_tab == SidebarTab::Contents,
+                        self.sidebar_visible && self.sidebar_tab == SidebarTab::Library,
+                        RailIcon::Files,
+                    )
+                    .on_hover_text("Files")
+                    .clicked();
+                    if files {
+                        if self.sidebar_visible && self.sidebar_tab == SidebarTab::Library {
+                            self.sidebar_visible = false;
+                        } else {
+                            self.sidebar_visible = true;
+                            self.sidebar_tab = SidebarTab::Library;
+                        }
+                    }
+                    let contents = rail_button(
+                        ui,
+                        self.sidebar_visible && self.sidebar_tab == SidebarTab::Contents,
                         RailIcon::Contents,
                     )
                     .on_hover_text("Document outline")
-                    .clicked()
-                    {
-                        self.sidebar_tab = SidebarTab::Contents;
+                    .clicked();
+                    if contents {
+                        if self.sidebar_visible && self.sidebar_tab == SidebarTab::Contents {
+                            self.sidebar_visible = false;
+                        } else {
+                            self.sidebar_visible = true;
+                            self.sidebar_tab = SidebarTab::Contents;
+                        }
                     }
-                    if rail_button(ui, self.sidebar_tab == SidebarTab::Search, RailIcon::Search)
-                        .on_hover_text("Find in document (Ctrl+F)")
-                        .clicked()
-                    {
-                        self.show_search = true;
-                        self.sidebar_tab = SidebarTab::Search;
+                    let search = rail_button(
+                        ui,
+                        self.sidebar_visible && self.sidebar_tab == SidebarTab::Search,
+                        RailIcon::Search,
+                    )
+                    .on_hover_text("Find in document (Ctrl+F)")
+                    .clicked();
+                    if search {
+                        if self.sidebar_visible && self.sidebar_tab == SidebarTab::Search {
+                            self.sidebar_visible = false;
+                            self.show_search = false;
+                        } else {
+                            self.sidebar_visible = true;
+                            self.show_search = true;
+                            self.sidebar_tab = SidebarTab::Search;
+                        }
                     }
                 });
             });
     }
 
     fn sidebar(&mut self, root: &mut egui::Ui) {
+        if !self.sidebar_visible || self.reader_mode || self.presentation_mode {
+            return;
+        }
         egui::Panel::left("project-sidebar")
             .resizable(true)
             .default_size(340.0)
@@ -1926,18 +2008,21 @@ impl SnapPdfApp {
                 .hint_text("Search PDFs")
                 .margin(Margin::symmetric(8, 6)),
         );
-        let submit = response.lost_focus() && ui.input(|input| input.key_pressed(Key::Enter));
+        // `lost_focus()` is not reliable here because egui keeps a single-line
+        // editor focused after submit. Consume Enter while this field owns focus.
+        let submit = response.has_focus()
+            && ui.input_mut(|input| input.consume_key(Modifiers::NONE, Key::Enter));
         if submit {
-            self.run_search();
+            self.run_search(ui.ctx());
         }
         ui.add_space(6.0);
         ui.horizontal(|ui| {
             if ui.button("Search current + tabs").clicked() {
-                self.run_search();
+                self.run_search(ui.ctx());
             }
             if ui.button("Search workspace").clicked() && !self.search_query.trim().is_empty() {
                 self.workspace_search_matches.clear();
-                self.start_scoped_search(SearchScope::Workspace);
+                self.start_scoped_search(SearchScope::Workspace, ui.ctx());
             }
         });
         ui.horizontal(|ui| {
@@ -2007,7 +2092,7 @@ impl SnapPdfApp {
             &format!("{} results", tab_result_count),
             theme::MUTED,
         );
-        if self.search_scan_scope == Some(SearchScope::OpenTabs) {
+        if self.tab_search_scan.is_some() {
             ui.label(
                 RichText::new("Searching open tabs...")
                     .size(12.0)
@@ -2057,7 +2142,7 @@ impl SnapPdfApp {
             &format!("{} results", workspace_result_count),
             theme::MUTED,
         );
-        if self.search_scan_scope == Some(SearchScope::Workspace) {
+        if self.workspace_search_scan.is_some() {
             ui.label(
                 RichText::new("Searching workspace PDFs...")
                     .size(12.0)
@@ -2099,6 +2184,9 @@ impl SnapPdfApp {
     }
 
     fn toolbar(&mut self, root: &mut egui::Ui) {
+        if !self.toolbar_visible || self.reader_mode || self.presentation_mode {
+            return;
+        }
         egui::Panel::top("toolbar")
             .frame(
                 Frame::new()
@@ -2195,6 +2283,39 @@ impl SnapPdfApp {
                                 .clicked()
                                 {
                                     self.show_view_settings = true;
+                                }
+                                if icon_button(
+                                    ui,
+                                    ToolbarIcon::Reader,
+                                    false,
+                                    true,
+                                    "Reader mode — hide the sidebar and toolbar",
+                                )
+                                .clicked()
+                                {
+                                    self.set_reader_mode(true);
+                                }
+                                if icon_button(
+                                    ui,
+                                    ToolbarIcon::Present,
+                                    false,
+                                    true,
+                                    "Presentation mode — full screen",
+                                )
+                                .clicked()
+                                {
+                                    self.set_presentation_mode(ui.ctx(), true);
+                                }
+                                if icon_button(
+                                    ui,
+                                    ToolbarIcon::CollapseToolbar,
+                                    false,
+                                    true,
+                                    "Hide toolbar",
+                                )
+                                .clicked()
+                                {
+                                    self.toolbar_visible = false;
                                 }
                             }
                         });
@@ -2352,7 +2473,7 @@ impl SnapPdfApp {
                                     &mut self.tool_mode,
                                     ToolMode::MathOcr,
                                     ToolbarIcon::Math,
-                                    "Math OCR",
+                                    "Math OCR (experimental)",
                                 );
                                 ui.separator();
                                 if icon_button(
@@ -2958,6 +3079,36 @@ impl SnapPdfApp {
                 if let Some(path) = self.current_path.clone() {
                     self.state.reading_positions.insert(path, visible_page);
                 }
+            });
+    }
+
+    fn mode_controls(&mut self, ctx: &egui::Context) {
+        if !self.presentation_mode && !self.reader_mode && self.toolbar_visible {
+            return;
+        }
+        let bounds = ctx.content_rect();
+        egui::Area::new(egui::Id::new("reading-mode-controls"))
+            .order(egui::Order::Foreground)
+            .fixed_pos(pos2(bounds.right() - 190.0, bounds.top() + 10.0))
+            .show(ctx, |ui| {
+                Frame::new()
+                    .fill(Color32::from_rgba_unmultiplied(29, 29, 29, 232))
+                    .stroke(Stroke::new(1.0, Color32::from_rgb(70, 70, 70)))
+                    .corner_radius(CornerRadius::same(7))
+                    .inner_margin(Margin::symmetric(7, 5))
+                    .show(ui, |ui| {
+                        if self.presentation_mode {
+                            if ui.button("Exit presentation · Esc").clicked() {
+                                self.set_presentation_mode(ctx, false);
+                            }
+                        } else if self.reader_mode {
+                            if ui.button("Exit reader mode").clicked() {
+                                self.set_reader_mode(false);
+                            }
+                        } else if ui.button("Show toolbar").clicked() {
+                            self.toolbar_visible = true;
+                        }
+                    });
             });
     }
 
@@ -3635,6 +3786,7 @@ impl eframe::App for SnapPdfApp {
         self.sidebar(ui);
         self.toolbar(ui);
         self.viewer(ui);
+        self.mode_controls(ui.ctx());
         self.rename_dialog(ui.ctx());
         self.note_dialog(ui.ctx());
         self.view_settings_dialog(ui.ctx());
@@ -4551,6 +4703,9 @@ enum ToolbarIcon {
     OpenWith,
     Folder,
     Settings,
+    CollapseToolbar,
+    Reader,
+    Present,
 }
 
 fn compact_text_button(ui: &mut egui::Ui, text: &str, help: &str) -> Response {
@@ -4613,26 +4768,25 @@ fn paint_toolbar_icon(
     let stroke = Stroke::new(1.45, color);
     match icon {
         ToolbarIcon::Highlight => {
-            // A conventional chisel-tip highlighter: dark outline, light body,
-            // and the yellow ink edge used by familiar PDF viewers.
+            // Conventional chisel-tip highlighter with a bright ink edge.
             let body = vec![
-                center + vec2(-7.0, 3.0),
-                center + vec2(1.5, -5.5),
-                center + vec2(6.5, -0.5),
-                center + vec2(-2.0, 8.0),
+                center + vec2(-6.5, 3.0),
+                center + vec2(1.5, -5.0),
+                center + vec2(6.5, 0.0),
+                center + vec2(-1.5, 8.0),
             ];
             painter.add(egui::Shape::convex_polygon(
                 body.clone(),
-                color.gamma_multiply(0.9),
+                Color32::from_rgb(224, 224, 224),
                 Stroke::new(1.1, Color32::from_rgb(34, 34, 34)),
             ));
             painter.line_segment(
-                [center + vec2(-4.5, 5.5), center + vec2(4.0, -3.0)],
-                Stroke::new(1.1, Color32::from_rgb(112, 112, 112)),
+                [center + vec2(-4.3, 5.0), center + vec2(3.8, -3.1)],
+                Stroke::new(1.25, Color32::from_rgb(105, 105, 105)),
             );
             painter.line_segment(
                 [center + vec2(-7.0, 8.0), center + vec2(7.0, 8.0)],
-                Stroke::new(2.5, Color32::from_rgb(255, 204, 48)),
+                Stroke::new(2.7, Color32::from_rgb(255, 211, 59)),
             );
         }
         ToolbarIcon::Pen => {
@@ -4655,16 +4809,16 @@ fn paint_toolbar_icon(
         }
         ToolbarIcon::Eraser => {
             let white_half = vec![
-                center + vec2(-7.0, 1.5),
+                center + vec2(-7.0, 1.0),
                 center + vec2(-2.0, -6.0),
-                center + vec2(2.0, -2.0),
-                center + vec2(-3.0, 6.0),
+                center + vec2(2.2, -1.8),
+                center + vec2(-2.8, 6.2),
             ];
             let dark_half = vec![
-                center + vec2(2.0, -2.0),
-                center + vec2(7.0, 2.5),
-                center + vec2(2.0, 7.0),
-                center + vec2(-3.0, 6.0),
+                center + vec2(2.2, -1.8),
+                center + vec2(7.0, 2.9),
+                center + vec2(1.8, 7.0),
+                center + vec2(-2.8, 6.2),
             ];
             painter.add(egui::Shape::convex_polygon(
                 white_half,
@@ -4673,7 +4827,7 @@ fn paint_toolbar_icon(
             ));
             painter.add(egui::Shape::convex_polygon(
                 dark_half,
-                Color32::from_rgb(145, 151, 160),
+                Color32::from_rgb(196, 201, 208),
                 Stroke::NONE,
             ));
             painter.add(egui::Shape::closed_line(
@@ -4721,24 +4875,26 @@ fn paint_toolbar_icon(
         }
         ToolbarIcon::Undo | ToolbarIcon::Redo => {
             let flip = if matches!(icon, ToolbarIcon::Undo) {
-                -1.0
-            } else {
                 1.0
+            } else {
+                -1.0
             };
-            let arc = (0..=16)
-                .map(|step| {
-                    let angle =
-                        205.0_f32.to_radians() - step as f32 / 16.0 * 220.0_f32.to_radians();
-                    center + vec2(angle.cos() * 7.2 * flip, angle.sin() * 6.6)
-                })
-                .collect::<Vec<_>>();
-            painter.add(egui::Shape::line(arc, Stroke::new(1.65, color)));
-            let arrow_tip = center + vec2(-6.5 * flip, -2.7);
+            let u_turn = vec![
+                center + vec2(-6.7 * flip, -2.8),
+                center + vec2(-2.0 * flip, -2.8),
+                center + vec2(3.0 * flip, -2.8),
+                center + vec2(6.0 * flip, 0.0),
+                center + vec2(5.6 * flip, 3.9),
+                center + vec2(2.2 * flip, 6.0),
+                center + vec2(-1.5 * flip, 5.4),
+            ];
+            painter.add(egui::Shape::line(u_turn, Stroke::new(1.7, color)));
+            let arrow_tip = center + vec2(-7.0 * flip, -2.8);
             painter.add(egui::Shape::convex_polygon(
                 vec![
                     arrow_tip,
-                    arrow_tip + vec2(4.6 * flip, -3.2),
-                    arrow_tip + vec2(4.6 * flip, 3.2),
+                    arrow_tip + vec2(4.2 * flip, -3.6),
+                    arrow_tip + vec2(4.2 * flip, 3.6),
                 ],
                 color,
                 Stroke::NONE,
@@ -4832,6 +4988,45 @@ fn paint_toolbar_icon(
             painter.circle_filled(center, 4.35, theme::PANEL_BG);
             painter.circle_stroke(center, 4.35, Stroke::new(1.05, color));
             painter.circle_filled(center, 1.5, color);
+        }
+        ToolbarIcon::CollapseToolbar => {
+            painter.line_segment(
+                [center + vec2(-7.0, -5.0), center + vec2(7.0, -5.0)],
+                stroke,
+            );
+            painter.add(egui::Shape::convex_polygon(
+                vec![
+                    center + vec2(-4.0, 0.0),
+                    center + vec2(4.0, 0.0),
+                    center + vec2(0.0, 4.5),
+                ],
+                color,
+                Stroke::NONE,
+            ));
+        }
+        ToolbarIcon::Reader => {
+            let page = Rect::from_center_size(center, vec2(12.0, 15.0));
+            painter.rect_stroke(page, 1.0, stroke, StrokeKind::Inside);
+            painter.line_segment(
+                [
+                    page.left_top() + vec2(3.0, 4.0),
+                    page.right_top() + vec2(-3.0, 4.0),
+                ],
+                Stroke::new(1.1, color),
+            );
+            painter.line_segment(
+                [
+                    page.left_top() + vec2(3.0, 8.0),
+                    page.right_top() + vec2(-3.0, 8.0),
+                ],
+                Stroke::new(1.1, color),
+            );
+        }
+        ToolbarIcon::Present => {
+            let screen = Rect::from_center_size(center, vec2(15.0, 11.0));
+            painter.rect_stroke(screen, 1.0, stroke, StrokeKind::Inside);
+            painter.line_segment([center + vec2(-3.0, 7.0), center + vec2(3.0, 7.0)], stroke);
+            painter.line_segment([center + vec2(0.0, 4.0), center + vec2(0.0, 7.0)], stroke);
         }
     }
 }
