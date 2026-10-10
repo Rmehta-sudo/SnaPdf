@@ -5,8 +5,11 @@ pub struct NativePinch {
     pub events: Receiver<NativePinchEvent>,
 }
 
-pub struct NativePinchEvent {
-    pub factor: f32,
+#[derive(Clone, Copy)]
+pub enum NativePinchEvent {
+    Begin,
+    Update(f32),
+    End,
 }
 
 #[cfg(target_os = "linux")]
@@ -57,21 +60,29 @@ pub fn listen(creation: &eframe::CreationContext<'_>) -> Option<NativePinch> {
             let mut previous_scale = 1.0_f32;
             while let Ok(event) = connection.wait_for_event() {
                 match event {
-                    Event::XinputGesturePinchBegin(_) => previous_scale = 1.0,
+                    Event::XinputGesturePinchBegin(_) => {
+                        previous_scale = 1.0;
+                        if sender.send(NativePinchEvent::Begin).is_err() { break; }
+                        repaint.request_repaint();
+                    },
                     Event::XinputGesturePinchUpdate(event) => {
                         let scale = event.scale as f32 / 65_536.0;
                         if scale.is_finite() && scale > 0.0 {
                             let factor = (scale / previous_scale).clamp(0.5, 2.0);
                             previous_scale = scale;
                             if (factor - 1.0).abs() > 0.0001 {
-                                if sender.send(NativePinchEvent { factor }).is_err() {
+                                if sender.send(NativePinchEvent::Update(factor)).is_err() {
                                     break;
                                 }
                                 repaint.request_repaint();
                             }
                         }
                     }
-                    Event::XinputGesturePinchEnd(_) => previous_scale = 1.0,
+                    Event::XinputGesturePinchEnd(_) => {
+                        previous_scale = 1.0;
+                        if sender.send(NativePinchEvent::End).is_err() { break; }
+                        repaint.request_repaint();
+                    },
                     _ => {}
                 }
             }

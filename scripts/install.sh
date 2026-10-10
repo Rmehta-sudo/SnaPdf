@@ -31,10 +31,10 @@ if ! command -v uv >/dev/null 2>&1 && [[ ! -x "${HOME}/.local/bin/uv" ]]; then
 fi
 export PATH="${HOME}/.local/bin:${HOME}/.cargo/bin:${PATH}"
 
-if [[ ! -x "${PROJECT_ROOT}/target/release/snappdf" ]]; then
-  echo "Release binary not found; building it now."
-  (cd "${PROJECT_ROOT}" && cargo build --release)
-fi
+# Always check the current source. Cargo's incremental build cache makes this
+# quick when nothing changed; skipping the build would reinstall a stale binary.
+echo "Building the current SnapPDF source..."
+(cd "${PROJECT_ROOT}" && cargo build --release --locked)
 
 install -d "${BIN_DIR}" "${APP_DIR}" "${ICON_DIR}"
 rm -f "${BIN_DIR}/crisppdf"

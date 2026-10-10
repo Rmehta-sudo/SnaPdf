@@ -349,10 +349,12 @@ fn worker_loop(
                 page_index,
                 generation,
             } => {
-                let focus = focused_page.load(Ordering::Relaxed);
+                // Rendering is intentionally restricted to the focused pages,
+                // but text extraction also serves a selection spanning several
+                // pages. Do not drop those requests just because the user has
+                // scrolled away from an intermediate page.
                 if generation != active_generation
                     || generation != desired_generation.load(Ordering::Relaxed)
-                    || page_index.abs_diff(focus) > 2
                 {
                     continue;
                 }

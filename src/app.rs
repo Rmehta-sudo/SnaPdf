@@ -32,11 +32,36 @@ enum RenameTarget {
     File(PathBuf),
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct TextPosition {
+    page: usize,
+    glyph: usize,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct TextSelection {
-    page_index: usize,
-    anchor: usize,
-    focus: usize,
+    anchor: TextPosition,
+    focus: TextPosition,
+}
+
+impl TextSelection {
+    fn ordered(self) -> (TextPosition, TextPosition) {
+        if self.anchor <= self.focus {
+            (self.anchor, self.focus)
+        } else {
+            (self.focus, self.anchor)
+        }
+    }
+
+    // Return the selected glyph range on this page (including intermediate pages).
+    fn bounds_on_page(self, page: usize, glyph_count: usize) -> Option<(usize, usize)> {
+        if glyph_count == 0 { return None; }
+        let (start, end) = self.ordered();
+        if page < start.page || page > end.page { return None; }
+        let first = if page == start.page { start.glyph.min(glyph_count - 1) } else { 0 };
+        let last = if page == end.page { end.glyph.min(glyph_count - 1) } else { glyph_count - 1 };
+        (first <= last).then_some((first, last))
+    }
 }
 
 #[derive(Clone)]
@@ -235,6 +260,8 @@ pub struct SnapPdfApp {
     link_layers: HashMap<usize, Vec<PdfLinkRegion>>,
     pending_text: HashSet<(usize, u64)>,
     text_selection: Option<TextSelection>,
+    text_selection_dragging: bool,
+    pending_selection_highlight: bool,
     generation: u64,
     frame_number: u64,
     zoom: f32,
@@ -297,6 +324,8 @@ pub struct SnapPdfApp {
     search_project_expanded: bool,
     native_pinch: Option<crate::gestures::NativePinch>,
     pending_native_pinches: Vec<crate::gestures::NativePinchEvent>,
+    native_pinch_active: bool,
+    native_pinch_suppress_until: f64,
     page_rects: Vec<(usize, Rect)>,
     pinch_anchor: Option<PinchAnchor>,
     show_search: bool,
@@ -348,6 +377,8 @@ impl SnapPdfApp {
             link_layers: HashMap::new(),
             pending_text: HashSet::new(),
             text_selection: None,
+            text_selection_dragging: false,
+            pending_selection_highlight: false,
             generation: 0,
             frame_number: 0,
             zoom: 1.0,
@@ -408,6 +439,8 @@ impl SnapPdfApp {
             search_project_expanded: false,
             native_pinch: crate::gestures::listen(creation),
             pending_native_pinches: Vec::new(),
+            native_pinch_active: false,
+            native_pinch_suppress_until: 0.0,
             page_rects: Vec::new(),
             pinch_anchor: None,
             show_search: false,
@@ -460,6 +493,8 @@ impl SnapPdfApp {
         self.collapsed_outline_items.clear();
         self.pending_text.clear();
         self.text_selection = None;
+        self.text_selection_dragging = false;
+        self.pending_selection_highlight = false;
         self.search_matches.clear();
         self.search_index = 0;
         self.search_navigation_index = 0;
@@ -1137,7 +1172,7 @@ impl SnapPdfApp {
     }
 
     fn apply_pinch_zoom(&mut self, factor: f32, cursor: Option<egui::Pos2>, ctx: &egui::Context) {
-        if (factor - 1.0).abs() <= 0.0001 {
+        if !factor.is_finite() || factor <= 0.0 || (factor - 1.0).abs() <= 0.0001 {
             return;
         }
         if self.presentation_mode
@@ -1147,17 +1182,30 @@ impl SnapPdfApp {
             return;
         }
         self.pinch_anchor = cursor.and_then(|cursor| {
-            self.page_rects
-                .iter()
-                .find(|(_, rect)| rect.contains(cursor))
-                .map(|(page, rect)| PinchAnchor {
-                    page: *page,
-                    fraction: vec2(
-                        (cursor.x - rect.left()) / rect.width().max(1.0),
-                        (cursor.y - rect.top()) / rect.height().max(1.0),
-                    ),
-                    cursor,
-                })
+            // A pinch can be centred on the grey margin or between pages.
+            // Use the nearest point *on* a page rather than dropping the anchor.
+            let (page, rect) = self.page_rects.iter().min_by(|(_, a), (_, b)| {
+                let distance_sq = |rect: &Rect| {
+                    let dx = (rect.left() - cursor.x).max(0.0)
+                        + (cursor.x - rect.right()).max(0.0);
+                    let dy = (rect.top() - cursor.y).max(0.0)
+                        + (cursor.y - rect.bottom()).max(0.0);
+                    dx * dx + dy * dy
+                };
+                distance_sq(a).total_cmp(&distance_sq(b))
+            })?;
+            let on_page = pos2(
+                cursor.x.clamp(rect.left(), rect.right()),
+                cursor.y.clamp(rect.top(), rect.bottom()),
+            );
+            Some(PinchAnchor {
+                page: *page,
+                fraction: vec2(
+                    (on_page.x - rect.left()) / rect.width().max(1.0),
+                    (on_page.y - rect.top()) / rect.height().max(1.0),
+                ),
+                cursor: on_page,
+            })
         });
         let minimum = if self.presentation_mode {
             self.mode_zoom_restore.unwrap_or(self.zoom)
@@ -2739,37 +2787,57 @@ impl SnapPdfApp {
                 }
 
                 let viewer_rect = ui.clip_rect();
-                let (pointer_position, pinch_zoom) = ctx.input(|input| {
+                let (pointer_position, egui_pinch_zoom, time) = ctx.input(|input| {
                     (
-                        input
-                            .pointer
-                            .hover_pos()
-                            .or_else(|| input.pointer.interact_pos()),
+                        input.pointer.hover_pos().or_else(|| input.pointer.interact_pos()),
                         trackpad_pinch_factor(&input.events),
+                        input.time,
                     )
                 });
-                let gesture_is_over_viewer =
-                    pointer_position.is_none_or(|position| viewer_rect.contains(position));
-                if gesture_is_over_viewer && (pinch_zoom - 1.0).abs() > 0.0001 {
-                    self.apply_pinch_zoom(pinch_zoom, pointer_position, &ctx);
+                // Both winit/egui and XInput can report the *same* physical
+                // gesture on X11. Native gesture Begin/End makes XInput the
+                // authoritative source during the pinch, including a short
+                // grace period for late synthetic Ctrl+wheel events.
+                let mut native_factor = 1.0_f32;
+                let mut native_event_seen = false;
+                for event in self.pending_native_pinches.drain(..) {
+                    native_event_seen = true;
+                    match event {
+                        crate::gestures::NativePinchEvent::Begin => {
+                            self.native_pinch_active = true;
+                        }
+                        crate::gestures::NativePinchEvent::Update(factor) => {
+                            self.native_pinch_active = true;
+                            native_factor *= factor;
+                        }
+                        crate::gestures::NativePinchEvent::End => {
+                            self.native_pinch_active = false;
+                        }
+                    }
                 }
-                // Gesture events arrive directly from XInput for this window. The
-                // event coordinates vary with the X compositor, so use egui's
-                // pointer position only for the region check instead of rejecting
-                // an otherwise valid native pinch because of a coordinate mismatch.
-                let pointer_is_over_viewer = ctx.input(|input| {
-                    input
-                        .pointer
-                        .hover_pos()
-                        .is_none_or(|position| viewer_rect.contains(position))
-                });
-                let native_pinch_zoom = self
-                    .pending_native_pinches
-                    .drain(..)
-                    .map(|event| event.factor)
-                    .product::<f32>();
-                if pointer_is_over_viewer && (native_pinch_zoom - 1.0).abs() > 0.0001 {
-                    self.apply_pinch_zoom(native_pinch_zoom, pointer_position, &ctx);
+                if native_event_seen {
+                    self.native_pinch_suppress_until = time + 0.20;
+                } else if self.native_pinch_active && time > self.native_pinch_suppress_until + 0.30 {
+                    // Recover if an X11 compositor never delivers PinchEnd.
+                    self.native_pinch_active = false;
+                }
+                let use_native = native_event_seen
+                    || self.native_pinch_active
+                    || time < self.native_pinch_suppress_until;
+                let pinch_zoom = if use_native { native_factor } else { egui_pinch_zoom };
+                let over_viewer = pointer_position.is_none_or(|pos| viewer_rect.contains(pos));
+                if over_viewer && (pinch_zoom - 1.0).abs() > 0.0001 {
+                    // Eguis ScrollArea also consumes scroll deltas. A gesture
+                    // must never both scale the page and scroll the document.
+                    self.apply_pinch_zoom(pinch_zoom, Some(pointer_position.unwrap_or(viewer_rect.center())), &ctx);
+                }
+                if over_viewer && (use_native || (egui_pinch_zoom - 1.0).abs() > 0.0001) {
+                    // A single precision wheel packet can produce both zoom and
+                    // smooth-scroll input. Do not let ScrollArea consume it twice.
+                    ctx.input_mut(|input| input.smooth_scroll_delta = egui::Vec2::ZERO);
+                }
+                if self.pending_selection_highlight && self.selection_text_ready() {
+                    self.highlight_text_selection();
                 }
 
                 let available_page_width = (ui.available_width() - 56.0).max(100.0);
@@ -2816,7 +2884,7 @@ impl SnapPdfApp {
                 ScrollArea::both()
                     .id_salt("document-scroll")
                     .auto_shrink([false, false])
-                    .animated(true)
+                    .animated(false)
                     .wheel_scroll_multiplier(vec2(
                         WHEEL_SCROLL_MULTIPLIER,
                         WHEEL_SCROLL_MULTIPLIER,
@@ -2853,9 +2921,13 @@ impl SnapPdfApp {
                                 rect.left() + rect.width() * anchor.fraction.x,
                                 rect.top() + rect.height() * anchor.fraction.y,
                             );
-                            // Offset the scroll area by exactly the point's movement,
-                            // keeping the PDF coordinate under the trackpad cursor fixed.
-                            ui.scroll_with_delta(target - anchor.cursor);
+                            // Preserve the PDF point beneath the cursor: if the
+                            // new layout moved it right/down, move the *content*
+                            // left/up by precisely that amount, without easing.
+                            ui.scroll_with_delta_animation(
+                                pinch_anchor_scroll_delta(anchor.cursor, target),
+                                egui::style::ScrollAnimation::none(),
+                            );
                         }
                         self.page_rects = laid_out_pages.clone();
                         ui.add_space(page_gap);
@@ -2890,11 +2962,81 @@ impl SnapPdfApp {
                             pending.generation == generation
                                 && pending.index.abs_diff(visible_page) <= 2
                         });
+                        let selected_pages = self.text_selection.map(|selection| {
+                            let (first, last) = selection.ordered();
+                            (first.page, last.page)
+                        });
                         self.pending_text.retain(|(index, pending_generation)| {
-                            *pending_generation == generation && index.abs_diff(visible_page) <= 2
+                            *pending_generation == generation
+                                && (index.abs_diff(visible_page) <= 2
+                                    || selected_pages.is_some_and(|(first, last)|
+                                        (first..=last).contains(index)))
                         });
 
+                        // Selection is a document-level gesture, not a gesture of
+                        // the page on which the mouse was pressed. Otherwise the
+                        // drag stops tracking when that page leaves the viewport.
+                        if self.text_selection_dragging {
+                            let (pointer, down) = ctx.input(|input| {
+                                (input.pointer.hover_pos().or_else(|| input.pointer.interact_pos()),
+                                 input.pointer.primary_down())
+                            });
+                            if let Some(pointer) = pointer {
+                                let edge_delta = selection_edge_scroll(pointer.y, viewport);
+                                if down && edge_delta.abs() > 0.1 {
+                                    ui.scroll_with_delta_animation(
+                                        vec2(0.0, edge_delta),
+                                        egui::style::ScrollAnimation::none(),
+                                    );
+                                    ctx.request_repaint();
+                                }
+                                let clamped = pos2(
+                                    pointer.x.clamp(viewport.left(), viewport.right()),
+                                    pointer.y.clamp(viewport.top(), viewport.bottom()),
+                                );
+                                if let Some((page, rect)) = laid_out_pages.iter().min_by(|(_, a), (_, b)| {
+                                    let distance = |rect: &Rect| {
+                                        let dx = (rect.left() - clamped.x).max(0.0)
+                                            + (clamped.x - rect.right()).max(0.0);
+                                        let dy = (rect.top() - clamped.y).max(0.0)
+                                            + (clamped.y - rect.bottom()).max(0.0);
+                                        dx * dx + dy * dy
+                                    };
+                                    distance(a).total_cmp(&distance(b))
+                                }) {
+                                    // Already-visible layers update immediately; newly
+                                    // encountered pages can be extracted asynchronously.
+                                    if let Some(glyphs) = self.text_layers.get(page) {
+                                        if let Some(glyph) = nearest_drag_glyph(
+                                            glyphs, *rect, page_sizes[*page], clamped,
+                                        ) {
+                                            if let Some(selection) = self.text_selection.as_mut() {
+                                                selection.focus = TextPosition { page: *page, glyph };
+                                            }
+                                        }
+                                    } else {
+                                        self.request_text(*page, generation);
+                                    }
+                                }
+                            }
+                            if !down {
+                                self.text_selection_dragging = false;
+                                if self.tool_mode == ToolMode::Highlight {
+                                    self.highlight_text_selection();
+                                }
+                            }
+                        }
+                        if let Some(selection) = self.text_selection {
+                            let (start, end) = selection.ordered();
+                            // Include intervening pages, even when a fast drag
+                            // crosses one before its text layer has loaded.
+                            for page in start.page..=end.page {
+                                self.request_text(page, generation);
+                            }
+                        }
+
                         let preload = viewport.expand2(vec2(0.0, viewport.height() * 1.25));
+                        let mut selection_action_rect = None;
                         for (index, page_rect) in laid_out_pages {
                             if page_rect.intersects(preload) {
                                 let target_width =
@@ -2964,6 +3106,17 @@ impl SnapPdfApp {
                                     .cloned()
                                     .collect::<Vec<_>>();
                                 paint_annotations(ui.painter(), &page_annotations, page_rect, page_sizes[index]);
+                                if let Some(selection) = self.text_selection
+                                    && let Some(glyphs) = self.text_layers.get(&index)
+                                    && let Some((start, end)) = selection.bounds_on_page(index, glyphs.len())
+                                {
+                                    paint_text_selection(ui.painter(), glyphs, start, end, page_rect, page_sizes[index]);
+                                    if index == selection.focus.page {
+                                        selection_action_rect = text_selection_screen_rect(
+                                            glyphs, start, end, page_rect, page_sizes[index],
+                                        );
+                                    }
+                                }
                                 let pointer = ctx.pointer_latest_pos();
                                 let pointer_on_annotation = pointer.is_some_and(|pointer| {
                                     annotation_at(
@@ -3093,76 +3246,27 @@ impl SnapPdfApp {
                                     );
                                     match self.tool_mode {
                                         ToolMode::Select | ToolMode::Highlight => {
-                                            if let Some(glyphs) = self.text_layers.get(&index) {
-                                                if let Some(pointer) = response.interact_pointer_pos()
-                                                    && let Some(glyph_index) = nearest_glyph(glyphs, page_rect, source_size, pointer)
+                                            if let Some(glyphs) = self.text_layers.get(&index)
+                                                && let Some(pointer) = response.interact_pointer_pos()
+                                            {
+                                                if response.drag_started() || response.clicked() {
+                                                    if let Some(glyph) = nearest_glyph(glyphs, page_rect, source_size, pointer) {
+                                                        let position = TextPosition { page: index, glyph };
+                                                        self.text_selection = Some(TextSelection { anchor: position, focus: position });
+                                                        self.text_selection_dragging = response.drag_started();
+                                                        self.pending_selection_highlight = false;
+                                                    }
+                                                } else if response.dragged()
+                                                    && self.text_selection_dragging
+                                                    && page_rect.contains(pointer)
                                                 {
-                                                    if response.drag_started() || response.clicked() {
-                                                        self.text_selection = Some(TextSelection { page_index: index, anchor: glyph_index, focus: glyph_index });
-                                                    } else if response.dragged()
+                                                    if let Some(glyph) = nearest_drag_glyph(glyphs, page_rect, source_size, pointer)
                                                         && let Some(selection) = self.text_selection.as_mut()
-                                                        && selection.page_index == index
                                                     {
-                                                        selection.focus = glyph_index;
-                                                    }
-                                                    if response.hovered() { ctx.set_cursor_icon(CursorIcon::Text); }
-                                                }
-                                                if let Some(selection) = self.text_selection
-                                                    && selection.page_index == index
-                                                {
-                                                    paint_text_selection(ui.painter(), glyphs, selection, page_rect, source_size);
-                                                    if self.tool_mode == ToolMode::Highlight && response.drag_stopped() {
-                                                        let start = selection.anchor.min(selection.focus);
-                                                        let end = selection.anchor.max(selection.focus);
-                                                        let rects = glyphs.get(start..=end).unwrap_or_default().iter().filter_map(|glyph| glyph.bounds).collect::<Vec<_>>();
-                                                        if !rects.is_empty() {
-                                                            self.add_annotation(index, AnnotationKind::Highlight { rects, color: [self.annotation_color.r(), self.annotation_color.g(), self.annotation_color.b(), 86] });
-                                                            self.text_selection = None;
-                                                            self.status = "Highlight saved locally.".to_owned();
-                                                        }
-                                                    } else if self.tool_mode == ToolMode::Select
-                                                        && !response.dragged()
-                                                        && selection.anchor != selection.focus
-                                                        && let Some(selection_rect) = text_selection_screen_rect(
-                                                            glyphs,
-                                                            selection,
-                                                            page_rect,
-                                                            source_size,
-                                                        )
-                                                        && let Some(action) = selection_action_bar(&ctx, selection_rect)
-                                                    {
-                                                        match action {
-                                                            SelectionAction::Copy => {
-                                                                if let Some(text) = selected_glyph_text(
-                                                                    glyphs,
-                                                                    selection.anchor,
-                                                                    selection.focus,
-                                                                ) {
-                                                                    ctx.copy_text(text);
-                                                                    self.status = "Selected text copied.".to_owned();
-                                                                }
-                                                            }
-                                                            SelectionAction::Highlight => {
-                                                                let start = selection.anchor.min(selection.focus);
-                                                                let end = selection.anchor.max(selection.focus);
-                                                                let rects = glyphs
-                                                                    .get(start..=end)
-                                                                    .unwrap_or_default()
-                                                                    .iter()
-                                                                    .filter_map(|glyph| glyph.bounds)
-                                                                    .collect::<Vec<_>>();
-                                                                if !rects.is_empty() {
-                                                                    self.add_annotation(index, AnnotationKind::Highlight {
-                                                                        rects,
-                                                                        color: [self.annotation_color.r(), self.annotation_color.g(), self.annotation_color.b(), 86],
-                                                                    });
-                                                                    self.text_selection = None;
-                                                                    self.status = "Highlight saved locally.".to_owned();
-                                                                }
-                                                            }
-                                                        }
+                                                        selection.focus = TextPosition { page: index, glyph };
                                                     }
                                                 }
+                                                if response.hovered() { ctx.set_cursor_icon(CursorIcon::Text); }
                                             }
                                         }
                                         ToolMode::Pen | ToolMode::Signature => {
@@ -3311,6 +3415,22 @@ impl SnapPdfApp {
                                         }
                                     }
                                 }
+                            }
+                        }
+                        if self.tool_mode == ToolMode::Select && !self.text_selection_dragging
+                            && let Some(selection) = self.text_selection
+                            && selection.anchor != selection.focus
+                            && let Some(rect) = selection_action_rect
+                            && let Some(action) = selection_action_bar(&ctx, rect)
+                        {
+                            match action {
+                                SelectionAction::Copy => {
+                                    if let Some(text) = self.selected_text() {
+                                        ctx.copy_text(text);
+                                        self.status = "Selected text copied.".to_owned();
+                                    }
+                                }
+                                SelectionAction::Highlight => self.highlight_text_selection(),
                             }
                         }
                     });
@@ -3536,8 +3656,56 @@ impl SnapPdfApp {
 
     fn selected_text(&self) -> Option<String> {
         let selection = self.text_selection?;
-        let glyphs = self.text_layers.get(&selection.page_index)?;
-        selected_glyph_text(glyphs, selection.anchor, selection.focus)
+        let (first, last) = selection.ordered();
+        let mut parts = Vec::new();
+        for page in first.page..=last.page {
+            let glyphs = self.text_layers.get(&page)?;
+            if let Some((start, end)) = selection.bounds_on_page(page, glyphs.len()) {
+                if let Some(text) = selected_glyph_text(glyphs, start, end) {
+                    parts.push(text);
+                }
+            }
+        }
+        (!parts.is_empty()).then(|| parts.join("\n"))
+    }
+
+    fn selection_text_ready(&self) -> bool {
+        let Some(selection) = self.text_selection else { return false; };
+        let (first, last) = selection.ordered();
+        (first.page..=last.page).all(|page| self.text_layers.contains_key(&page))
+    }
+
+    fn highlight_text_selection(&mut self) {
+        let Some(selection) = self.text_selection else { return; };
+        if !self.selection_text_ready() {
+            self.pending_selection_highlight = true;
+            let (first, last) = selection.ordered();
+            for page in first.page..=last.page {
+                self.request_text(page, self.generation);
+            }
+            self.status = "Finishing text extraction before highlighting...".to_owned();
+            return;
+        }
+        self.pending_selection_highlight = false;
+        self.text_selection = None;
+        let (first, last) = selection.ordered();
+        let mut saved = 0;
+        for page in first.page..=last.page {
+            let Some(glyphs) = self.text_layers.get(&page) else { continue; };
+            let Some((start, end)) = selection.bounds_on_page(page, glyphs.len()) else { continue; };
+            let rects = glyphs[start..=end]
+                .iter()
+                .filter_map(|glyph| glyph.bounds)
+                .collect::<Vec<_>>();
+            if !rects.is_empty() {
+                self.add_annotation(page, AnnotationKind::Highlight {
+                    rects,
+                    color: [self.annotation_color.r(), self.annotation_color.g(), self.annotation_color.b(), 86],
+                });
+                saved += 1;
+            }
+        }
+        if saved > 0 { self.status = "Highlight saved locally.".to_owned(); }
     }
 
     fn rename_dialog(&mut self, ctx: &egui::Context) {
@@ -4821,15 +4989,12 @@ fn paint_search_hits(
 fn paint_text_selection(
     painter: &egui::Painter,
     glyphs: &[TextGlyph],
-    selection: TextSelection,
+    first: usize,
+    last: usize,
     page_rect: Rect,
     source_size: [f32; 2],
 ) {
-    let start = selection.anchor.min(selection.focus);
-    let end = selection.anchor.max(selection.focus);
-    let Some(selected) = glyphs.get(start..=end) else {
-        return;
-    };
+    let Some(selected) = glyphs.get(first..=last) else { return; };
     for glyph in selected {
         if let Some(rect) = glyph_screen_rect(glyph, page_rect, source_size) {
             painter.rect_filled(
@@ -4843,17 +5008,44 @@ fn paint_text_selection(
 
 fn text_selection_screen_rect(
     glyphs: &[TextGlyph],
-    selection: TextSelection,
+    first: usize,
+    last: usize,
     page_rect: Rect,
     source_size: [f32; 2],
 ) -> Option<Rect> {
-    let start = selection.anchor.min(selection.focus);
-    let end = selection.anchor.max(selection.focus);
     glyphs
-        .get(start..=end)?
+        .get(first..=last)?
         .iter()
         .filter_map(|glyph| glyph_screen_rect(glyph, page_rect, source_size))
         .reduce(Rect::union)
+}
+
+/// During an ongoing drag, the pointer may be in whitespace or even beyond
+/// the visible page. Keep choosing the closest glyph instead of dropping the
+/// selection when `nearest_glyph`'s ordinary click tolerance is exceeded.
+fn nearest_drag_glyph(
+    glyphs: &[TextGlyph],
+    page_rect: Rect,
+    source_size: [f32; 2],
+    pointer: egui::Pos2,
+) -> Option<usize> {
+    glyphs.iter().enumerate().filter_map(|(index, glyph)| {
+        let rect = glyph_screen_rect(glyph, page_rect, source_size)?;
+        let dx = (rect.left() - pointer.x).max(0.0) + (pointer.x - rect.right()).max(0.0);
+        let dy = (rect.top() - pointer.y).max(0.0) + (pointer.y - rect.bottom()).max(0.0);
+        Some((index, dx * dx + dy * dy))
+    }).min_by(|a, b| a.1.total_cmp(&b.1)).map(|(index, _)| index)
+}
+
+/// Positive values move PDF content down, negative values move it up.
+/// Start gently inside a 48-point edge zone and accelerate as the pointer
+/// approaches (or passes) the boundary. Works in both directions.
+fn selection_edge_scroll(pointer_y: f32, viewport: Rect) -> f32 {
+    const EDGE: f32 = 48.0;
+    const MAX_SPEED: f32 = 28.0;
+    let above = (viewport.top() + EDGE - pointer_y).max(0.0) / EDGE;
+    let below = (pointer_y - (viewport.bottom() - EDGE)).max(0.0) / EDGE;
+    above.min(2.0) * MAX_SPEED - below.min(2.0) * MAX_SPEED
 }
 
 fn selection_action_bar(ctx: &egui::Context, selection_rect: Rect) -> Option<SelectionAction> {
@@ -5418,6 +5610,12 @@ fn chrome_zoom(document_zoom: f32, ratio: f32) -> f32 {
 /// touchpad pinches are commonly represented as point-granularity wheel events
 /// with a synthetic Ctrl modifier. A real mouse wheel uses line granularity, so
 /// excluding it here keeps Ctrl+mouse-wheel out of this PDF-only gesture path.
+/// egui's scroll delta is a displacement of *content*, not scroll offset.
+/// Offset the new PDF layout so the same document point stays at the cursor.
+fn pinch_anchor_scroll_delta(cursor: egui::Pos2, new_point: egui::Pos2) -> egui::Vec2 {
+    cursor - new_point
+}
+
 fn trackpad_pinch_factor(events: &[egui::Event]) -> f32 {
     let mut native_factor = 1.0_f32;
     let mut precision_scroll = 0.0_f32;
@@ -6293,4 +6491,48 @@ mod tests {
         assert!(trackpad_pinch_factor(&[precision_pinch]) > 1.0);
         assert_eq!(trackpad_pinch_factor(&[mouse_wheel]), 1.0);
     }
+    #[test]
+    fn pinch_anchor_moves_content_opposite_to_layout_displacement() {
+        let cursor = pos2(200.0, 300.0);
+        let new_point = pos2(240.0, 420.0);
+        assert_eq!(pinch_anchor_scroll_delta(cursor, new_point), vec2(-40.0, -120.0));
+        assert_eq!(pinch_anchor_scroll_delta(new_point, cursor), vec2(40.0, 120.0));
+    }
+
+    #[test]
+    fn selection_can_extend_across_pages_in_either_direction() {
+        let start = TextPosition { page: 2, glyph: 3 };
+        let end = TextPosition { page: 4, glyph: 1 };
+        for selection in [
+            TextSelection { anchor: start, focus: end },
+            TextSelection { anchor: end, focus: start },
+        ] {
+            assert_eq!(selection.ordered(), (start, end));
+            assert_eq!(selection.bounds_on_page(1, 9), None);
+            assert_eq!(selection.bounds_on_page(2, 6), Some((3, 5)));
+            assert_eq!(selection.bounds_on_page(3, 8), Some((0, 7)));
+            assert_eq!(selection.bounds_on_page(4, 5), Some((0, 1)));
+            assert_eq!(selection.bounds_on_page(5, 3), None);
+        }
+    }
+
+    #[test]
+    fn text_drag_scrolls_up_and_down_near_the_viewport_edge() {
+        let viewport = Rect::from_min_max(pos2(0.0, 100.0), pos2(900.0, 700.0));
+        assert!(selection_edge_scroll(101.0, viewport) > 0.0); // Content down, view up
+        assert!(selection_edge_scroll(699.0, viewport) < 0.0); // Content up, view down
+        assert_eq!(selection_edge_scroll(400.0, viewport), 0.0);
+    }
+
+    #[test]
+    fn drag_extends_selection_in_page_margin() {
+        let page = Rect::from_min_max(pos2(0.0, 0.0), pos2(200.0, 200.0));
+        let glyphs = vec![
+            TextGlyph { text: "A".to_owned(), bounds: Some([15.0, 175.0, 25.0, 190.0]) },
+            TextGlyph { text: "B".to_owned(), bounds: Some([15.0, 10.0, 25.0, 25.0]) },
+        ];
+        assert_eq!(nearest_drag_glyph(&glyphs, page, [200.0, 200.0], pos2(150.0, 230.0)), Some(1));
+        assert_eq!(nearest_drag_glyph(&glyphs, page, [200.0, 200.0], pos2(150.0, -20.0)), Some(0));
+    }
+
 }
