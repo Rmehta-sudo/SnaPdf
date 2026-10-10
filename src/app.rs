@@ -93,7 +93,6 @@ struct SearchScanResult {
 struct PinchAnchor {
     page: usize,
     fraction: egui::Vec2,
-    cursor: egui::Pos2,
 }
 
 fn poll_search_scan(receiver: &mut Option<Receiver<SearchScanResult>>) -> Option<SearchScanResult> {
@@ -328,6 +327,10 @@ pub struct SnapPdfApp {
     native_pinch_suppress_until: f64,
     page_rects: Vec<(usize, Rect)>,
     pinch_anchor: Option<PinchAnchor>,
+    /// ScrollArea offset measured after its last layout pass. Pinch zoom uses
+    /// this to position the *next* layout directly, rather than queueing a
+    /// scroll delta that races the ScrollArea's own gesture handling.
+    document_scroll_offset: egui::Vec2,
     show_search: bool,
     print_dialog: Option<PrintDialog>,
     browser_directory: Option<PathBuf>,
@@ -443,6 +446,7 @@ impl SnapPdfApp {
             native_pinch_suppress_until: 0.0,
             page_rects: Vec::new(),
             pinch_anchor: None,
+            document_scroll_offset: egui::Vec2::ZERO,
             show_search: false,
             print_dialog: None,
             browser_directory: None,
@@ -485,6 +489,8 @@ impl SnapPdfApp {
         self.browser_scan = None;
         self.pinned_comment = None;
         self.page_sizes.clear();
+        self.pinch_anchor = None;
+        self.document_scroll_offset = egui::Vec2::ZERO;
         self.textures.clear();
         self.pending_pages.clear();
         self.text_layers.clear();
@@ -1204,7 +1210,6 @@ impl SnapPdfApp {
                     (on_page.x - rect.left()) / rect.width().max(1.0),
                     (on_page.y - rect.top()) / rect.height().max(1.0),
                 ),
-                cursor: on_page,
             })
         });
         let minimum = if self.presentation_mode {
@@ -2787,6 +2792,7 @@ impl SnapPdfApp {
                 }
 
                 let viewer_rect = ui.clip_rect();
+                let zoom_before_pinch = self.zoom;
                 let (pointer_position, egui_pinch_zoom, time) = ctx.input(|input| {
                     (
                         input.pointer.hover_pos().or_else(|| input.pointer.interact_pos()),
@@ -2831,10 +2837,21 @@ impl SnapPdfApp {
                     // must never both scale the page and scroll the document.
                     self.apply_pinch_zoom(pinch_zoom, Some(pointer_position.unwrap_or(viewer_rect.center())), &ctx);
                 }
-                if over_viewer && (use_native || (egui_pinch_zoom - 1.0).abs() > 0.0001) {
-                    // A single precision wheel packet can produce both zoom and
-                    // smooth-scroll input. Do not let ScrollArea consume it twice.
+                let pinch_in_progress = over_viewer
+                    && (use_native || (egui_pinch_zoom - 1.0).abs() > 0.0001);
+                if pinch_in_progress {
+                    // Native touchpads can deliver a pinch and a synthetic wheel
+                    // event on separate paths. Discard the smooth-wheel movement;
+                    // the document ScrollArea also has its wheel source disabled
+                    // for this frame below.
                     ctx.input_mut(|input| input.smooth_scroll_delta = egui::Vec2::ZERO);
+                }
+                if pinch_in_progress && std::env::var_os("SNAPPDF_PINCH_DEBUG").is_some() {
+                    eprintln!(
+                        "[snappdf pinch] source={} native={:.5} egui={:.5} zoom={:.4} old_offset={:?}",
+                        if use_native { "xinput" } else { "egui" },
+                        native_factor, egui_pinch_zoom, self.zoom, self.document_scroll_offset,
+                    );
                 }
                 if self.pending_selection_highlight && self.selection_text_ready() {
                     self.highlight_text_selection();
@@ -2881,14 +2898,41 @@ impl SnapPdfApp {
                     .map(|size| size[0] * zoom + 56.0)
                     .fold(ui.available_width(), f32::max);
 
-                ScrollArea::both()
+                // Solve the new scroll offset *before* egui lays out the pages.
+                // A queued scroll_with_delta() adjusts a later frame and causes
+                // oscillation when gesture updates arrive every frame.
+                let anchored_offset = self.pinch_anchor.take().map(|anchor| {
+                    let previous_canvas_width = page_sizes
+                        .iter()
+                        .map(|size| size[0] * zoom_before_pinch + 56.0)
+                        .fold(ui.available_width(), f32::max);
+                    pinch_anchored_offset(
+                        self.document_scroll_offset,
+                        anchor,
+                        &page_sizes,
+                        zoom_before_pinch,
+                        zoom,
+                        previous_canvas_width,
+                        canvas_width,
+                        self.presentation_mode,
+                    )
+                });
+
+                let mut scroll_source = egui::containers::scroll_area::ScrollSource::default();
+                scroll_source.mouse_wheel = !pinch_in_progress;
+                let mut document_scroll = ScrollArea::both()
                     .id_salt("document-scroll")
                     .auto_shrink([false, false])
                     .animated(false)
+                    .scroll_source(scroll_source)
                     .wheel_scroll_multiplier(vec2(
                         WHEEL_SCROLL_MULTIPLIER,
                         WHEEL_SCROLL_MULTIPLIER,
-                    ))
+                    ));
+                if let Some(offset) = anchored_offset {
+                    document_scroll = document_scroll.scroll_offset(offset);
+                }
+                let scroll_output = document_scroll
                     .show_viewport(ui, |ui, _viewport| {
                         ui.set_min_width(canvas_width);
                         if self.keyboard_scroll != 0.0 {
@@ -2912,22 +2956,6 @@ impl SnapPdfApp {
                                 display_size,
                             );
                             laid_out_pages.push((index, page_rect));
-                        }
-                        if let Some(anchor) = self.pinch_anchor.take()
-                            && let Some((_, rect)) =
-                                laid_out_pages.iter().find(|(page, _)| *page == anchor.page)
-                        {
-                            let target = pos2(
-                                rect.left() + rect.width() * anchor.fraction.x,
-                                rect.top() + rect.height() * anchor.fraction.y,
-                            );
-                            // Preserve the PDF point beneath the cursor: if the
-                            // new layout moved it right/down, move the *content*
-                            // left/up by precisely that amount, without easing.
-                            ui.scroll_with_delta_animation(
-                                pinch_anchor_scroll_delta(anchor.cursor, target),
-                                egui::style::ScrollAnimation::none(),
-                            );
                         }
                         self.page_rects = laid_out_pages.clone();
                         ui.add_space(page_gap);
@@ -3434,6 +3462,9 @@ impl SnapPdfApp {
                             }
                         }
                     });
+                // This includes normal wheel scrolling, scroll-bar drags, and
+                // offset clamping. Use the actual state, never a predicted value.
+                self.document_scroll_offset = scroll_output.state.offset;
                 self.current_page = visible_page;
                 if let Some(path) = self.current_path.clone() {
                     self.state.reading_positions.insert(path, visible_page);
@@ -5604,18 +5635,42 @@ fn chrome_zoom(document_zoom: f32, ratio: f32) -> f32 {
     (document_zoom * ratio).clamp(0.28, 5.0)
 }
 
+/// Compute the *absolute* ScrollArea offset that preserves a PDF point
+/// beneath the gesture cursor across a scale change. A page's vertical content
+/// coordinate is the sum of prior page heights plus its relative position;
+/// page gaps cancel because they are not zoomed. Horizontally, each page is
+/// centered within the (possibly wider) document canvas.
+fn pinch_anchored_offset(
+    previous_offset: egui::Vec2,
+    anchor: PinchAnchor,
+    page_sizes: &[[f32; 2]],
+    previous_zoom: f32,
+    new_zoom: f32,
+    previous_canvas_width: f32,
+    new_canvas_width: f32,
+    presentation_mode: bool,
+) -> egui::Vec2 {
+    let Some(page_size) = page_sizes.get(anchor.page) else {
+        return previous_offset;
+    };
+    let delta_zoom = new_zoom - previous_zoom;
+    let preceding_height: f32 = if presentation_mode {
+        0.0
+    } else {
+        page_sizes[..anchor.page].iter().map(|size| size[1]).sum()
+    };
+    let delta_y = (preceding_height + page_size[1] * anchor.fraction.y) * delta_zoom;
+    let delta_x = (new_canvas_width - previous_canvas_width) * 0.5
+        + (anchor.fraction.x - 0.5) * page_size[0] * delta_zoom;
+    (previous_offset + vec2(delta_x, delta_y)).max(egui::Vec2::ZERO)
+}
+
 /// Return only zoom gestures produced by a physical trackpad/touch surface.
 ///
 /// Wayland and some X11 drivers emit `Event::Zoom` directly. On X11, precision
 /// touchpad pinches are commonly represented as point-granularity wheel events
 /// with a synthetic Ctrl modifier. A real mouse wheel uses line granularity, so
 /// excluding it here keeps Ctrl+mouse-wheel out of this PDF-only gesture path.
-/// egui's scroll delta is a displacement of *content*, not scroll offset.
-/// Offset the new PDF layout so the same document point stays at the cursor.
-fn pinch_anchor_scroll_delta(cursor: egui::Pos2, new_point: egui::Pos2) -> egui::Vec2 {
-    cursor - new_point
-}
-
 fn trackpad_pinch_factor(events: &[egui::Event]) -> f32 {
     let mut native_factor = 1.0_f32;
     let mut precision_scroll = 0.0_f32;
@@ -6492,11 +6547,45 @@ mod tests {
         assert_eq!(trackpad_pinch_factor(&[mouse_wheel]), 1.0);
     }
     #[test]
-    fn pinch_anchor_moves_content_opposite_to_layout_displacement() {
-        let cursor = pos2(200.0, 300.0);
-        let new_point = pos2(240.0, 420.0);
-        assert_eq!(pinch_anchor_scroll_delta(cursor, new_point), vec2(-40.0, -120.0));
-        assert_eq!(pinch_anchor_scroll_delta(new_point, cursor), vec2(40.0, 120.0));
+    fn pinch_preserves_document_point_using_absolute_scroll_offset() {
+        let pages = [[400.0, 600.0], [400.0, 800.0]];
+        let anchor = PinchAnchor {
+            page: 1, fraction: vec2(0.25, 0.5),
+        };
+        let actual = pinch_anchored_offset(
+            vec2(50.0, 200.0), anchor, &pages, 1.0, 1.5,
+            600.0, 656.0, false,
+        );
+        // Y: 200 + (600 + 800*0.5)*0.5 = 700.
+        // X: 50 + (656-600)/2 + (0.25-0.5)*400*0.5 = 28.
+        assert!((actual.y - 700.0).abs() < 0.001);
+        assert!((actual.x - 28.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn pinch_offset_excludes_hidden_pages_in_presentation_mode() {
+        let pages = [[400.0, 600.0], [400.0, 800.0]];
+        let anchor = PinchAnchor {
+            page: 1, fraction: vec2(0.5, 0.25),
+        };
+        let actual = pinch_anchored_offset(
+            vec2(0.0, 100.0), anchor, &pages, 1.0, 1.5,
+            700.0, 700.0, true,
+        );
+        assert!((actual.y - 200.0).abs() < 0.001);
+        assert_eq!(actual.x, 0.0);
+    }
+
+    #[test]
+    fn pinch_offset_never_goes_negative() {
+        let anchor = PinchAnchor {
+            page: 0, fraction: vec2(0.2, 0.2),
+        };
+        let actual = pinch_anchored_offset(
+            vec2(0.0, 0.0), anchor, &[[400.0, 600.0]], 2.0, 1.0,
+            856.0, 456.0, false,
+        );
+        assert_eq!(actual, egui::Vec2::ZERO);
     }
 
     #[test]
