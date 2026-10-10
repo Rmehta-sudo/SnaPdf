@@ -130,10 +130,38 @@ secondary-click menus. Detect annotation hits first and suppress the broad page 
 ## DEC-013: zoom-resilient document chrome
 
 Keep document tabs, path/actions, and tools as distinct rows with separators. The path and tool rows
-are horizontally scrollable with visible scrollbars, so whole-interface zoom cannot overlap or hide
-controls. Render the path as Obsidian-style component breadcrumbs; clicking any component copies the
-full path. Browse/text-selection remains the internal default but has no visible Select button;
-clicking an active annotation tool again returns to that neutral mode.
+are horizontally scrollable by wheel, trackpad, or direct drag, so whole-interface zoom cannot
+overlap or hide controls. Hide the native scrollbar because its high-contrast trough overwhelms the
+compact header. Render the path as Obsidian-style component breadcrumbs; clicking any component
+copies the full path. Browse/text-selection remains the internal default but has no visible Select
+button; clicking an active annotation tool again returns to that neutral mode.
+
+## DEC-014: compact document controls and transient annotation detail
+
+Hide horizontal scrollbar chrome entirely while preserving trackpad, wheel, and drag scrolling.
+Group zoom, editable page position, tools, and undo/redo with separators and vector-drawn icons.
+Breadcrumb directories switch the center region to a cached PDF-only folder browser instead of
+launching an external file manager. Its unbounded recursive scan runs on a background thread so even
+deep trees remain complete without freezing the viewer. Comment markers do not paint their text over the PDF: hover shows
+a temporary card, and primary click pins it until explicitly closed. Text selections expose a small
+Copy/Highlight action card, and Erase hides the system pointer in favor of a drawn eraser cursor.
+
+Recents has a persisted expand/collapse flag but retains the startup-frozen 15-item order. Document
+zoom is allowed through 500%. Superseding the earlier fixed 0.7 relationship, chrome now defaults to
+a persisted, View-settings-editable 0.6 ratio across tabs, path, tools, rail, and sidebar.
+
+## DEC-015: sidebar search, hierarchical contents, and opt-in source saving
+
+Search belongs to a dedicated VS Code-style sidebar view; the document header does not grow a search
+row. Contents keeps its flat PDFium outline representation internally but derives parent/child
+visibility by depth, preserving individual collapsed-node indices and offering Collapse all/Expand
+all.
+
+Normal edits remain app-owned overlays. The explicit Save-to-PDF action exports to a temporary PDF
+beside the source, copies the original to a timestamped backup, and atomically replaces the source
+only after export succeeds. Highlight comments become highlight contents, freehand/signature paths
+become PDF path objects, and attachment references become PDF text annotations. Successful saving
+clears the now-embedded overlays before reopening the PDF to prevent double rendering.
 # 2026-10-10 direct link hit testing and export boundary
 
 - PDF links are now resolved from the latest raw pointer position before the page tool interaction

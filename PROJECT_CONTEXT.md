@@ -52,6 +52,17 @@ This is the compact entry point for the project. Keep current truth here; route 
   eraser removes annotations directly by click or drag. Open with lists other installed PDF handlers.
 - Multiple tabs, reading-position restore, nested directories, document search, CUPS print controls,
   whole-interface zoom, richer overlay tools, and annotated-copy export are implemented.
+- The path strip has no visible scrollbar and each directory breadcrumb opens an in-app PDF-only
+  folder browser that recursively includes PDFs at every nested depth and reports recursive counts.
+  Viewer controls are icon-led and grouped into zoom, page, annotation, and history clusters;
+  document zoom reaches 500% while chrome defaults to a user-editable 0.6 ratio.
+- Text selection exposes Copy/Highlight actions. Comments render as unobtrusive markers with
+  temporary hover cards and click-pinned cards; the Eraser uses a dedicated cursor. Recents is a
+  persistent collapsible section and remains startup-frozen.
+- Search is a VS Code-style sidebar view. Contents nodes support individual disclosure controls plus
+  Collapse all/Expand all. Pinch zoom changes only the PDF canvas.
+- An explicit confirmed Save-to-PDF action can persist overlays into the source after creating a
+  timestamped backup; normal annotation editing remains non-destructive by default.
 - New highlights no longer retain the temporary blue selection overlay; highlight/comment context
   targets remain independently right-clickable. The path/action and tool rows scroll horizontally at
   high UI zoom, path breadcrumbs copy the full path directly, and browse mode has no visible Select
@@ -77,8 +88,8 @@ This is the compact entry point for the project. Keep current truth here; route 
 - Validate printing against a physical printer and exported annotations across third-party viewers.
 - Formula-model acquisition stalled on the workstation network and remains unverified; the code path
   is implemented, but mathematical OCR quality and latency must be measured after the model arrives.
-- Freehand ink/signatures and attachment references remain local overlays when exporting; PDF-native
-  export currently covers highlights, comments, text boxes, shapes, and stamps.
+- Validate opt-in in-place annotation saving and exported annotations across additional third-party
+  viewers and complex PDFs.
 
 ## Retrieval and freshness
 

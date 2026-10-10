@@ -94,3 +94,30 @@ completion evidence. Do not compare configurations as controlled unless their di
 - `cargo test --offline`: 11/11 passed. `cargo clippy --offline --all-targets -- -D warnings` passed.
   `cargo build --release --offline` passed. Visual QA at the persisted 140% UI scale confirmed the
   breadcrumb path, neutral tool state, separated chrome, centered filter, and rendered PDF.
+- Follow-up: the always-visible native horizontal scrollbar rendered as a thick white strip in the
+  dark header. It was hidden while retaining wheel, trackpad, and direct-drag horizontal scrolling.
+
+## 2026-10-11 compact toolbar and breadcrumb browser release
+
+- Replaced text-heavy viewer actions with grouped vector icon controls, a boxed editable current-page
+  field, hidden-scrollbar path/tools rows, and a document zoom range up to 500%.
+- Directory breadcrumbs now open an in-app PDF-only folder browser; a background scan includes every
+  nested depth without a result cap, and PDF selection opens a normal tab. Recents gained a
+  persistent collapse toggle without changing session ordering.
+- Comments now use hover/click cards rather than inline text, text selections offer Copy/Highlight,
+  and Erase uses a dedicated cursor.
+- `cargo test --offline`: 11/11 passed. `cargo clippy --offline --all-targets -- -D warnings` passed.
+  `cargo build --release --offline` passed.
+
+## 2026-10-11 view controls, sidebar search, and source-save release
+
+- Reduced annotation menus and anchored the compact comment editor near its annotation; Enter saves
+  and Shift+Enter inserts a new line.
+- Added a persisted View setting whose chrome/PDF ratio defaults to 60%, PDF-only pinch zoom, standard
+  curved undo/redo icons, recursive sidebar/folder counts, and a denser file-manager browser.
+- Search now lives in a VS Code-style sidebar. Contents sections have individual disclosure arrows
+  plus Collapse all/Expand all.
+- Added confirmed in-place annotation saving with a timestamped backup; PDF-native output now
+  includes highlights/comments, text, shapes/stamps, ink/signatures, and attachment references.
+- `cargo test --offline`: 12/12 passed. `cargo clippy --offline --all-targets -- -D warnings` passed.
+  `cargo build --release --offline` passed; the installed default handler launched successfully.

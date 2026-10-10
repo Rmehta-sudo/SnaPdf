@@ -28,6 +28,10 @@ pub struct AppState {
     pub reading_positions: HashMap<PathBuf, usize>,
     #[serde(default = "default_ui_scale")]
     pub ui_scale: f32,
+    #[serde(default = "default_chrome_scale_ratio")]
+    pub chrome_scale_ratio: f32,
+    #[serde(default = "default_true")]
+    pub recents_expanded: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -105,6 +109,10 @@ fn default_true() -> bool {
 
 fn default_ui_scale() -> f32 {
     1.0
+}
+
+fn default_chrome_scale_ratio() -> f32 {
+    0.6
 }
 
 impl Project {
@@ -254,7 +262,12 @@ impl AppState {
         self.ui_scale = if self.ui_scale <= 0.0 {
             1.0
         } else {
-            self.ui_scale.clamp(0.7, 1.8)
+            self.ui_scale.clamp(0.7, 5.0)
+        };
+        self.chrome_scale_ratio = if self.chrome_scale_ratio <= 0.0 {
+            default_chrome_scale_ratio()
+        } else {
+            self.chrome_scale_ratio.clamp(0.4, 1.0)
         };
         if self
             .last_document
@@ -325,5 +338,11 @@ mod tests {
         assert_eq!(path, PathBuf::from("/course/original.pdf"));
         state.clear_file_alias(&path);
         assert_eq!(state.display_name(&path), "original.pdf");
+    }
+
+    #[test]
+    fn legacy_state_uses_sixty_percent_chrome_ratio() {
+        let state: AppState = serde_json::from_str("{}").expect("legacy state should deserialize");
+        assert!((state.chrome_scale_ratio - 0.6).abs() < f32::EPSILON);
     }
 }

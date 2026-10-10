@@ -25,7 +25,8 @@ per-project recents, and recursively discovered PDFs; it never lists non-PDF fil
 
 ## Current annotation and OCR release
 
-- CrispPDF annotations are persistent app-owned overlays; the source PDF is never modified.
+- CrispPDF annotations are persistent app-owned overlays by default. A separate confirmed action may
+  write them into the source PDF after creating a timestamped backup.
 - Selectable text supports copy; annotation tools cover highlights, freehand ink, comments, erasing,
   color choice, and undo/redo.
 - Snip OCR first uses the exact embedded PDF text layer. Image-only crops use a persistent local
@@ -45,11 +46,22 @@ per-project recents, and recursively discovered PDFs; it never lists non-PDF fil
 - Neutral browse/text-selection is implicit rather than exposed as a selected tool. Path components
   copy the full path when clicked, and path/actions/tools remain usable at high interface zoom via
   separated horizontal scrolling rows.
+- Directory breadcrumb components open a PDF-only browser in the main region. It recursively lists
+  every PDF beneath that directory regardless of nesting depth; choosing one opens it in a tab and
+  records it for the next launch's Recents ordering. The final filename component copies the path.
+- Recents can be collapsed independently like project folders. Comment text is hidden until marker
+  hover or click, text selection offers Copy/Highlight, and toolbar actions use compact icons.
+- Document zoom supports 70% through 500%; surrounding chrome, including the navigation rail and
+  sidebar, defaults to a user-editable 0.6 ratio. Pinch gestures zoom only the PDF canvas.
+- Document search uses a dedicated VS Code-style sidebar. Bookmark-outline sections and subsections
+  can be collapsed individually or globally.
+- Folder browsing uses a denser file-manager table with recursive PDF counts and an explicit action
+  to open the directory in Ubuntu Files.
 
 ## Remaining later phases
 
 - Validate printing with a physical printer and exported annotations in third-party viewers.
-- Export PDF-native freehand ink/signatures and attachment representations.
+- Validate opt-in in-place PDF annotation saving across additional external viewers.
 - Revisit local mathematical OCR quality and latency after the formula model acquisition succeeds.
 
 Provenance: user request, 2026-10-10.

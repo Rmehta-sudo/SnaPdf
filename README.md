@@ -28,7 +28,8 @@ Codex-style project sidebar with a crisp, continuously scrolling PDF canvas.
 - Obsidian-inspired dark UI with a narrow icon rail, nested file tree, document tabs, selectable
   copyable path bar, quiet surfaces, and restrained hover/selection states.
 - Vector-drawn sidebar icons, so the UI does not depend on missing Unicode glyphs.
-- Library and Contents sidebar tabs; Contents is generated from the PDF's bookmark outline.
+- Library, Contents, and VS Code-style Search sidebar tabs. Contents is generated from the PDF's
+  bookmark outline and supports individual or global collapse/expand.
 - Persistent, non-destructive highlights, freehand drawing/signatures, comments, text boxes,
   rectangles/ellipses, stamps, attachment markers, color selection, erasing, and undo/redo.
 - Comments always render above highlights. Right-click highlights to add/edit/delete comments;
@@ -71,7 +72,6 @@ is required. OCR models download once and remain in `~/.local/share/crisppdf/ocr
 | `Ctrl+O` | Open PDF |
 | `Ctrl++` | Scale the entire app up |
 | `Ctrl+-` | Scale the entire app down |
-| `Ctrl+0` | Reset the entire app to 100% |
 | `Ctrl+F` | Find text in the current PDF |
 | `Ctrl+P` | Open the print dialog |
 | `Up` / `Down` | Scroll document |
@@ -84,10 +84,11 @@ is required. OCR models download once and remain in `~/.local/share/crisppdf/ocr
 
 Projects, recent documents, display names, and annotation overlays are stored locally in
 `~/.config/crisppdf/state.json`. OCR runs locally after the one-time model download. CrispPDF does
-not upload documents or telemetry, and annotation tools do not modify the original PDF.
+not upload documents or telemetry. Annotation tools do not modify the original PDF by default; the
+explicit Save-to-PDF action creates a timestamped backup before embedding annotations into it.
 
 ## Export note
 
-Highlights, comments, text boxes, shapes, and stamps can be exported into a new annotated PDF.
-Freehand ink/signatures and attachment markers remain in CrispPDF's local overlay store in this
-release; the original PDF is never modified.
+Highlights, comments, text boxes, shapes, stamps, ink/signatures, and attachment references can be
+exported into a new annotated PDF. They can also be embedded into the source PDF through the
+explicit confirmed Save-to-PDF action; CrispPDF creates a timestamped backup first.

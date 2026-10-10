@@ -507,8 +507,11 @@ fn worker_loop(
                                 position,
                                 text,
                                 color,
-                                ..
+                                parent,
                             } => {
+                                if parent.is_some() {
+                                    continue;
+                                }
                                 let mut note = page
                                     .annotations_mut()
                                     .create_text_annotation(text)
@@ -528,6 +531,29 @@ fn worker_loop(
                                     .map_err(|error| error.to_string())?;
                                 note.set_is_printed(true)
                                     .map_err(|error| error.to_string())?;
+                                exported += 1;
+                            }
+                            AnnotationKind::Ink {
+                                points,
+                                color,
+                                width,
+                            } => {
+                                if points.len() < 2 {
+                                    skipped += 1;
+                                    continue;
+                                }
+                                for segment in points.windows(2) {
+                                    page.objects_mut()
+                                        .create_path_object_line(
+                                            PdfPoints::new(segment[0][0]),
+                                            PdfPoints::new(segment[0][1]),
+                                            PdfPoints::new(segment[1][0]),
+                                            PdfPoints::new(segment[1][1]),
+                                            PdfColor::new(color[0], color[1], color[2], color[3]),
+                                            PdfPoints::new(*width),
+                                        )
+                                        .map_err(|error| error.to_string())?;
+                                }
                                 exported += 1;
                             }
                             AnnotationKind::TextBox { rect, text, color } => {
@@ -605,8 +631,26 @@ fn worker_loop(
                                     .map_err(|error| error.to_string())?;
                                 exported += 1;
                             }
-                            AnnotationKind::Ink { .. } | AnnotationKind::Attachment { .. } => {
-                                skipped += 1
+                            AnnotationKind::Attachment { position, path } => {
+                                let mut note = page
+                                    .annotations_mut()
+                                    .create_text_annotation(&format!(
+                                        "Attachment reference: {}",
+                                        path.display()
+                                    ))
+                                    .map_err(|error| error.to_string())?;
+                                note.set_bounds(PdfRect::new_from_values(
+                                    position[1] - 9.0,
+                                    position[0] - 9.0,
+                                    position[1] + 9.0,
+                                    position[0] + 9.0,
+                                ))
+                                .map_err(|error| error.to_string())?;
+                                note.set_creator("CrispPDF")
+                                    .map_err(|error| error.to_string())?;
+                                note.set_is_printed(true)
+                                    .map_err(|error| error.to_string())?;
+                                exported += 1;
                             }
                         }
                     }

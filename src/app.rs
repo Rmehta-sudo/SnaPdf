@@ -15,7 +15,9 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::mpsc::{self, Receiver};
 use std::time::{SystemTime, UNIX_EPOCH};
+use walkdir::WalkDir;
 
 const MAX_TEXTURES: usize = 10;
 const MAX_TEXTURE_BYTES: usize = 256 * 1024 * 1024;
@@ -35,6 +37,36 @@ struct TextSelection {
     page_index: usize,
     anchor: usize,
     focus: usize,
+}
+
+#[derive(Clone)]
+struct BrowserEntry {
+    path: PathBuf,
+    relative: PathBuf,
+    is_directory: bool,
+    pdf_count: usize,
+}
+
+struct BrowserScanResult {
+    directory: PathBuf,
+    entries: Vec<BrowserEntry>,
+}
+
+enum BreadcrumbAction {
+    Browse(PathBuf),
+    Copy(PathBuf),
+}
+
+#[derive(Clone, Copy)]
+enum SelectionAction {
+    Copy,
+    Highlight,
+}
+
+struct AnnotationUiResult {
+    action: Option<AnnotationContextAction>,
+    hovered_comment: Option<u64>,
+    clicked_comment: Option<u64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -58,6 +90,7 @@ enum ToolMode {
 enum SidebarTab {
     Library,
     Contents,
+    Search,
 }
 
 enum AnnotationContextAction {
@@ -81,6 +114,7 @@ struct NoteDraft {
     parent: Option<u64>,
     page: usize,
     position: [f32; 2],
+    screen_anchor: Option<egui::Pos2>,
     text: String,
 }
 
@@ -201,6 +235,7 @@ pub struct CrispPdfApp {
     math_ocr_requests: HashSet<u64>,
     sidebar_tab: SidebarTab,
     outline: Vec<PdfOutlineItem>,
+    collapsed_outline_items: HashSet<usize>,
     open_with_path: Option<PathBuf>,
     external_apps: Vec<ExternalApp>,
     open_with_error: Option<String>,
@@ -212,6 +247,13 @@ pub struct CrispPdfApp {
     search_request_id: u64,
     show_search: bool,
     print_dialog: Option<PrintDialog>,
+    browser_directory: Option<PathBuf>,
+    browser_entries: Vec<BrowserEntry>,
+    browser_scan: Option<Receiver<BrowserScanResult>>,
+    pinned_comment: Option<u64>,
+    show_view_settings: bool,
+    confirm_save_to_source: bool,
+    pending_source_save: Option<(PathBuf, PathBuf)>,
 }
 
 impl CrispPdfApp {
@@ -226,7 +268,9 @@ impl CrispPdfApp {
         if let Some(path) = initial_path.as_ref() {
             state.record_open(path);
         }
-        creation.egui_ctx.set_zoom_factor(state.ui_scale);
+        creation
+            .egui_ctx
+            .set_zoom_factor(chrome_zoom(state.ui_scale, state.chrome_scale_ratio));
         let session_recents = state.recent_documents.clone();
         let project_files = state
             .projects
@@ -279,6 +323,7 @@ impl CrispPdfApp {
             math_ocr_requests: HashSet::new(),
             sidebar_tab: SidebarTab::Library,
             outline: Vec::new(),
+            collapsed_outline_items: HashSet::new(),
             open_with_path: None,
             external_apps: Vec::new(),
             open_with_error: None,
@@ -290,6 +335,13 @@ impl CrispPdfApp {
             search_request_id: 0,
             show_search: false,
             print_dialog: None,
+            browser_directory: None,
+            browser_entries: Vec::new(),
+            browser_scan: None,
+            pinned_comment: None,
+            show_view_settings: false,
+            confirm_save_to_source: false,
+            pending_source_save: None,
         };
 
         if let Some(path) = initial_path {
@@ -318,12 +370,17 @@ impl CrispPdfApp {
         self.generation = self.generation.wrapping_add(1);
         self.worker.expect_generation(self.generation);
         self.current_path = Some(path.clone());
+        self.browser_directory = None;
+        self.browser_entries.clear();
+        self.browser_scan = None;
+        self.pinned_comment = None;
         self.page_sizes.clear();
         self.textures.clear();
         self.pending_pages.clear();
         self.text_layers.clear();
         self.link_layers.clear();
         self.outline.clear();
+        self.collapsed_outline_items.clear();
         self.pending_text.clear();
         self.text_selection = None;
         self.search_matches.clear();
@@ -412,6 +469,22 @@ impl CrispPdfApp {
             .then(|| "No other registered PDF applications were found.".to_owned());
     }
 
+    fn open_current_directory(&mut self) {
+        let directory = self.browser_directory.clone().or_else(|| {
+            self.current_path
+                .as_deref()
+                .and_then(Path::parent)
+                .map(Path::to_path_buf)
+        });
+        let Some(directory) = directory else {
+            return;
+        };
+        match Command::new("xdg-open").arg(&directory).spawn() {
+            Ok(_) => self.status = format!("Opened {}.", directory.display()),
+            Err(error) => self.status = format!("Could not open the folder: {error}"),
+        }
+    }
+
     fn launch_external_app(&mut self, app: &ExternalApp, path: &Path) {
         match Command::new("gio")
             .arg("launch")
@@ -497,6 +570,29 @@ impl CrispPdfApp {
         });
     }
 
+    fn save_annotations_to_source(&mut self) {
+        let Some(source) = self.current_path.clone() else {
+            return;
+        };
+        let name = source
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("document.pdf");
+        let temporary = source.with_file_name(format!(
+            ".{name}.crisppdf-saving-{}.pdf",
+            std::process::id()
+        ));
+        let annotations = self.current_annotations().to_vec();
+        self.pending_source_save = Some((temporary.clone(), source.clone()));
+        self.status = "Writing annotations into the PDF...".to_owned();
+        let _ = self.worker.commands.send(RenderCommand::ExportAnnotated {
+            source,
+            destination: temporary,
+            annotations,
+            generation: self.generation,
+        });
+    }
+
     fn refresh_projects(&mut self) {
         self.project_files = self
             .state
@@ -505,6 +601,72 @@ impl CrispPdfApp {
             .map(|project| (project.root.clone(), project.pdf_files()))
             .collect();
         self.status = "Project folders refreshed.".to_owned();
+    }
+
+    fn open_folder_browser(&mut self, directory: PathBuf) {
+        if !directory.is_dir() {
+            self.status = "That folder is no longer available.".to_owned();
+            return;
+        }
+        self.browser_directory = Some(directory.clone());
+        self.browser_entries.clear();
+        self.status = "Scanning nested folders for PDFs...".to_owned();
+        let (sender, receiver) = mpsc::channel();
+        self.browser_scan = Some(receiver);
+        std::thread::spawn(move || {
+            let mut entries = Vec::new();
+            if let Ok(children) = fs::read_dir(&directory) {
+                for child in children.flatten() {
+                    let path = child.path();
+                    if path.is_dir() {
+                        entries.push(BrowserEntry {
+                            relative: path
+                                .strip_prefix(&directory)
+                                .unwrap_or(path.as_path())
+                                .to_path_buf(),
+                            path,
+                            is_directory: true,
+                            pdf_count: 0,
+                        });
+                    }
+                }
+            }
+            for entry in WalkDir::new(&directory)
+                .follow_links(false)
+                .into_iter()
+                .filter_map(Result::ok)
+                .filter(|entry| entry.file_type().is_file() && is_pdf(entry.path()))
+            {
+                let path = entry.into_path();
+                entries.push(BrowserEntry {
+                    relative: path
+                        .strip_prefix(&directory)
+                        .unwrap_or(path.as_path())
+                        .to_path_buf(),
+                    path,
+                    is_directory: false,
+                    pdf_count: 1,
+                });
+            }
+            let pdf_paths = entries
+                .iter()
+                .filter(|entry| !entry.is_directory)
+                .map(|entry| entry.path.clone())
+                .collect::<Vec<_>>();
+            for entry in entries.iter_mut().filter(|entry| entry.is_directory) {
+                entry.pdf_count = pdf_paths
+                    .iter()
+                    .filter(|path| path.starts_with(&entry.path))
+                    .count();
+            }
+            entries.sort_by(|left, right| {
+                right
+                    .is_directory
+                    .cmp(&left.is_directory)
+                    .then_with(|| left.relative.cmp(&right.relative))
+            });
+            let _ = sender.send(BrowserScanResult { directory, entries });
+        });
     }
 
     fn persist(&mut self) {
@@ -608,17 +770,52 @@ impl CrispPdfApp {
                     exported,
                     skipped,
                 } if generation == self.generation => {
-                    self.status = if skipped == 0 {
-                        format!(
-                            "Exported {exported} PDF annotations to {}.",
-                            destination.display()
-                        )
+                    let source_save = self
+                        .pending_source_save
+                        .take()
+                        .filter(|(temporary, _)| *temporary == destination);
+                    if let Some((temporary, source)) = source_save {
+                        let timestamp = SystemTime::now()
+                            .duration_since(UNIX_EPOCH)
+                            .map(|duration| duration.as_secs())
+                            .unwrap_or_default();
+                        let stem = source
+                            .file_stem()
+                            .and_then(|name| name.to_str())
+                            .unwrap_or("document");
+                        let backup = source
+                            .with_file_name(format!("{stem}.crisppdf-backup-{timestamp}.pdf"));
+                        match fs::copy(&source, &backup)
+                            .and_then(|_| fs::rename(&temporary, &source))
+                        {
+                            Ok(_) => {
+                                self.state.annotations.remove(&source);
+                                self.persist();
+                                self.status = format!(
+                                    "Saved {exported} annotations to the PDF. Backup: {}",
+                                    backup.display()
+                                );
+                                self.open_document(source);
+                            }
+                            Err(error) => {
+                                self.status = format!(
+                                    "Could not replace the original PDF: {error}. The original was not changed."
+                                );
+                            }
+                        }
                     } else {
-                        format!(
-                            "Exported {exported} highlights/comments to {}; {skipped} freehand drawings remain CrispPDF overlays.",
-                            destination.display()
-                        )
-                    };
+                        self.status = if skipped == 0 {
+                            format!(
+                                "Exported {exported} PDF annotations to {}.",
+                                destination.display()
+                            )
+                        } else {
+                            format!(
+                                "Exported {exported} annotations to {}; {skipped} unsupported items remain CrispPDF overlays.",
+                                destination.display()
+                            )
+                        };
+                    }
                 }
                 RenderEvent::RegionRendered {
                     generation,
@@ -647,6 +844,9 @@ impl CrispPdfApp {
                     generation,
                     message,
                 } if generation == 0 || generation == self.generation => {
+                    if let Some((temporary, _)) = self.pending_source_save.take() {
+                        let _ = fs::remove_file(temporary);
+                    }
                     self.status = message;
                 }
                 _ => {}
@@ -689,6 +889,17 @@ impl CrispPdfApp {
                     }
                 }
             }
+        }
+        let scan_result = self
+            .browser_scan
+            .as_ref()
+            .and_then(|receiver| receiver.try_recv().ok());
+        if let Some(result) = scan_result {
+            if self.browser_directory.as_deref() == Some(result.directory.as_path()) {
+                self.browser_entries = result.entries;
+                self.status = format!("{} PDF entries found.", self.browser_entries.len());
+            }
+            self.browser_scan = None;
         }
     }
 
@@ -784,7 +995,6 @@ impl CrispPdfApp {
         let open = KeyboardShortcut::new(Modifiers::CTRL, Key::O);
         let zoom_in = KeyboardShortcut::new(Modifiers::CTRL, Key::Plus);
         let zoom_out = KeyboardShortcut::new(Modifiers::CTRL, Key::Minus);
-        let fit = KeyboardShortcut::new(Modifiers::CTRL, Key::Num0);
         let copy = KeyboardShortcut::new(Modifiers::CTRL, Key::C);
         let find = KeyboardShortcut::new(Modifiers::CTRL, Key::F);
         let print = KeyboardShortcut::new(Modifiers::CTRL, Key::P);
@@ -795,18 +1005,23 @@ impl CrispPdfApp {
             self.open_file_dialog();
         }
         if ctx.input_mut(|input| input.consume_shortcut(&zoom_in)) {
-            self.state.ui_scale = (self.state.ui_scale + 0.1).min(1.8);
-            ctx.set_zoom_factor(self.state.ui_scale);
+            let previous = self.state.ui_scale;
+            self.state.ui_scale = (self.state.ui_scale + 0.1).min(5.0);
+            self.zoom *= self.state.ui_scale / previous.max(0.1);
+            ctx.set_zoom_factor(chrome_zoom(
+                self.state.ui_scale,
+                self.state.chrome_scale_ratio,
+            ));
             self.persist();
         }
         if ctx.input_mut(|input| input.consume_shortcut(&zoom_out)) {
+            let previous = self.state.ui_scale;
             self.state.ui_scale = (self.state.ui_scale - 0.1).max(0.7);
-            ctx.set_zoom_factor(self.state.ui_scale);
-            self.persist();
-        }
-        if ctx.input_mut(|input| input.consume_shortcut(&fit)) {
-            self.state.ui_scale = 1.0;
-            ctx.set_zoom_factor(1.0);
+            self.zoom *= self.state.ui_scale / previous.max(0.1);
+            ctx.set_zoom_factor(chrome_zoom(
+                self.state.ui_scale,
+                self.state.chrome_scale_ratio,
+            ));
             self.persist();
         }
         if ctx.input_mut(|input| input.consume_shortcut(&copy))
@@ -817,6 +1032,7 @@ impl CrispPdfApp {
         }
         if ctx.input_mut(|input| input.consume_shortcut(&find)) {
             self.show_search = true;
+            self.sidebar_tab = SidebarTab::Search;
         }
         if ctx.input_mut(|input| input.consume_shortcut(&print)) {
             self.request_print();
@@ -1058,11 +1274,12 @@ impl CrispPdfApp {
                     {
                         self.sidebar_tab = SidebarTab::Contents;
                     }
-                    if rail_button(ui, false, RailIcon::Search)
+                    if rail_button(ui, self.sidebar_tab == SidebarTab::Search, RailIcon::Search)
                         .on_hover_text("Find in document (Ctrl+F)")
                         .clicked()
                     {
                         self.show_search = true;
+                        self.sidebar_tab = SidebarTab::Search;
                     }
                 });
             });
@@ -1109,6 +1326,10 @@ impl CrispPdfApp {
                 ui.add_space(4.0);
                 if self.sidebar_tab == SidebarTab::Contents {
                     self.outline_sidebar(ui);
+                    return;
+                }
+                if self.sidebar_tab == SidebarTab::Search {
+                    self.search_sidebar(ui);
                     return;
                 }
                 ui.add_sized(
@@ -1226,44 +1447,56 @@ impl CrispPdfApp {
                         }
 
                         ui.add_space(18.0);
-                        sidebar_section_header(ui, "RECENTS", "", theme::MUTED);
+                        if collapsible_section_header(
+                            ui,
+                            "RECENTS",
+                            self.session_recents.len().min(15),
+                            self.state.recents_expanded,
+                        )
+                        .clicked()
+                        {
+                            self.state.recents_expanded = !self.state.recents_expanded;
+                            self.persist();
+                        }
                         let recent = self.session_recents.clone();
-                        for item in recent.iter().take(15) {
-                            let selected =
-                                self.current_path.as_deref() == Some(item.path.as_path());
-                            let row = nav_row(
-                                ui,
-                                &self.state.display_name(&item.path),
-                                selected,
-                                NavIcon::Recent,
-                                0.0,
-                            );
-                            row.body
-                                .clone()
-                                .on_hover_text(item.path.display().to_string());
-                            if row.body.clicked() && !row.options.clicked() {
-                                open_after_ui = Some(item.path.clone());
-                            }
-                            if let Some(action) = sidebar_options_popup(
-                                &row.options,
-                                "RECENT PDF",
-                                self.state.file_aliases.contains_key(&item.path),
-                                false,
-                            ) {
-                                match action {
-                                    SidebarMenuAction::OpenWith => {
-                                        open_with_request = Some(item.path.clone());
+                        if self.state.recents_expanded {
+                            for item in recent.iter().take(15) {
+                                let selected =
+                                    self.current_path.as_deref() == Some(item.path.as_path());
+                                let row = nav_row(
+                                    ui,
+                                    &self.state.display_name(&item.path),
+                                    selected,
+                                    NavIcon::Recent,
+                                    0.0,
+                                );
+                                row.body
+                                    .clone()
+                                    .on_hover_text(item.path.display().to_string());
+                                if row.body.clicked() && !row.options.clicked() {
+                                    open_after_ui = Some(item.path.clone());
+                                }
+                                if let Some(action) = sidebar_options_popup(
+                                    &row.options,
+                                    "RECENT PDF",
+                                    self.state.file_aliases.contains_key(&item.path),
+                                    false,
+                                ) {
+                                    match action {
+                                        SidebarMenuAction::OpenWith => {
+                                            open_with_request = Some(item.path.clone());
+                                        }
+                                        SidebarMenuAction::Rename => {
+                                            rename_request = Some((
+                                                RenameTarget::File(item.path.clone()),
+                                                self.state.display_name(&item.path),
+                                            ));
+                                        }
+                                        SidebarMenuAction::ResetName => {
+                                            clear_file_alias = Some(item.path.clone());
+                                        }
+                                        SidebarMenuAction::Remove => {}
                                     }
-                                    SidebarMenuAction::Rename => {
-                                        rename_request = Some((
-                                            RenameTarget::File(item.path.clone()),
-                                            self.state.display_name(&item.path),
-                                        ));
-                                    }
-                                    SidebarMenuAction::ResetName => {
-                                        clear_file_alias = Some(item.path.clone());
-                                    }
-                                    SidebarMenuAction::Remove => {}
                                 }
                             }
                         }
@@ -1312,11 +1545,49 @@ impl CrispPdfApp {
             );
             return;
         }
-        ui.label(
-            RichText::new(format!("{} navigable sections", self.outline.len()))
-                .size(11.0)
-                .color(theme::MUTED),
-        );
+        ui.horizontal(|ui| {
+            ui.label(
+                RichText::new(format!("{} navigable sections", self.outline.len()))
+                    .size(11.0)
+                    .color(theme::MUTED),
+            );
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                let all_collapsed = self
+                    .outline
+                    .iter()
+                    .enumerate()
+                    .filter(|(index, item)| {
+                        self.outline
+                            .get(index + 1)
+                            .is_some_and(|next| next.depth > item.depth)
+                    })
+                    .all(|(index, _)| self.collapsed_outline_items.contains(&index));
+                if ui
+                    .small_button(if all_collapsed {
+                        "Expand all"
+                    } else {
+                        "Collapse all"
+                    })
+                    .clicked()
+                {
+                    if all_collapsed {
+                        self.collapsed_outline_items.clear();
+                    } else {
+                        self.collapsed_outline_items = self
+                            .outline
+                            .iter()
+                            .enumerate()
+                            .filter(|(index, item)| {
+                                self.outline
+                                    .get(index + 1)
+                                    .is_some_and(|next| next.depth > item.depth)
+                            })
+                            .map(|(index, _)| index)
+                            .collect();
+                    }
+                }
+            });
+        });
         ui.add_space(9.0);
         let items = self.outline.clone();
         let mut activated = None;
@@ -1324,7 +1595,18 @@ impl CrispPdfApp {
             .id_salt("outline-scroll")
             .auto_shrink([false, false])
             .show(ui, |ui| {
+                let mut hidden_below_depth = None;
                 for (index, item) in items.iter().enumerate() {
+                    if let Some(depth) = hidden_below_depth {
+                        if item.depth > depth {
+                            continue;
+                        }
+                        hidden_below_depth = None;
+                    }
+                    let has_children = items
+                        .get(index + 1)
+                        .is_some_and(|next| next.depth > item.depth);
+                    let collapsed = self.collapsed_outline_items.contains(&index);
                     let indent = item.depth as f32 * 14.0;
                     let (rect, response) = ui.allocate_exact_size(
                         vec2(
@@ -1346,8 +1628,26 @@ impl CrispPdfApp {
                         theme::MUTED
                     };
                     let max_chars = ((rect.width() - indent - 42.0) / 6.9).max(6.0) as usize;
+                    if has_children {
+                        let chevron_center = pos2(rect.left() + 10.0 + indent, rect.center().y);
+                        let points = if collapsed {
+                            vec![
+                                chevron_center + vec2(-2.0, -4.0),
+                                chevron_center + vec2(2.5, 0.0),
+                                chevron_center + vec2(-2.0, 4.0),
+                            ]
+                        } else {
+                            vec![
+                                chevron_center + vec2(-4.0, -2.0),
+                                chevron_center + vec2(0.0, 2.5),
+                                chevron_center + vec2(4.0, -2.0),
+                            ]
+                        };
+                        ui.painter()
+                            .add(egui::Shape::line(points, Stroke::new(1.25, theme::MUTED)));
+                    }
                     ui.painter().text(
-                        pos2(rect.left() + 8.0 + indent, rect.center().y),
+                        pos2(rect.left() + 22.0 + indent, rect.center().y),
                         Align2::LEFT_CENTER,
                         elide(&item.title, max_chars),
                         FontId::proportional(if item.depth == 0 { 13.5 } else { 12.8 }),
@@ -1363,10 +1663,24 @@ impl CrispPdfApp {
                         );
                     }
                     response.clone().on_hover_text(&item.title);
-                    if response.clicked() && item.target.is_some() {
-                        activated = item.target.clone();
+                    if response.clicked() {
+                        let pointer = response.interact_pointer_pos();
+                        let clicked_disclosure = has_children
+                            && pointer
+                                .is_some_and(|pointer| pointer.x < rect.left() + indent + 21.0);
+                        if clicked_disclosure {
+                            if collapsed {
+                                self.collapsed_outline_items.remove(&index);
+                            } else {
+                                self.collapsed_outline_items.insert(index);
+                            }
+                        } else if item.target.is_some() {
+                            activated = item.target.clone();
+                        }
                     }
-                    let _ = index;
+                    if has_children && collapsed {
+                        hidden_below_depth = Some(item.depth);
+                    }
                 }
             });
         if let Some(target) = activated {
@@ -1459,52 +1773,113 @@ impl CrispPdfApp {
         }
     }
 
-    fn search_bar(&mut self, ui: &mut egui::Ui) {
-        if !self.show_search {
-            return;
-        }
+    fn search_sidebar(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            ui.label(
+                RichText::new("SEARCH")
+                    .size(11.5)
+                    .strong()
+                    .color(theme::MUTED),
+            );
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                if ui
+                    .add(egui::Button::new(RichText::new("×").size(16.0)).frame(false))
+                    .on_hover_text("Close search")
+                    .clicked()
+                {
+                    self.sidebar_tab = SidebarTab::Library;
+                    self.show_search = false;
+                }
+            });
+        });
+        ui.add_space(6.0);
         let response = ui.add_sized(
-            [260.0, 28.0],
-            egui::TextEdit::singleline(&mut self.search_query).hint_text("Find in document"),
+            [ui.available_width(), 32.0],
+            egui::TextEdit::singleline(&mut self.search_query)
+                .hint_text("Search current PDF")
+                .margin(Margin::symmetric(8, 6)),
         );
         let submit = response.lost_focus() && ui.input(|input| input.key_pressed(Key::Enter));
-        if submit || ui.small_button("Find").clicked() {
+        if submit {
             self.run_search();
         }
-        if ui
-            .add_enabled(!self.search_matches.is_empty(), egui::Button::new("↑"))
-            .on_hover_text("Previous match")
-            .clicked()
-        {
-            self.step_search(-1);
-        }
-        if ui
-            .add_enabled(!self.search_matches.is_empty(), egui::Button::new("↓"))
-            .on_hover_text("Next match")
-            .clicked()
-        {
-            self.step_search(1);
-        }
+        ui.add_space(6.0);
+        ui.horizontal(|ui| {
+            if ui.button("Search").clicked() {
+                self.run_search();
+            }
+            if ui
+                .add_enabled(
+                    !self.search_matches.is_empty(),
+                    egui::Button::new("Previous"),
+                )
+                .clicked()
+            {
+                self.step_search(-1);
+            }
+            if ui
+                .add_enabled(!self.search_matches.is_empty(), egui::Button::new("Next"))
+                .clicked()
+            {
+                self.step_search(1);
+            }
+        });
+        ui.add_space(10.0);
         if self.search_matches.is_empty() {
-            ui.label(RichText::new("No results").size(11.5).color(theme::MUTED));
+            let message = if self.search_query.trim().is_empty() {
+                "Type to search inside the current PDF."
+            } else {
+                "No results"
+            };
+            ui.label(RichText::new(message).size(12.0).color(theme::MUTED));
         } else {
             ui.label(
-                RichText::new(format!(
-                    "{} / {} · {}",
-                    self.search_index + 1,
-                    self.search_matches.len(),
-                    elide(&self.search_matches[self.search_index].excerpt, 48)
-                ))
-                .size(11.5)
-                .color(theme::MUTED),
+                RichText::new(format!("{} RESULTS", self.search_matches.len()))
+                    .size(10.5)
+                    .strong()
+                    .color(theme::MUTED),
             );
-        }
-        if ui
-            .add(egui::Button::new(RichText::new("×").size(16.0)).frame(false))
-            .on_hover_text("Close search")
-            .clicked()
-        {
-            self.show_search = false;
+            ui.add_space(4.0);
+            let matches = self.search_matches.clone();
+            ScrollArea::vertical()
+                .id_salt("search-results")
+                .auto_shrink([false, false])
+                .show(ui, |ui| {
+                    for (index, result) in matches.iter().enumerate() {
+                        let selected = index == self.search_index;
+                        let (rect, response) = ui
+                            .allocate_exact_size(vec2(ui.available_width(), 54.0), Sense::click());
+                        if selected || response.hovered() {
+                            ui.painter().rect_filled(
+                                rect,
+                                CornerRadius::same(5),
+                                if selected {
+                                    Color32::from_rgb(53, 53, 53)
+                                } else {
+                                    Color32::from_rgb(42, 42, 42)
+                                },
+                            );
+                        }
+                        ui.painter().text(
+                            pos2(rect.left() + 8.0, rect.top() + 10.0),
+                            Align2::LEFT_TOP,
+                            format!("Page {}", result.page_index + 1),
+                            FontId::proportional(11.0),
+                            theme::MUTED,
+                        );
+                        ui.painter().text(
+                            pos2(rect.left() + 8.0, rect.top() + 27.0),
+                            Align2::LEFT_TOP,
+                            elide(&result.excerpt, 42),
+                            FontId::proportional(12.5),
+                            Color32::from_rgb(216, 216, 216),
+                        );
+                        if response.clicked() {
+                            self.search_index = index;
+                            self.jump_to_page = Some(result.page_index);
+                        }
+                    }
+                });
         }
     }
 
@@ -1519,55 +1894,103 @@ impl CrispPdfApp {
                 self.document_tabs(ui);
                 ui.add_space(3.0);
                 ui.separator();
-                ui.add_space(3.0);
+                ui.add_space(2.0);
+                let mut breadcrumb_action = None;
+                let breadcrumb_path = self
+                    .browser_directory
+                    .as_deref()
+                    .or(self.current_path.as_deref())
+                    .map(Path::to_path_buf);
                 ScrollArea::horizontal()
                     .id_salt("path-actions-scroll")
                     .auto_shrink([false, true])
-                    .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysVisible)
+                    .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden)
+                    .scroll_source(egui::scroll_area::ScrollSource::ALL)
                     .show(ui, |ui| {
                         ui.horizontal(|ui| {
-                            ui.add_enabled(false, egui::Button::new("‹").frame(false));
-                            ui.add_enabled(false, egui::Button::new("›").frame(false));
-                            if path_breadcrumbs(ui, self.current_path.as_deref())
-                                && let Some(path) = self.current_path.as_deref()
+                            breadcrumb_action = path_breadcrumbs(ui, breadcrumb_path.as_deref());
+                            if icon_button(
+                                ui,
+                                ToolbarIcon::Folder,
+                                false,
+                                breadcrumb_path.is_some(),
+                                "Open this directory in Files",
+                            )
+                            .clicked()
+                                && breadcrumb_path.is_some()
                             {
-                                ui.ctx().copy_text(path.display().to_string());
-                                self.status = "Path copied.".to_owned();
+                                self.open_current_directory();
                             }
                             if self.current_path.is_some() {
-                                ui.add_space(12.0);
+                                ui.add_space(8.0);
                                 ui.separator();
-                                ui.add_space(6.0);
-                                if ui
-                                    .add(egui::Button::new("Export copy").frame(false))
-                                    .on_hover_text("Save highlights and comments into a new PDF")
-                                    .clicked()
+                                if icon_button(
+                                    ui,
+                                    ToolbarIcon::Export,
+                                    false,
+                                    true,
+                                    "Export annotated copy",
+                                )
+                                .clicked()
                                 {
                                     self.export_annotated_copy();
                                 }
-                                if ui
-                                    .add(egui::Button::new("Print").frame(false))
-                                    .on_hover_text("Print (Ctrl+P)")
-                                    .clicked()
+                                if icon_button(
+                                    ui,
+                                    ToolbarIcon::Save,
+                                    false,
+                                    !self.current_annotations().is_empty(),
+                                    "Save annotations into this PDF",
+                                )
+                                .clicked()
+                                    && !self.current_annotations().is_empty()
+                                {
+                                    self.confirm_save_to_source = true;
+                                }
+                                if icon_button(
+                                    ui,
+                                    ToolbarIcon::Print,
+                                    false,
+                                    true,
+                                    "Print (Ctrl+P)",
+                                )
+                                .clicked()
                                 {
                                     self.request_print();
                                 }
-                                if ui
-                                    .add(egui::Button::new("Open with…").frame(false))
-                                    .clicked()
+                                if icon_button(
+                                    ui,
+                                    ToolbarIcon::OpenWith,
+                                    false,
+                                    true,
+                                    "Open with another app",
+                                )
+                                .clicked()
                                     && let Some(path) = self.current_path.clone()
                                 {
                                     self.request_open_with(path);
                                 }
+                                if icon_button(
+                                    ui,
+                                    ToolbarIcon::Settings,
+                                    false,
+                                    true,
+                                    "View settings",
+                                )
+                                .clicked()
+                                {
+                                    self.show_view_settings = true;
+                                }
                             }
                         });
                     });
-                if self.show_search {
-                    ui.add_space(4.0);
-                    ScrollArea::horizontal()
-                        .id_salt("document-search-scroll")
-                        .auto_shrink([false, true])
-                        .show(ui, |ui| ui.horizontal(|ui| self.search_bar(ui)));
+                match breadcrumb_action {
+                    Some(BreadcrumbAction::Browse(path)) => self.open_folder_browser(path),
+                    Some(BreadcrumbAction::Copy(path)) => {
+                        ui.ctx().copy_text(path.display().to_string());
+                        self.status = "Path copied.".to_owned();
+                    }
+                    None => {}
                 }
                 if self.current_path.is_some() {
                     ui.add_space(5.0);
@@ -1576,88 +1999,89 @@ impl CrispPdfApp {
                     ScrollArea::horizontal()
                         .id_salt("viewer-tools-scroll")
                         .auto_shrink([false, true])
-                        .scroll_bar_visibility(
-                            egui::scroll_area::ScrollBarVisibility::AlwaysVisible,
-                        )
+                        .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden)
+                        .scroll_source(egui::scroll_area::ScrollSource::ALL)
                         .show(ui, |ui| {
                             ui.horizontal(|ui| {
-                                if ui
-                                    .add(egui::Button::new("−").frame(false))
-                                    .on_hover_text("Scale entire app down (Ctrl+-)")
-                                    .clicked()
-                                {
+                                // Zoom group: document zoom is primary; surrounding chrome follows the configured ratio.
+                                if compact_text_button(ui, "−", "Zoom out (Ctrl+-)").clicked() {
+                                    let previous = self.state.ui_scale;
                                     self.state.ui_scale = (self.state.ui_scale - 0.1).max(0.7);
-                                    ui.ctx().set_zoom_factor(self.state.ui_scale);
+                                    self.zoom *= self.state.ui_scale / previous.max(0.1);
+                                    ui.ctx().set_zoom_factor(chrome_zoom(
+                                        self.state.ui_scale,
+                                        self.state.chrome_scale_ratio,
+                                    ));
                                     self.persist();
                                 }
-                                ui.label(format!(
-                                    "{}%",
-                                    (self.state.ui_scale * 100.0).round() as i32
-                                ));
-                                if ui
-                                    .add(egui::Button::new("+").frame(false))
-                                    .on_hover_text("Scale entire app up (Ctrl++)")
-                                    .clicked()
-                                {
-                                    self.state.ui_scale = (self.state.ui_scale + 0.1).min(1.8);
-                                    ui.ctx().set_zoom_factor(self.state.ui_scale);
+                                ui.label(
+                                    RichText::new(format!(
+                                        "{}%",
+                                        (self.state.ui_scale * 100.0).round() as i32
+                                    ))
+                                    .monospace(),
+                                );
+                                if compact_text_button(ui, "+", "Zoom in (Ctrl++)").clicked() {
+                                    let previous = self.state.ui_scale;
+                                    self.state.ui_scale = (self.state.ui_scale + 0.1).min(5.0);
+                                    self.zoom *= self.state.ui_scale / previous.max(0.1);
+                                    ui.ctx().set_zoom_factor(chrome_zoom(
+                                        self.state.ui_scale,
+                                        self.state.chrome_scale_ratio,
+                                    ));
                                     self.persist();
                                 }
-                                if ui
-                                    .add(egui::Button::new("Fit width").frame(false))
-                                    .clicked()
-                                {
-                                    self.fit_width_requested = true;
-                                }
-                                if !self.page_sizes.is_empty() {
-                                    ui.add_space(8.0);
-                                    ui.label(
-                                        RichText::new(format!(
-                                            "{}  of  {}",
-                                            self.current_page + 1,
-                                            self.page_sizes.len()
-                                        ))
-                                        .strong(),
-                                    );
-                                }
-                                ui.add_space(8.0);
+                                ui.add_space(5.0);
                                 ui.separator();
                                 ui.add_space(5.0);
-                                ui.label(
-                                    RichText::new("TOOLS")
-                                        .size(10.0)
-                                        .strong()
-                                        .color(theme::MUTED),
-                                );
-                                tool_button(
+                                if !self.page_sizes.is_empty() {
+                                    let mut page = self.current_page + 1;
+                                    let response = ui.add_sized(
+                                        [45.0, 28.0],
+                                        egui::DragValue::new(&mut page)
+                                            .range(1..=self.page_sizes.len())
+                                            .speed(1),
+                                    );
+                                    if response.changed() {
+                                        self.jump_to_page = Some(page.saturating_sub(1));
+                                    }
+                                    ui.label(
+                                        RichText::new(format!("of {}", self.page_sizes.len()))
+                                            .color(theme::MUTED),
+                                    );
+                                }
+                                ui.add_space(5.0);
+                                ui.separator();
+                                ui.add_space(5.0);
+                                tool_icon_button(
                                     ui,
                                     &mut self.tool_mode,
                                     ToolMode::Highlight,
-                                    "Highlight",
-                                    "Drag across text to highlight it",
+                                    ToolbarIcon::Highlight,
+                                    "Highlight text",
                                 );
-                                tool_button(
+                                tool_icon_button(
                                     ui,
                                     &mut self.tool_mode,
                                     ToolMode::Pen,
+                                    ToolbarIcon::Pen,
                                     "Draw",
-                                    "Write freehand on the page",
                                 );
-                                tool_button(
+                                tool_icon_button(
                                     ui,
                                     &mut self.tool_mode,
                                     ToolMode::Eraser,
-                                    "Erase",
-                                    "Click or drag across annotations to remove them",
+                                    ToolbarIcon::Eraser,
+                                    "Erase annotations",
                                 );
-                                tool_button(
+                                tool_icon_button(
                                     ui,
                                     &mut self.tool_mode,
                                     ToolMode::Note,
-                                    "Comment",
-                                    "Place a text comment",
+                                    ToolbarIcon::Comment,
+                                    "Add comment",
                                 );
-                                ui.menu_button("More", |ui| {
+                                ui.menu_button("···", |ui| {
                                     tool_button(
                                         ui,
                                         &mut self.tool_mode,
@@ -1701,50 +2125,45 @@ impl CrispPdfApp {
                                         "Attach a local file reference to the page",
                                     );
                                 });
-                                tool_button(
+                                tool_icon_button(
                                     ui,
                                     &mut self.tool_mode,
                                     ToolMode::Ocr,
+                                    ToolbarIcon::Ocr,
                                     "Snip OCR",
-                                    "Drag a region; result opens without copying",
                                 );
-                                tool_button(
+                                tool_icon_button(
                                     ui,
                                     &mut self.tool_mode,
                                     ToolMode::MathOcr,
+                                    ToolbarIcon::Math,
                                     "Math OCR",
-                                    "Drag an image formula to convert it to LaTeX locally",
                                 );
                                 ui.separator();
-                                if ui
-                                    .add_enabled(
-                                        !self.annotation_undo.is_empty(),
-                                        egui::Button::new("Undo"),
-                                    )
-                                    .clicked()
+                                if icon_button(
+                                    ui,
+                                    ToolbarIcon::Undo,
+                                    false,
+                                    !self.annotation_undo.is_empty(),
+                                    "Undo",
+                                )
+                                .clicked()
                                 {
                                     self.undo_annotation();
                                 }
-                                if ui
-                                    .add_enabled(
-                                        !self.annotation_redo.is_empty(),
-                                        egui::Button::new("Redo"),
-                                    )
-                                    .clicked()
+                                if icon_button(
+                                    ui,
+                                    ToolbarIcon::Redo,
+                                    false,
+                                    !self.annotation_redo.is_empty(),
+                                    "Redo",
+                                )
+                                .clicked()
                                 {
                                     self.redo_annotation();
                                 }
                                 ui.separator();
-                                ui.label(RichText::new("Color").size(11.0).color(theme::MUTED));
                                 ui.color_edit_button_srgba(&mut self.annotation_color);
-                                ui.add_space(8.0);
-                                ui.separator();
-                                ui.add_space(5.0);
-                                ui.label(
-                                    RichText::new(elide(&self.status, 54))
-                                        .size(11.0)
-                                        .color(theme::MUTED),
-                                );
                             });
                         });
                 }
@@ -1760,6 +2179,10 @@ impl CrispPdfApp {
                     .inner_margin(Margin::ZERO),
             )
             .show(root, |ui| {
+                if self.browser_directory.is_some() {
+                    self.folder_browser(ui);
+                    return;
+                }
                 if self.current_path.is_none() {
                     self.empty_state(ui);
                     return;
@@ -1770,6 +2193,14 @@ impl CrispPdfApp {
                         ui.label(&self.status);
                     });
                     return;
+                }
+
+                if ui.rect_contains_pointer(ui.max_rect()) {
+                    let pinch_zoom = ctx.input(|input| input.zoom_delta());
+                    if (pinch_zoom - 1.0).abs() > 0.001 {
+                        self.zoom = (self.zoom * pinch_zoom).clamp(0.2, 8.0);
+                        self.fit_width_requested = false;
+                    }
                 }
 
                 let available_page_width = (ui.available_width() - 56.0).max(100.0);
@@ -1927,15 +2358,19 @@ impl CrispPdfApp {
                                     )
                                     .is_some()
                                 });
-                                let annotation_action = annotation_context_menu(
+                                let annotation_ui = annotation_context_menu(
                                     ui,
                                     &page_annotations,
                                     page_rect,
                                     page_sizes[index],
                                     self.tool_mode == ToolMode::Eraser,
                                 );
-                                let annotation_consumed = annotation_action.is_some();
-                                if let Some(action) = annotation_action {
+                                if let Some(id) = annotation_ui.clicked_comment {
+                                    self.pinned_comment = Some(id);
+                                }
+                                let annotation_consumed = annotation_ui.action.is_some()
+                                    || annotation_ui.clicked_comment.is_some();
+                                if let Some(action) = annotation_ui.action {
                                     match action {
                                         AnnotationContextAction::AddComment {
                                             page,
@@ -1947,6 +2382,11 @@ impl CrispPdfApp {
                                                 parent,
                                                 page,
                                                 position,
+                                                screen_anchor: Some(pdf_point_to_screen(
+                                                    position,
+                                                    page_rect,
+                                                    page_sizes[index],
+                                                )),
                                                 text: String::new(),
                                             });
                                         }
@@ -1966,6 +2406,11 @@ impl CrispPdfApp {
                                                     parent: *parent,
                                                     page: annotation.page,
                                                     position: *position,
+                                                    screen_anchor: Some(pdf_point_to_screen(
+                                                        *position,
+                                                        page_rect,
+                                                        page_sizes[index],
+                                                    )),
                                                     text: text.clone(),
                                                 });
                                             }
@@ -1976,6 +2421,17 @@ impl CrispPdfApp {
                                             }
                                         }
                                     }
+                                }
+                                let visible_comment = annotation_ui.hovered_comment.or_else(|| {
+                                    self.pinned_comment.filter(|id| {
+                                        page_annotations.iter().any(|annotation| annotation.id == *id)
+                                    })
+                                });
+                                if let Some(id) = visible_comment
+                                    && let Some(annotation) = page_annotations.iter().find(|annotation| annotation.id == id)
+                                    && show_comment_card(&ctx, annotation, page_rect, page_sizes[index], self.pinned_comment == Some(id))
+                                {
+                                    self.pinned_comment = None;
                                 }
 
                                 let mut pointer_on_link = false;
@@ -2048,6 +2504,47 @@ impl CrispPdfApp {
                                                             self.text_selection = None;
                                                             self.status = "Highlight saved locally.".to_owned();
                                                         }
+                                                    } else if self.tool_mode == ToolMode::Select
+                                                        && !response.dragged()
+                                                        && selection.anchor != selection.focus
+                                                        && let Some(selection_rect) = text_selection_screen_rect(
+                                                            glyphs,
+                                                            selection,
+                                                            page_rect,
+                                                            source_size,
+                                                        )
+                                                        && let Some(action) = selection_action_bar(&ctx, selection_rect)
+                                                    {
+                                                        match action {
+                                                            SelectionAction::Copy => {
+                                                                if let Some(text) = selected_glyph_text(
+                                                                    glyphs,
+                                                                    selection.anchor,
+                                                                    selection.focus,
+                                                                ) {
+                                                                    ctx.copy_text(text);
+                                                                    self.status = "Selected text copied.".to_owned();
+                                                                }
+                                                            }
+                                                            SelectionAction::Highlight => {
+                                                                let start = selection.anchor.min(selection.focus);
+                                                                let end = selection.anchor.max(selection.focus);
+                                                                let rects = glyphs
+                                                                    .get(start..=end)
+                                                                    .unwrap_or_default()
+                                                                    .iter()
+                                                                    .filter_map(|glyph| glyph.bounds)
+                                                                    .collect::<Vec<_>>();
+                                                                if !rects.is_empty() {
+                                                                    self.add_annotation(index, AnnotationKind::Highlight {
+                                                                        rects,
+                                                                        color: [self.annotation_color.r(), self.annotation_color.g(), self.annotation_color.b(), 86],
+                                                                    });
+                                                                    self.text_selection = None;
+                                                                    self.status = "Highlight saved locally.".to_owned();
+                                                                }
+                                                            }
+                                                        }
                                                     }
                                                 }
                                             }
@@ -2079,7 +2576,12 @@ impl CrispPdfApp {
                                             }
                                         }
                                         ToolMode::Eraser => {
-                                            if response.hovered() { ctx.set_cursor_icon(CursorIcon::Crosshair); }
+                                            if response.hovered() {
+                                                ctx.set_cursor_icon(CursorIcon::None);
+                                                if let Some(pointer) = response.hover_pos() {
+                                                    paint_eraser_cursor(ui.painter(), pointer);
+                                                }
+                                            }
                                             if response.drag_started() {
                                                 self.push_annotation_history();
                                                 self.eraser_gesture_active = true;
@@ -2107,6 +2609,7 @@ impl CrispPdfApp {
                                                     parent: None,
                                                     page: index,
                                                     position: screen_point_to_pdf(pointer, page_rect, source_size),
+                                                    screen_anchor: Some(pointer),
                                                     text: String::new(),
                                                 });
                                             }
@@ -2202,6 +2705,166 @@ impl CrispPdfApp {
             });
     }
 
+    fn folder_browser(&mut self, ui: &mut egui::Ui) {
+        let Some(directory) = self.browser_directory.clone() else {
+            return;
+        };
+        let entries = self.browser_entries.clone();
+        let scanning = self.browser_scan.is_some();
+        let pdf_total = entries.iter().filter(|entry| !entry.is_directory).count();
+        let mut browse = None;
+        let mut open = None;
+        let mut close = false;
+        let mut open_system_folder = false;
+        Frame::new()
+            .fill(theme::CANVAS_BG)
+            .inner_margin(Margin::symmetric(18, 16))
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.vertical(|ui| {
+                        ui.label(RichText::new("Files").size(19.0).strong());
+                        ui.label(
+                            RichText::new(format!(
+                                "{}  ·  {} PDFs in this folder tree",
+                                directory.display(),
+                                pdf_total
+                            ))
+                            .size(12.0)
+                            .color(theme::MUTED),
+                        );
+                    });
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        if ui.button("Back to document").clicked() {
+                            close = true;
+                        }
+                        if ui.button("Open in Files").clicked() {
+                            open_system_folder = true;
+                        }
+                        if let Some(parent) = directory.parent()
+                            && ui.button("Up").clicked()
+                        {
+                            browse = Some(parent.to_path_buf());
+                        }
+                    });
+                });
+                ui.add_space(12.0);
+                Frame::new()
+                    .fill(Color32::from_rgb(26, 26, 26))
+                    .stroke(Stroke::new(1.0, Color32::from_rgb(52, 52, 52)))
+                    .corner_radius(CornerRadius::same(5))
+                    .inner_margin(Margin::ZERO)
+                    .show(ui, |ui| {
+                        let (header, _) = ui
+                            .allocate_exact_size(vec2(ui.available_width(), 32.0), Sense::hover());
+                        ui.painter().rect_filled(
+                            header,
+                            CornerRadius::same(5),
+                            Color32::from_rgb(34, 34, 34),
+                        );
+                        let location_x = header.left() + header.width() * 0.62;
+                        ui.painter().text(
+                            pos2(header.left() + 34.0, header.center().y),
+                            Align2::LEFT_CENTER,
+                            "Name",
+                            FontId::proportional(11.0),
+                            theme::MUTED,
+                        );
+                        ui.painter().text(
+                            pos2(location_x, header.center().y),
+                            Align2::LEFT_CENTER,
+                            "Location / count",
+                            FontId::proportional(11.0),
+                            theme::MUTED,
+                        );
+                        ScrollArea::vertical()
+                            .id_salt("folder-browser")
+                            .auto_shrink([false, false])
+                            .show(ui, |ui| {
+                                if scanning {
+                                    ui.horizontal(|ui| {
+                                        ui.spinner();
+                                        ui.label(
+                                            RichText::new("Scanning all nested folders...")
+                                                .color(theme::MUTED),
+                                        );
+                                    });
+                                    ui.add_space(8.0);
+                                } else if entries.is_empty() {
+                                    ui.label(
+                                        RichText::new("No PDF files were found here.")
+                                            .color(theme::MUTED),
+                                    );
+                                }
+                                for entry in entries {
+                                    let (rect, response) = ui.allocate_exact_size(
+                                        vec2(ui.available_width(), 36.0),
+                                        Sense::click(),
+                                    );
+                                    ui.painter().line_segment(
+                                        [rect.left_bottom(), rect.right_bottom()],
+                                        Stroke::new(1.0, Color32::from_rgb(42, 42, 42)),
+                                    );
+                                    if response.hovered() {
+                                        ui.painter().rect_filled(
+                                            rect,
+                                            0.0,
+                                            Color32::from_rgb(43, 43, 43),
+                                        );
+                                    }
+                                    let center = pos2(rect.left() + 15.0, rect.center().y);
+                                    if entry.is_directory {
+                                        paint_folder_icon(ui.painter(), center, theme::MUTED);
+                                    } else {
+                                        paint_file_icon(ui.painter(), center, theme::MUTED);
+                                    }
+                                    ui.painter().text(
+                                        pos2(rect.left() + 34.0, rect.center().y),
+                                        Align2::LEFT_CENTER,
+                                        file_name(&entry.path),
+                                        FontId::proportional(13.0),
+                                        Color32::from_rgb(214, 214, 214),
+                                    );
+                                    let detail = if entry.is_directory {
+                                        format!("{} PDFs", entry.pdf_count)
+                                    } else {
+                                        entry
+                                            .relative
+                                            .parent()
+                                            .map(|path| path.display().to_string())
+                                            .filter(|path| !path.is_empty())
+                                            .unwrap_or_else(|| ".".to_owned())
+                                    };
+                                    ui.painter().text(
+                                        pos2(rect.left() + rect.width() * 0.62, rect.center().y),
+                                        Align2::LEFT_CENTER,
+                                        elide(&detail, 44),
+                                        FontId::proportional(11.5),
+                                        theme::MUTED,
+                                    );
+                                    if response.clicked() {
+                                        if entry.is_directory {
+                                            browse = Some(entry.path);
+                                        } else {
+                                            open = Some(entry.path);
+                                        }
+                                    }
+                                }
+                            });
+                    });
+            });
+        if open_system_folder {
+            self.open_current_directory();
+        }
+        if close {
+            self.browser_directory = None;
+            self.browser_entries.clear();
+        } else if let Some(path) = browse {
+            self.open_folder_browser(path);
+        } else if let Some(path) = open {
+            self.open_document(path);
+        }
+    }
+
     fn selected_text(&self) -> Option<String> {
         let selection = self.text_selection?;
         let glyphs = self.text_layers.get(&selection.page_index)?;
@@ -2276,23 +2939,38 @@ impl CrispPdfApp {
         let editing = draft.annotation_id.is_some();
         let mut save = false;
         let mut open = true;
-        egui::Window::new(if editing {
+        let mut window = egui::Window::new(if editing {
             "Edit comment"
         } else {
             "Add comment"
         })
         .open(&mut open)
-        .anchor(Align2::CENTER_CENTER, vec2(0.0, -40.0))
         .collapsible(false)
-        .resizable(true)
-        .default_width(380.0)
-        .show(ctx, |ui| {
-            ui.label(RichText::new("Comment stored as a CrispPDF overlay").color(theme::MUTED));
-            ui.add_sized(
-                [ui.available_width(), 120.0],
-                egui::TextEdit::multiline(&mut draft.text).hint_text("Write a comment..."),
+        .resizable(false)
+        .default_width(300.0);
+        if let Some(anchor) = draft.screen_anchor {
+            window = window.current_pos(anchor + vec2(18.0, -24.0));
+        } else {
+            window = window.anchor(Align2::CENTER_CENTER, vec2(0.0, -40.0));
+        }
+        window.show(ctx, |ui| {
+            let editor = ui.add_sized(
+                [ui.available_width(), 76.0],
+                egui::TextEdit::multiline(&mut draft.text)
+                    .hint_text("Write a comment...")
+                    .desired_rows(3),
             );
+            let enter_to_save = editor.has_focus()
+                && ui.input(|input| input.key_pressed(Key::Enter) && !input.modifiers.shift);
+            if enter_to_save && !draft.text.trim().is_empty() {
+                save = true;
+            }
             ui.horizontal(|ui| {
+                ui.label(
+                    RichText::new("Shift+Enter for a new line")
+                        .size(10.5)
+                        .color(theme::MUTED),
+                );
                 if ui
                     .add_enabled(
                         !draft.text.trim().is_empty(),
@@ -2334,6 +3012,92 @@ impl CrispPdfApp {
                 );
                 self.status = "Comment saved locally.".to_owned();
             }
+        }
+    }
+
+    fn view_settings_dialog(&mut self, ctx: &egui::Context) {
+        if !self.show_view_settings {
+            return;
+        }
+        let mut open = true;
+        let mut ratio = self.state.chrome_scale_ratio;
+        let mut changed = false;
+        egui::Window::new("View settings")
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(false)
+            .default_width(300.0)
+            .show(ctx, |ui| {
+                ui.label(RichText::new("Interface scale").strong());
+                ui.label(
+                    RichText::new(
+                        "Size of tabs, toolbar, navigation rail, and sidebar relative to PDF zoom.",
+                    )
+                    .size(11.5)
+                    .color(theme::MUTED),
+                );
+                ui.add_space(8.0);
+                changed = ui
+                    .add(
+                        egui::Slider::new(&mut ratio, 0.4..=1.0)
+                            .step_by(0.05)
+                            .custom_formatter(|value, _| {
+                                format!("{}%", (value * 100.0).round() as i32)
+                            }),
+                    )
+                    .changed();
+                ui.add_space(4.0);
+                if ui.small_button("Reset to 60%").clicked() {
+                    ratio = 0.6;
+                    changed = true;
+                }
+            });
+        if !open {
+            self.show_view_settings = false;
+        }
+        if changed {
+            self.state.chrome_scale_ratio = ratio;
+            ctx.set_zoom_factor(chrome_zoom(self.state.ui_scale, ratio));
+            self.persist();
+        }
+    }
+
+    fn save_to_source_dialog(&mut self, ctx: &egui::Context) {
+        if !self.confirm_save_to_source {
+            return;
+        }
+        let mut open = true;
+        let mut save = false;
+        let mut cancel = false;
+        egui::Window::new("Save annotations to PDF?")
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(false)
+            .default_width(360.0)
+            .show(ctx, |ui| {
+                ui.label("This writes CrispPDF annotations into the PDF on disk so other viewers can see them.");
+                ui.add_space(6.0);
+                ui.label(
+                    RichText::new("A timestamped backup of the original PDF will be created first.")
+                        .size(11.5)
+                        .color(theme::MUTED),
+                );
+                ui.add_space(10.0);
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    if ui.button("Save to PDF").clicked() {
+                        save = true;
+                    }
+                    if ui.button("Cancel").clicked() {
+                        cancel = true;
+                    }
+                });
+            });
+        if !open || cancel {
+            self.confirm_save_to_source = false;
+        }
+        if save {
+            self.confirm_save_to_source = false;
+            self.save_annotations_to_source();
         }
     }
 
@@ -2617,6 +3381,8 @@ impl eframe::App for CrispPdfApp {
         self.viewer(ui);
         self.rename_dialog(ui.ctx());
         self.note_dialog(ui.ctx());
+        self.view_settings_dialog(ui.ctx());
+        self.save_to_source_dialog(ui.ctx());
         self.text_annotation_dialog(ui.ctx());
         self.ocr_result_dialog(ui.ctx());
         self.open_with_dialog(ui.ctx());
@@ -2752,7 +3518,13 @@ fn render_pdf_tree(
     let mut action = None;
     for child in node.directories.values() {
         let is_collapsed = collapsed.contains(&child.path);
-        let response = directory_row(ui, &child.name, !is_collapsed, 24.0 + depth as f32 * 14.0);
+        let response = directory_row(
+            ui,
+            &child.name,
+            pdf_tree_count(child),
+            !is_collapsed,
+            24.0 + depth as f32 * 14.0,
+        );
         response
             .clone()
             .on_hover_text(child.path.display().to_string());
@@ -2802,7 +3574,17 @@ fn render_pdf_tree(
     action
 }
 
-fn directory_row(ui: &mut egui::Ui, name: &str, expanded: bool, indent: f32) -> Response {
+fn pdf_tree_count(node: &PdfTreeNode) -> usize {
+    node.files.len() + node.directories.values().map(pdf_tree_count).sum::<usize>()
+}
+
+fn directory_row(
+    ui: &mut egui::Ui,
+    name: &str,
+    count: usize,
+    expanded: bool,
+    indent: f32,
+) -> Response {
     let (rect, response) = ui.allocate_exact_size(vec2(ui.available_width(), 30.0), Sense::click());
     if response.hovered() {
         ui.painter().rect_filled(
@@ -2836,6 +3618,13 @@ fn directory_row(ui: &mut egui::Ui, name: &str, expanded: bool, indent: f32) -> 
         elide(name, ((rect.right() - x - 38.0) / 7.0).max(5.0) as usize),
         FontId::proportional(13.0),
         Color32::from_rgb(202, 202, 202),
+    );
+    ui.painter().text(
+        pos2(rect.right() - 7.0, y),
+        Align2::RIGHT_CENTER,
+        count.to_string(),
+        FontId::proportional(10.5),
+        theme::MUTED,
     );
     response
 }
@@ -3020,7 +3809,7 @@ fn sidebar_options_popup(
 }
 
 fn popup_menu_row(ui: &mut egui::Ui, text: &str, color: Color32) -> bool {
-    let (rect, response) = ui.allocate_exact_size(vec2(ui.available_width(), 32.0), Sense::click());
+    let (rect, response) = ui.allocate_exact_size(vec2(ui.available_width(), 28.0), Sense::click());
     if response.hovered() {
         ui.painter()
             .rect_filled(rect, CornerRadius::same(7), Color32::from_rgb(44, 47, 56));
@@ -3029,7 +3818,7 @@ fn popup_menu_row(ui: &mut egui::Ui, text: &str, color: Color32) -> bool {
         pos2(rect.left() + 9.0, rect.center().y),
         Align2::LEFT_CENTER,
         text,
-        FontId::proportional(13.5),
+        FontId::proportional(12.5),
         color,
     );
     response.clicked()
@@ -3127,6 +3916,57 @@ fn sidebar_section_header(ui: &mut egui::Ui, title: &str, subtitle: &str, accent
         Stroke::new(1.0, Color32::from_rgb(39, 42, 49)),
     );
     ui.add_space(3.0);
+}
+
+fn collapsible_section_header(
+    ui: &mut egui::Ui,
+    title: &str,
+    count: usize,
+    expanded: bool,
+) -> Response {
+    let (rect, response) = ui.allocate_exact_size(vec2(ui.available_width(), 30.0), Sense::click());
+    if response.hovered() {
+        ui.painter()
+            .rect_filled(rect, CornerRadius::same(5), Color32::from_rgb(40, 40, 40));
+    }
+    let x = rect.left() + 7.0;
+    let center = rect.center().y;
+    let chevron = if expanded {
+        [
+            pos2(x, center - 2.5),
+            pos2(x + 4.0, center + 2.0),
+            pos2(x + 8.0, center - 2.5),
+        ]
+    } else {
+        [
+            pos2(x + 1.0, center - 4.0),
+            pos2(x + 5.0, center),
+            pos2(x + 1.0, center + 4.0),
+        ]
+    };
+    ui.painter().add(egui::Shape::line(
+        chevron.to_vec(),
+        Stroke::new(1.25, theme::MUTED),
+    ));
+    ui.painter().text(
+        pos2(x + 16.0, center),
+        Align2::LEFT_CENTER,
+        title,
+        FontId::proportional(11.5),
+        theme::MUTED,
+    );
+    ui.painter().text(
+        pos2(rect.right() - 6.0, center),
+        Align2::RIGHT_CENTER,
+        count.to_string(),
+        FontId::proportional(10.5),
+        theme::MUTED,
+    );
+    response.on_hover_text(if expanded {
+        "Collapse recents"
+    } else {
+        "Expand recents"
+    })
 }
 
 fn elide(text: &str, max_chars: usize) -> String {
@@ -3284,6 +4124,116 @@ fn paint_text_selection(
     }
 }
 
+fn text_selection_screen_rect(
+    glyphs: &[TextGlyph],
+    selection: TextSelection,
+    page_rect: Rect,
+    source_size: [f32; 2],
+) -> Option<Rect> {
+    let start = selection.anchor.min(selection.focus);
+    let end = selection.anchor.max(selection.focus);
+    glyphs
+        .get(start..=end)?
+        .iter()
+        .filter_map(|glyph| glyph_screen_rect(glyph, page_rect, source_size))
+        .reduce(Rect::union)
+}
+
+fn selection_action_bar(ctx: &egui::Context, selection_rect: Rect) -> Option<SelectionAction> {
+    let mut action = None;
+    egui::Area::new(egui::Id::new("text-selection-actions"))
+        .order(egui::Order::Tooltip)
+        .fixed_pos(pos2(
+            selection_rect.center().x - 70.0,
+            selection_rect.top() - 40.0,
+        ))
+        .show(ctx, |ui| {
+            Frame::new()
+                .fill(Color32::from_rgb(31, 31, 31))
+                .stroke(Stroke::new(1.0, Color32::from_rgb(70, 70, 70)))
+                .corner_radius(CornerRadius::same(7))
+                .inner_margin(Margin::symmetric(5, 4))
+                .show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        if ui.small_button("Copy").clicked() {
+                            action = Some(SelectionAction::Copy);
+                        }
+                        if ui.small_button("Highlight").clicked() {
+                            action = Some(SelectionAction::Highlight);
+                        }
+                    });
+                });
+        });
+    action
+}
+
+fn paint_eraser_cursor(painter: &egui::Painter, pointer: egui::Pos2) {
+    let points = vec![
+        pointer + vec2(-7.0, 4.0),
+        pointer + vec2(-2.0, -6.0),
+        pointer + vec2(8.0, -1.0),
+        pointer + vec2(3.0, 9.0),
+    ];
+    painter.add(egui::Shape::convex_polygon(
+        points,
+        Color32::from_rgb(226, 143, 151),
+        Stroke::new(1.2, Color32::from_rgb(245, 221, 224)),
+    ));
+    painter.line_segment(
+        [pointer + vec2(-4.5, -1.0), pointer + vec2(5.5, 4.0)],
+        Stroke::new(1.0, Color32::from_rgb(116, 82, 88)),
+    );
+}
+
+fn show_comment_card(
+    ctx: &egui::Context,
+    annotation: &Annotation,
+    page_rect: Rect,
+    source_size: [f32; 2],
+    pinned: bool,
+) -> bool {
+    let AnnotationKind::Note { position, text, .. } = &annotation.kind else {
+        return false;
+    };
+    let anchor = pdf_point_to_screen(*position, page_rect, source_size);
+    let mut close = false;
+    egui::Area::new(egui::Id::new(("comment-card", annotation.id)))
+        .order(egui::Order::Tooltip)
+        .fixed_pos(anchor + vec2(14.0, 10.0))
+        .show(ctx, |ui| {
+            Frame::new()
+                .fill(Color32::from_rgb(32, 32, 32))
+                .stroke(Stroke::new(1.0, Color32::from_rgb(72, 72, 72)))
+                .corner_radius(CornerRadius::same(8))
+                .inner_margin(Margin::same(9))
+                .show(ui, |ui| {
+                    ui.set_max_width(260.0);
+                    ui.horizontal(|ui| {
+                        ui.label(
+                            RichText::new("Comment")
+                                .size(11.0)
+                                .strong()
+                                .color(theme::MUTED),
+                        );
+                        if pinned {
+                            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                if ui.add(egui::Button::new("×").frame(false)).clicked() {
+                                    close = true;
+                                }
+                            });
+                        }
+                    });
+                    ui.add_space(3.0);
+                    ui.label(
+                        RichText::new(text)
+                            .size(13.0)
+                            .color(Color32::from_rgb(225, 225, 225)),
+                    );
+                });
+        });
+    close
+}
+
 fn tool_button(ui: &mut egui::Ui, mode: &mut ToolMode, value: ToolMode, label: &str, help: &str) {
     let selected = *mode == value;
     if ui
@@ -3299,24 +4249,272 @@ fn tool_button(ui: &mut egui::Ui, mode: &mut ToolMode, value: ToolMode, label: &
     }
 }
 
-fn path_breadcrumbs(ui: &mut egui::Ui, path: Option<&Path>) -> bool {
+#[derive(Clone, Copy)]
+enum ToolbarIcon {
+    Highlight,
+    Pen,
+    Eraser,
+    Comment,
+    Ocr,
+    Math,
+    Undo,
+    Redo,
+    Print,
+    Export,
+    Save,
+    OpenWith,
+    Folder,
+    Settings,
+}
+
+fn compact_text_button(ui: &mut egui::Ui, text: &str, help: &str) -> Response {
+    ui.add_sized(
+        [28.0, 28.0],
+        egui::Button::new(RichText::new(text).size(16.0)).frame(false),
+    )
+    .on_hover_text(help)
+}
+
+fn tool_icon_button(
+    ui: &mut egui::Ui,
+    mode: &mut ToolMode,
+    value: ToolMode,
+    icon: ToolbarIcon,
+    help: &str,
+) -> Response {
+    let selected = *mode == value;
+    let response = icon_button(ui, icon, selected, true, help);
+    if response.clicked() {
+        *mode = if selected { ToolMode::Select } else { value };
+    }
+    response
+}
+
+fn icon_button(
+    ui: &mut egui::Ui,
+    icon: ToolbarIcon,
+    selected: bool,
+    enabled: bool,
+    help: &str,
+) -> Response {
+    let (rect, response) = ui.allocate_exact_size(vec2(30.0, 28.0), Sense::click());
+    if selected || response.hovered() {
+        ui.painter().rect_filled(
+            rect,
+            CornerRadius::same(5),
+            if selected {
+                Color32::from_rgb(65, 65, 65)
+            } else {
+                Color32::from_rgb(45, 45, 45)
+            },
+        );
+    }
+    let color = if enabled {
+        Color32::from_rgb(205, 205, 205)
+    } else {
+        Color32::from_rgb(88, 88, 88)
+    };
+    paint_toolbar_icon(ui.painter(), rect.center(), icon, color);
+    response.on_hover_text(help)
+}
+
+fn paint_toolbar_icon(
+    painter: &egui::Painter,
+    center: egui::Pos2,
+    icon: ToolbarIcon,
+    color: Color32,
+) {
+    let stroke = Stroke::new(1.45, color);
+    match icon {
+        ToolbarIcon::Highlight => {
+            painter.line_segment(
+                [center + vec2(-6.0, 4.0), center + vec2(3.5, -5.5)],
+                Stroke::new(4.0, color),
+            );
+            painter.line_segment(
+                [center + vec2(-7.0, 7.0), center + vec2(7.0, 7.0)],
+                Stroke::new(2.2, Color32::from_rgb(232, 190, 62)),
+            );
+        }
+        ToolbarIcon::Pen => {
+            painter.line_segment(
+                [center + vec2(-5.0, 6.0), center + vec2(5.5, -4.5)],
+                Stroke::new(2.2, color),
+            );
+            painter.add(egui::Shape::convex_polygon(
+                vec![
+                    center + vec2(-7.0, 7.0),
+                    center + vec2(-3.0, 5.0),
+                    center + vec2(-5.0, 3.0),
+                ],
+                color,
+                Stroke::NONE,
+            ));
+        }
+        ToolbarIcon::Eraser => {
+            let rect = Rect::from_center_size(center, vec2(14.0, 9.0));
+            painter.rect(rect, 2.0, Color32::TRANSPARENT, stroke, StrokeKind::Inside);
+            painter.line_segment(
+                [
+                    pos2(rect.center().x, rect.top()),
+                    pos2(rect.center().x, rect.bottom()),
+                ],
+                stroke,
+            );
+        }
+        ToolbarIcon::Comment => {
+            let bubble = Rect::from_center_size(center - vec2(0.0, 1.0), vec2(15.0, 11.0));
+            painter.rect_stroke(bubble, 3.0, stroke, StrokeKind::Inside);
+            painter.line_segment(
+                [
+                    bubble.left_bottom() + vec2(3.0, 0.0),
+                    bubble.left_bottom() + vec2(1.0, 4.0),
+                ],
+                stroke,
+            );
+        }
+        ToolbarIcon::Ocr => {
+            painter.text(
+                center,
+                Align2::CENTER_CENTER,
+                "OCR",
+                FontId::monospace(8.5),
+                color,
+            );
+        }
+        ToolbarIcon::Math => {
+            painter.text(
+                center,
+                Align2::CENTER_CENTER,
+                "fx",
+                FontId::proportional(11.0),
+                color,
+            );
+        }
+        ToolbarIcon::Undo | ToolbarIcon::Redo => {
+            let flip = if matches!(icon, ToolbarIcon::Undo) {
+                -1.0
+            } else {
+                1.0
+            };
+            let arc = (0..=12)
+                .map(|step| {
+                    let angle = -2.45 + step as f32 / 12.0 * 4.15;
+                    center + vec2(angle.cos() * 7.0 * flip, angle.sin() * 6.0)
+                })
+                .collect::<Vec<_>>();
+            painter.add(egui::Shape::line(arc.clone(), stroke));
+            let tip = arc[0];
+            painter.line_segment([tip, tip + vec2(4.0 * flip, -0.5)], stroke);
+            painter.line_segment([tip, tip + vec2(0.5 * flip, 4.0)], stroke);
+        }
+        ToolbarIcon::Print => {
+            painter.rect_stroke(
+                Rect::from_center_size(center + vec2(0.0, -4.0), vec2(11.0, 8.0)),
+                0.0,
+                stroke,
+                StrokeKind::Inside,
+            );
+            painter.rect_stroke(
+                Rect::from_center_size(center + vec2(0.0, 4.0), vec2(15.0, 8.0)),
+                2.0,
+                stroke,
+                StrokeKind::Inside,
+            );
+        }
+        ToolbarIcon::Export => {
+            painter.rect_stroke(
+                Rect::from_center_size(center + vec2(0.0, 3.0), vec2(13.0, 10.0)),
+                1.0,
+                stroke,
+                StrokeKind::Inside,
+            );
+            painter.line_segment([center + vec2(0.0, 3.0), center + vec2(0.0, -7.0)], stroke);
+            painter.line_segment(
+                [center + vec2(0.0, -7.0), center + vec2(-3.0, -4.0)],
+                stroke,
+            );
+            painter.line_segment([center + vec2(0.0, -7.0), center + vec2(3.0, -4.0)], stroke);
+        }
+        ToolbarIcon::Save => {
+            let body = Rect::from_center_size(center, vec2(14.0, 14.0));
+            painter.rect_stroke(body, 1.0, stroke, StrokeKind::Inside);
+            painter.rect_stroke(
+                Rect::from_min_max(
+                    body.left_top() + vec2(3.0, 0.0),
+                    body.right_top() + vec2(-2.0, 5.0),
+                ),
+                0.0,
+                stroke,
+                StrokeKind::Inside,
+            );
+            painter.rect_stroke(
+                Rect::from_min_max(
+                    body.left_bottom() + vec2(3.0, -6.0),
+                    body.right_bottom() + vec2(-3.0, -2.0),
+                ),
+                0.0,
+                stroke,
+                StrokeKind::Inside,
+            );
+        }
+        ToolbarIcon::OpenWith => {
+            painter.rect_stroke(
+                Rect::from_center_size(center + vec2(-2.0, 2.0), vec2(12.0, 12.0)),
+                2.0,
+                stroke,
+                StrokeKind::Inside,
+            );
+            painter.line_segment([center + vec2(0.0, 0.0), center + vec2(7.0, -7.0)], stroke);
+            painter.line_segment([center + vec2(7.0, -7.0), center + vec2(3.0, -7.0)], stroke);
+            painter.line_segment([center + vec2(7.0, -7.0), center + vec2(7.0, -3.0)], stroke);
+        }
+        ToolbarIcon::Folder => {
+            let body = Rect::from_min_max(center + vec2(-8.0, -3.0), center + vec2(8.0, 6.0));
+            painter.rect_stroke(body, 2.0, stroke, StrokeKind::Inside);
+            painter.line_segment(
+                [center + vec2(-7.0, -3.0), center + vec2(-4.0, -6.0)],
+                stroke,
+            );
+            painter.line_segment(
+                [center + vec2(-4.0, -6.0), center + vec2(1.0, -6.0)],
+                stroke,
+            );
+            painter.line_segment([center + vec2(1.0, -6.0), center + vec2(3.0, -3.0)], stroke);
+        }
+        ToolbarIcon::Settings => {
+            painter.circle_stroke(center, 6.0, stroke);
+            painter.circle_stroke(center, 2.0, stroke);
+            for angle in [0.0_f32, 90.0, 180.0, 270.0] {
+                let radians = angle.to_radians();
+                let direction = vec2(radians.cos(), radians.sin());
+                painter.line_segment([center + direction * 6.0, center + direction * 8.0], stroke);
+            }
+        }
+    }
+}
+
+fn path_breadcrumbs(ui: &mut egui::Ui, path: Option<&Path>) -> Option<BreadcrumbAction> {
     let Some(path) = path else {
         ui.label(
             RichText::new("No document open")
                 .size(13.0)
                 .color(theme::MUTED),
         );
-        return false;
+        return None;
     };
 
     let full_path = path.display().to_string();
-    let mut copy_requested = false;
+    let mut action = None;
+    let mut cumulative = PathBuf::from("/");
     let mut parts = path.components().peekable();
     while let Some(component) = parts.next() {
         let label = match component {
             std::path::Component::RootDir => continue,
             _ => component.as_os_str().to_string_lossy().into_owned(),
         };
+        cumulative.push(component.as_os_str());
+        let is_last = parts.peek().is_none();
         let response = ui
             .add(
                 egui::Button::new(
@@ -3327,9 +4525,19 @@ fn path_breadcrumbs(ui: &mut egui::Ui, path: Option<&Path>) -> bool {
                 .frame(false)
                 .corner_radius(CornerRadius::same(4)),
             )
-            .on_hover_text(format!("Click to copy\n{full_path}"));
-        copy_requested |= response.clicked();
-        if parts.peek().is_some() {
+            .on_hover_text(if is_last {
+                format!("Copy path\n{full_path}")
+            } else {
+                format!("Browse PDFs in {}", cumulative.display())
+            });
+        if response.clicked() {
+            action = Some(if is_last {
+                BreadcrumbAction::Copy(path.to_path_buf())
+            } else {
+                BreadcrumbAction::Browse(cumulative.clone())
+            });
+        }
+        if !is_last {
             ui.label(
                 RichText::new("/")
                     .size(13.0)
@@ -3337,7 +4545,11 @@ fn path_breadcrumbs(ui: &mut egui::Ui, path: Option<&Path>) -> bool {
             );
         }
     }
-    copy_requested
+    action
+}
+
+fn chrome_zoom(document_zoom: f32, ratio: f32) -> f32 {
+    (document_zoom * ratio).clamp(0.28, 5.0)
 }
 
 fn screen_point_to_pdf(point: egui::Pos2, page_rect: Rect, source_size: [f32; 2]) -> [f32; 2] {
@@ -3491,10 +4703,7 @@ fn paint_annotations(
     // Comments are deliberately painted last, above highlights and drawings.
     for annotation in annotations {
         if let AnnotationKind::Note {
-            position,
-            text,
-            color,
-            ..
+            position, color, ..
         } = &annotation.kind
         {
             let center = pdf_point_to_screen(*position, page_rect, source_size);
@@ -3523,13 +4732,6 @@ fn paint_annotations(
                     Color32::from_rgb(38, 38, 42),
                 );
             }
-            painter.text(
-                pos2(center.x + 12.0, center.y),
-                Align2::LEFT_CENTER,
-                elide(text, 28),
-                FontId::proportional(11.5),
-                Color32::from_rgb(38, 38, 42),
-            );
         }
     }
 }
@@ -3540,8 +4742,10 @@ fn annotation_context_menu(
     page_rect: Rect,
     source_size: [f32; 2],
     erase_on_click: bool,
-) -> Option<AnnotationContextAction> {
+) -> AnnotationUiResult {
     let mut action = None;
+    let mut hovered_comment = None;
+    let mut clicked_comment = None;
     for annotation in annotations {
         let Some(rect) = annotation_screen_rect(annotation, page_rect, source_size) else {
             continue;
@@ -3554,6 +4758,14 @@ fn annotation_context_menu(
         if erase_on_click && response.clicked() {
             action = Some(AnnotationContextAction::Delete(annotation.id));
         }
+        if matches!(&annotation.kind, AnnotationKind::Note { .. }) {
+            if response.hovered() {
+                hovered_comment = Some(annotation.id);
+            }
+            if response.clicked() && !erase_on_click {
+                clicked_comment = Some(annotation.id);
+            }
+        }
         let child_comment = annotations.iter().find_map(|candidate| {
             matches!(
                 &candidate.kind,
@@ -3564,50 +4776,63 @@ fn annotation_context_menu(
             )
             .then_some(candidate.id)
         });
-        response.context_menu(|ui| {
-            let (kind, delete_label) = match &annotation.kind {
-                AnnotationKind::Highlight { .. } => ("HIGHLIGHT", "Delete highlight"),
-                AnnotationKind::Ink { .. } => ("DRAWING", "Delete drawing"),
-                AnnotationKind::Note { .. } => ("COMMENT", "Delete comment"),
-                AnnotationKind::TextBox { .. } => ("TEXT BOX", "Delete text box"),
-                AnnotationKind::Shape { .. } => ("SHAPE", "Delete shape"),
-                AnnotationKind::Stamp { .. } => ("STAMP", "Delete stamp"),
-                AnnotationKind::Attachment { .. } => ("ATTACHMENT", "Delete attachment"),
-            };
-            ui.label(RichText::new(kind).size(10.5).strong().color(theme::MUTED));
-            ui.add_space(3.0);
-            if matches!(&annotation.kind, AnnotationKind::Highlight { .. }) {
-                let label = if child_comment.is_some() {
-                    "Edit comment"
-                } else {
-                    "Add comment"
+        egui::Popup::context_menu(&response)
+            .width(184.0)
+            .frame(
+                Frame::new()
+                    .fill(Color32::from_rgb(29, 29, 29))
+                    .stroke(Stroke::new(1.0, Color32::from_rgb(65, 65, 65)))
+                    .corner_radius(CornerRadius::same(7))
+                    .inner_margin(Margin::same(5)),
+            )
+            .show(|ui| {
+                let (kind, delete_label) = match &annotation.kind {
+                    AnnotationKind::Highlight { .. } => ("HIGHLIGHT", "Delete highlight"),
+                    AnnotationKind::Ink { .. } => ("DRAWING", "Delete drawing"),
+                    AnnotationKind::Note { .. } => ("COMMENT", "Delete comment"),
+                    AnnotationKind::TextBox { .. } => ("TEXT BOX", "Delete text box"),
+                    AnnotationKind::Shape { .. } => ("SHAPE", "Delete shape"),
+                    AnnotationKind::Stamp { .. } => ("STAMP", "Delete stamp"),
+                    AnnotationKind::Attachment { .. } => ("ATTACHMENT", "Delete attachment"),
                 };
-                if popup_menu_row(ui, label, Color32::from_rgb(225, 227, 234)) {
-                    if let Some(comment_id) = child_comment {
-                        action = Some(AnnotationContextAction::EditComment(comment_id));
-                    } else if let Some(position) = annotation_comment_position(annotation) {
-                        action = Some(AnnotationContextAction::AddComment {
-                            page: annotation.page,
-                            position,
-                            parent: Some(annotation.id),
-                        });
+                ui.label(RichText::new(kind).size(10.5).strong().color(theme::MUTED));
+                ui.add_space(3.0);
+                if matches!(&annotation.kind, AnnotationKind::Highlight { .. }) {
+                    let label = if child_comment.is_some() {
+                        "Edit comment"
+                    } else {
+                        "Add comment"
+                    };
+                    if popup_menu_row(ui, label, Color32::from_rgb(225, 227, 234)) {
+                        if let Some(comment_id) = child_comment {
+                            action = Some(AnnotationContextAction::EditComment(comment_id));
+                        } else if let Some(position) = annotation_comment_position(annotation) {
+                            action = Some(AnnotationContextAction::AddComment {
+                                page: annotation.page,
+                                position,
+                                parent: Some(annotation.id),
+                            });
+                        }
+                        ui.close();
                     }
+                }
+                if matches!(&annotation.kind, AnnotationKind::Note { .. })
+                    && popup_menu_row(ui, "Edit comment", Color32::from_rgb(225, 227, 234))
+                {
+                    action = Some(AnnotationContextAction::EditComment(annotation.id));
                     ui.close();
                 }
-            }
-            if matches!(&annotation.kind, AnnotationKind::Note { .. })
-                && popup_menu_row(ui, "Edit comment", Color32::from_rgb(225, 227, 234))
-            {
-                action = Some(AnnotationContextAction::EditComment(annotation.id));
-                ui.close();
-            }
-            if popup_menu_row(ui, delete_label, Color32::from_rgb(238, 126, 132)) {
-                action = Some(AnnotationContextAction::Delete(annotation.id));
-                ui.close();
-            }
-        });
+                if popup_menu_row(ui, delete_label, Color32::from_rgb(238, 126, 132)) {
+                    action = Some(AnnotationContextAction::Delete(annotation.id));
+                    ui.close();
+                }
+            });
     }
-    action
+    AnnotationUiResult {
+        action,
+        hovered_comment,
+        clicked_comment,
+    }
 }
 
 fn annotation_screen_rect(
