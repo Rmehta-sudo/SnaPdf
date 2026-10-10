@@ -239,6 +239,8 @@ pub struct SnapPdfApp {
     frame_number: u64,
     zoom: f32,
     current_page: usize,
+    page_entry: String,
+    page_entry_editing: bool,
     sidebar_search: String,
     status: String,
     renderer_ready: bool,
@@ -270,6 +272,10 @@ pub struct SnapPdfApp {
     presentation_mode: bool,
     /// The document zoom to restore after leaving Reader or Presentation mode.
     mode_zoom_restore: Option<f32>,
+    /// The chrome scale to restore after a temporary focus-mode zoom.
+    mode_ui_scale_restore: Option<f32>,
+    presentation_fit_height_requested: bool,
+    presentation_fit_delay_frames: u8,
     outline: Vec<PdfOutlineItem>,
     collapsed_outline_items: HashSet<usize>,
     open_with_path: Option<PathBuf>,
@@ -346,6 +352,8 @@ impl SnapPdfApp {
             frame_number: 0,
             zoom: 1.0,
             current_page: 0,
+            page_entry: "1".to_owned(),
+            page_entry_editing: false,
             sidebar_search: String::new(),
             status: "Preparing PDF renderer...".to_owned(),
             renderer_ready: false,
@@ -376,6 +384,9 @@ impl SnapPdfApp {
             reader_mode: false,
             presentation_mode: false,
             mode_zoom_restore: None,
+            mode_ui_scale_restore: None,
+            presentation_fit_height_requested: false,
+            presentation_fit_delay_frames: 0,
             outline: Vec::new(),
             collapsed_outline_items: HashSet::new(),
             open_with_path: None,
@@ -1220,10 +1231,11 @@ impl SnapPdfApp {
                 .sum::<usize>()
     }
 
-    fn set_reader_mode(&mut self, enabled: bool) {
+    fn set_reader_mode(&mut self, ctx: &egui::Context, enabled: bool) {
         if enabled {
             if self.mode_zoom_restore.is_none() {
                 self.mode_zoom_restore = Some(self.zoom);
+                self.mode_ui_scale_restore = Some(self.state.ui_scale);
             }
             self.reader_mode = true;
             self.sidebar_visible = false;
@@ -1235,6 +1247,11 @@ impl SnapPdfApp {
             if let Some(zoom) = self.mode_zoom_restore.take() {
                 self.zoom = zoom;
             }
+            if let Some(scale) = self.mode_ui_scale_restore.take() {
+                self.state.ui_scale = scale;
+                ctx.set_zoom_factor(chrome_zoom(scale, self.state.chrome_scale_ratio));
+                self.persist();
+            }
         }
     }
 
@@ -1242,9 +1259,12 @@ impl SnapPdfApp {
         if enabled {
             if self.mode_zoom_restore.is_none() {
                 self.mode_zoom_restore = Some(self.zoom);
+                self.mode_ui_scale_restore = Some(self.state.ui_scale);
             }
             self.presentation_mode = true;
-            self.set_reader_mode(true);
+            self.presentation_fit_height_requested = true;
+            self.presentation_fit_delay_frames = 1;
+            self.set_reader_mode(ctx, true);
         } else {
             self.presentation_mode = false;
             self.reader_mode = false;
@@ -1253,6 +1273,13 @@ impl SnapPdfApp {
             if let Some(zoom) = self.mode_zoom_restore.take() {
                 self.zoom = zoom;
             }
+            if let Some(scale) = self.mode_ui_scale_restore.take() {
+                self.state.ui_scale = scale;
+                ctx.set_zoom_factor(chrome_zoom(scale, self.state.chrome_scale_ratio));
+                self.persist();
+            }
+            self.presentation_fit_height_requested = false;
+            self.presentation_fit_delay_frames = 0;
         }
         ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(enabled));
     }
@@ -1271,26 +1298,37 @@ impl SnapPdfApp {
         let redo = KeyboardShortcut::new(Modifiers::CTRL | Modifiers::SHIFT, Key::Z);
 
         if self.presentation_mode {
-            let (exit, previous, next) = ctx.input_mut(|input| {
-                (
-                    input.consume_key(Modifiers::NONE, Key::Escape),
-                    input.consume_key(Modifiers::NONE, Key::Backspace)
-                        || input.consume_key(Modifiers::NONE, Key::ArrowLeft)
-                        || input.consume_key(Modifiers::NONE, Key::K),
-                    input.consume_key(Modifiers::NONE, Key::Space)
-                        || input.consume_key(Modifiers::NONE, Key::ArrowRight)
-                        || input.consume_key(Modifiers::NONE, Key::J),
-                )
-            });
+            let (exit, previous, next, zoom_in_pressed, zoom_out_pressed) =
+                ctx.input_mut(|input| {
+                    (
+                        input.consume_key(Modifiers::NONE, Key::Escape),
+                        input.consume_key(Modifiers::NONE, Key::Backspace)
+                            || input.consume_key(Modifiers::NONE, Key::ArrowLeft)
+                            || input.consume_key(Modifiers::NONE, Key::K),
+                        input.consume_key(Modifiers::NONE, Key::Space)
+                            || input.consume_key(Modifiers::NONE, Key::ArrowRight)
+                            || input.consume_key(Modifiers::NONE, Key::J),
+                        input.consume_shortcut(&zoom_in),
+                        input.consume_shortcut(&zoom_out),
+                    )
+                });
             if exit {
                 self.set_presentation_mode(ctx, false);
             } else if previous {
                 self.current_page = self.current_page.saturating_sub(1);
                 self.jump_to_page = None;
+                self.presentation_fit_height_requested = true;
+                self.presentation_fit_delay_frames = 1;
             } else if next && !self.page_sizes.is_empty() {
                 self.current_page =
                     (self.current_page + 1).min(self.page_sizes.len().saturating_sub(1));
                 self.jump_to_page = None;
+                self.presentation_fit_height_requested = true;
+                self.presentation_fit_delay_frames = 1;
+            } else if zoom_in_pressed {
+                self.zoom = (self.zoom * 1.1).min(8.0);
+            } else if zoom_out_pressed {
+                self.zoom = (self.zoom / 1.1).max(self.mode_zoom_restore.unwrap_or(self.zoom));
             }
             return;
         }
@@ -1298,7 +1336,7 @@ impl SnapPdfApp {
         if self.reader_mode
             && ctx.input_mut(|input| input.consume_key(Modifiers::NONE, Key::Escape))
         {
-            self.set_reader_mode(false);
+            self.set_reader_mode(ctx, false);
             return;
         }
 
@@ -1331,7 +1369,9 @@ impl SnapPdfApp {
                 self.state.ui_scale,
                 self.state.chrome_scale_ratio,
             ));
-            self.persist();
+            if !self.reader_mode {
+                self.persist();
+            }
         }
         if ctx.input_mut(|input| input.consume_shortcut(&zoom_out)) {
             let previous = self.state.ui_scale;
@@ -1341,7 +1381,9 @@ impl SnapPdfApp {
                 self.state.ui_scale,
                 self.state.chrome_scale_ratio,
             ));
-            self.persist();
+            if !self.reader_mode {
+                self.persist();
+            }
         }
         if ctx.input_mut(|input| input.consume_shortcut(&copy))
             && let Some(text) = self.selected_text()
@@ -1684,6 +1726,18 @@ impl SnapPdfApp {
                     }
                 });
                 ui.add_space(4.0);
+                egui::Panel::bottom("sidebar-settings-footer")
+                    .exact_size(30.0)
+                    .frame(Frame::new().inner_margin(Margin::symmetric(0, 3)))
+                    .show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            if icon_button(ui, ToolbarIcon::Settings, false, true, "View settings")
+                                .clicked()
+                            {
+                                self.show_view_settings = true;
+                            }
+                        });
+                    });
                 if self.sidebar_tab == SidebarTab::Contents {
                     self.outline_sidebar(ui);
                     return;
@@ -2428,50 +2482,6 @@ impl SnapPdfApp {
                                 {
                                     self.request_open_with(path);
                                 }
-                                if icon_button(
-                                    ui,
-                                    ToolbarIcon::Settings,
-                                    false,
-                                    true,
-                                    "View settings",
-                                )
-                                .clicked()
-                                {
-                                    self.show_view_settings = true;
-                                }
-                                if icon_button(
-                                    ui,
-                                    ToolbarIcon::Reader,
-                                    false,
-                                    true,
-                                    "Reader mode — hide the sidebar and toolbar",
-                                )
-                                .clicked()
-                                {
-                                    self.set_reader_mode(true);
-                                }
-                                if icon_button(
-                                    ui,
-                                    ToolbarIcon::Present,
-                                    false,
-                                    true,
-                                    "Presentation mode — full screen",
-                                )
-                                .clicked()
-                                {
-                                    self.set_presentation_mode(ui.ctx(), true);
-                                }
-                                if icon_button(
-                                    ui,
-                                    ToolbarIcon::CollapseToolbar,
-                                    false,
-                                    true,
-                                    "Hide toolbar",
-                                )
-                                .clicked()
-                                {
-                                    self.toolbar_visible = false;
-                                }
                             }
                         });
                     });
@@ -2524,15 +2534,29 @@ impl SnapPdfApp {
                                 ui.separator();
                                 ui.add_space(5.0);
                                 if !self.page_sizes.is_empty() {
-                                    let mut page = self.current_page + 1;
+                                    if !self.page_entry_editing {
+                                        self.page_entry = (self.current_page + 1).to_string();
+                                    }
                                     let response = ui.add_sized(
-                                        [38.0, 20.0],
-                                        egui::DragValue::new(&mut page)
-                                            .range(1..=self.page_sizes.len())
-                                            .speed(1),
+                                        [42.0, 20.0],
+                                        egui::TextEdit::singleline(&mut self.page_entry)
+                                            .horizontal_align(Align::Center)
+                                            .margin(Margin::symmetric(4, 2)),
                                     );
-                                    if response.changed() {
-                                        self.jump_to_page = Some(page.saturating_sub(1));
+                                    self.page_entry_editing = response.has_focus();
+                                    if response.changed()
+                                        && let Ok(page) = self.page_entry.trim().parse::<usize>()
+                                        && (1..=self.page_sizes.len()).contains(&page)
+                                    {
+                                        self.jump_to_page = Some(page - 1);
+                                    }
+                                    if response.lost_focus()
+                                        && !response.has_focus()
+                                        && !self.page_entry.trim().parse::<usize>().is_ok_and(
+                                            |page| (1..=self.page_sizes.len()).contains(&page),
+                                        )
+                                    {
+                                        self.page_entry = (self.current_page + 1).to_string();
                                     }
                                     ui.label(
                                         RichText::new(format!("of {}", self.page_sizes.len()))
@@ -2653,6 +2677,40 @@ impl SnapPdfApp {
                                 }
                                 ui.separator();
                                 ui.color_edit_button_srgba(&mut self.annotation_color);
+                                ui.separator();
+                                if icon_button(
+                                    ui,
+                                    ToolbarIcon::Reader,
+                                    false,
+                                    true,
+                                    "Reader mode — hide the sidebar and toolbar",
+                                )
+                                .clicked()
+                                {
+                                    self.set_reader_mode(ui.ctx(), true);
+                                }
+                                if icon_button(
+                                    ui,
+                                    ToolbarIcon::Present,
+                                    false,
+                                    true,
+                                    "Presentation mode — full screen",
+                                )
+                                .clicked()
+                                {
+                                    self.set_presentation_mode(ui.ctx(), true);
+                                }
+                                if icon_button(
+                                    ui,
+                                    ToolbarIcon::CollapseToolbar,
+                                    false,
+                                    true,
+                                    "Hide toolbar",
+                                )
+                                .clicked()
+                                {
+                                    self.toolbar_visible = false;
+                                }
                             });
                         });
                 }
@@ -2723,6 +2781,18 @@ impl SnapPdfApp {
                     let first_width = self.page_sizes[0][0].max(1.0);
                     self.zoom = (available_page_width / first_width).clamp(0.4, 3.0);
                     self.fit_width_requested = false;
+                }
+                if self.presentation_fit_height_requested {
+                    if self.presentation_fit_delay_frames > 0 {
+                        self.presentation_fit_delay_frames -= 1;
+                        ctx.request_repaint();
+                    } else if let Some(size) = self.page_sizes.get(self.current_page) {
+                        // Presentation has no chrome: every newly shown page is
+                        // independently fit to the available screen height.
+                        self.zoom = ((ui.available_height() - 2.0) / size[1].max(1.0))
+                            .clamp(0.2, 8.0);
+                        self.presentation_fit_height_requested = false;
+                    }
                 }
 
                 let pixels_per_point = ctx.pixels_per_point();
@@ -3288,7 +3358,7 @@ impl SnapPdfApp {
                             )
                             .clicked()
                             {
-                                self.set_reader_mode(false);
+                                self.set_reader_mode(ctx, false);
                             }
                         } else if mini_mode_icon_button(
                             ui,
@@ -3708,8 +3778,8 @@ impl SnapPdfApp {
             .open(&mut open)
             .anchor(Align2::CENTER_CENTER, vec2(0.0, 0.0))
             .collapsible(false)
-            .resizable(true)
-            .default_size([520.0, 310.0])
+            .resizable(false)
+            .fixed_size(vec2(560.0, 350.0))
             .show(ctx, |ui| {
                 ui.horizontal(|ui| {
                     if popup.busy {
@@ -3718,10 +3788,23 @@ impl SnapPdfApp {
                     ui.label(RichText::new(&popup.detail).size(12.0).color(theme::MUTED));
                 });
                 ui.add_space(6.0);
-                ui.add_sized(
-                    [ui.available_width(), 220.0],
-                    egui::TextEdit::multiline(&mut popup.text)
-                        .hint_text("Recognized text will appear here..."),
+                // A fixed scroll region keeps the action row in view even when
+                // OCR returns several pages of text.
+                ui.allocate_ui_with_layout(
+                    vec2(ui.available_width(), 230.0),
+                    Layout::top_down(Align::Min),
+                    |ui| {
+                        ScrollArea::vertical()
+                            .id_salt("ocr-result-text-scroll")
+                            .show(ui, |ui| {
+                                ui.add(
+                                    egui::TextEdit::multiline(&mut popup.text)
+                                        .desired_width(ui.available_width())
+                                        .desired_rows(12)
+                                        .hint_text("Recognized text will appear here..."),
+                                );
+                            });
+                    },
                 );
                 ui.horizontal(|ui| {
                     if ui
