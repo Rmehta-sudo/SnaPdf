@@ -84,7 +84,7 @@ pub struct PdfFileSearchMatches {
 ///
 /// PDFium is process-global and can only be initialised once, so a second PDFium
 /// worker silently fails after the viewer has started. `pdftotext` is already
-/// provided by Poppler on Ubuntu and gives this background scan its own parser.
+/// provided by Poppler and gives this background scan its own parser.
 pub fn search_pdf_files(
     paths: &[PathBuf],
     query: &str,

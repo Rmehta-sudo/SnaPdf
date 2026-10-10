@@ -6,6 +6,31 @@ BIN_DIR="${HOME}/.local/bin"
 APP_DIR="${HOME}/.local/share/applications"
 ICON_DIR="${HOME}/.local/share/icons/hicolor/scalable/apps"
 
+ensure_system_dependencies() {
+  if ! command -v apt-get >/dev/null 2>&1; then
+    return
+  fi
+  echo "Installing Linux build dependencies (your password may be requested)..."
+  sudo apt-get update
+  sudo apt-get install -y \
+    build-essential pkg-config curl ca-certificates \
+    libfontconfig1-dev libfreetype6-dev libxkbcommon-dev libwayland-dev \
+    libx11-dev libxrandr-dev libxi-dev libgl1-mesa-dev libgtk-3-dev
+}
+
+if ! command -v cargo >/dev/null 2>&1; then
+  ensure_system_dependencies
+  echo "Installing the Rust toolchain..."
+  curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+  export PATH="${HOME}/.cargo/bin:${PATH}"
+fi
+
+if ! command -v uv >/dev/null 2>&1 && [[ ! -x "${HOME}/.local/bin/uv" ]]; then
+  echo "Installing the local OCR runtime..."
+  curl -LsSf https://astral.sh/uv/install.sh | sh
+fi
+export PATH="${HOME}/.local/bin:${HOME}/.cargo/bin:${PATH}"
+
 if [[ ! -x "${PROJECT_ROOT}/target/release/snappdf" ]]; then
   echo "Release binary not found; building it now."
   (cd "${PROJECT_ROOT}" && cargo build --release)

@@ -2,7 +2,7 @@
 name = "snappdf"
 version = "0.1.0"
 edition = "2024"
-description = "A fast, project-oriented PDF viewer for Ubuntu"
+description = "A fast, project-oriented PDF viewer for Linux"
 license = "MIT"
 
 [dependencies]

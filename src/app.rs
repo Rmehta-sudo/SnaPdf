@@ -1632,7 +1632,7 @@ impl SnapPdfApp {
                     .inner_margin(Margin::symmetric(4, 10)),
             )
             .show(root, |ui| {
-                ui.vertical_centered(|ui| {
+                ui.with_layout(Layout::top_down(Align::Center), |ui| {
                     let files = rail_button(
                         ui,
                         self.sidebar_visible && self.sidebar_tab == SidebarTab::Library,
@@ -1681,6 +1681,14 @@ impl SnapPdfApp {
                         }
                     }
                 });
+                ui.with_layout(Layout::bottom_up(Align::Center), |ui| {
+                    if rail_button(ui, false, RailIcon::Settings)
+                        .on_hover_text("View settings")
+                        .clicked()
+                    {
+                        self.show_view_settings = true;
+                    }
+                });
             });
     }
 
@@ -1726,18 +1734,6 @@ impl SnapPdfApp {
                     }
                 });
                 ui.add_space(4.0);
-                egui::Panel::bottom("sidebar-settings-footer")
-                    .exact_size(30.0)
-                    .frame(Frame::new().inner_margin(Margin::symmetric(0, 3)))
-                    .show(ui, |ui| {
-                        ui.horizontal(|ui| {
-                            if icon_button(ui, ToolbarIcon::Settings, false, true, "View settings")
-                                .clicked()
-                            {
-                                self.show_view_settings = true;
-                            }
-                        });
-                    });
                 if self.sidebar_tab == SidebarTab::Contents {
                     self.outline_sidebar(ui);
                     return;
@@ -2188,13 +2184,6 @@ impl SnapPdfApp {
     }
 
     fn search_sidebar(&mut self, ui: &mut egui::Ui) {
-        ScrollArea::vertical()
-            .id_salt("search-results-scroll")
-            .auto_shrink([false, false])
-            .show(ui, |ui| self.search_sidebar_contents(ui));
-    }
-
-    fn search_sidebar_contents(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
             ui.label(
                 RichText::new("SEARCH")
@@ -2245,6 +2234,13 @@ impl SnapPdfApp {
             }
         });
         ui.add_space(10.0);
+        ScrollArea::vertical()
+            .id_salt("search-results-scroll")
+            .auto_shrink([false, false])
+            .show(ui, |ui| self.search_results(ui));
+    }
+
+    fn search_results(&mut self, ui: &mut egui::Ui) {
         if self.search_query.trim().is_empty() {
             ui.label(
                 RichText::new(
@@ -3330,9 +3326,14 @@ impl SnapPdfApp {
             return;
         }
         let bounds = ctx.content_rect();
+        let control_x = if self.presentation_mode || self.reader_mode {
+            bounds.left() + 8.0
+        } else {
+            bounds.right() - 34.0
+        };
         egui::Area::new(egui::Id::new("reading-mode-controls"))
             .order(egui::Order::Foreground)
-            .fixed_pos(pos2(bounds.left() + 8.0, bounds.top() + 8.0))
+            .fixed_pos(pos2(control_x, bounds.top() + 8.0))
             .show(ctx, |ui| {
                 Frame::new()
                     .fill(Color32::from_rgba_unmultiplied(29, 29, 29, 232))
@@ -4089,6 +4090,7 @@ enum RailIcon {
     Files,
     Contents,
     Search,
+    Settings,
 }
 
 fn rail_button(ui: &mut egui::Ui, selected: bool, icon: RailIcon) -> Response {
@@ -4138,6 +4140,9 @@ fn rail_button(ui: &mut egui::Ui, selected: bool, icon: RailIcon) -> Response {
                 ],
                 Stroke::new(1.6, color),
             );
+        }
+        RailIcon::Settings => {
+            paint_toolbar_icon(ui.painter(), center, ToolbarIcon::Settings, color)
         }
     }
     response
