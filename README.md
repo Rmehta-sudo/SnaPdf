@@ -22,14 +22,16 @@ In short, SnaPdf is not just another PDF viewer. It is a fast, filesystem-first 
 
 ### Arch Linux (AUR)
 
-Install the lowercase package name with any AUR helper:
+The validated AUR recipe is included in [`packaging/aur`](packaging/aur). Once the `snapdf` package
+is published on the AUR, install the lowercase package name with any AUR helper:
 
 ```bash
 yay -S snapdf
 ```
 
 The package installs the visible **SnaPdf** application and the `snapdf` command. Package names in
-the AUR and pacman are lowercase even though the application name is styled **SnaPdf**.
+the AUR and pacman are lowercase even though the application name is styled **SnaPdf**. Until the
+initial AUR submission is visible, use the checksum-verified installer below.
 
 ### Install SnaPdf — no Git or development tools
 
