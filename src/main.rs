@@ -1,4 +1,5 @@
 mod app;
+mod chat;
 mod gestures;
 mod model;
 mod ocr;

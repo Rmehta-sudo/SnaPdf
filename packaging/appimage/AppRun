@@ -11,12 +11,13 @@ register_desktop_entry() {
     applications_dir="$data_home/applications"
     icons_dir="$data_home/icons/hicolor/scalable/apps"
     desktop_file="$applications_dir/$APP_ID.desktop"
-    expected_exec="Exec=\"$APPIMAGE\" %F"
+    launcher="${SNAPPDF_EXECUTABLE:-$APPIMAGE}"
+    expected_exec="Exec=\"$launcher\" %F"
 
     if [ ! -f "$desktop_file" ] || ! grep -Fqx "$expected_exec" "$desktop_file"; then
         mkdir -p "$applications_dir" "$icons_dir"
-        escaped_appimage="$(printf '%s' "$APPIMAGE" | sed 's/[&|]/\\&/g')"
-        sed "s|@EXEC@|\"$escaped_appimage\"|g" \
+        escaped_launcher="$(printf '%s' "$launcher" | sed 's/[&|]/\\&/g')"
+        sed "s|@EXEC@|\"$escaped_launcher\"|g" \
             "$APPDIR/usr/share/snappdf/$APP_ID.desktop" > "$desktop_file"
         cp "$APPDIR/usr/share/icons/hicolor/scalable/apps/$APP_ID.svg" \
             "$icons_dir/$APP_ID.svg"
@@ -33,4 +34,7 @@ if [ "${1:-}" = "--install-ocr" ]; then
 fi
 
 register_desktop_entry
+if [ "${1:-}" = "--register-only" ]; then
+    exit 0
+fi
 exec "$APPDIR/usr/bin/snappdf" "$@"

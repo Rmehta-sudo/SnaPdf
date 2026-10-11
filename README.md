@@ -12,12 +12,34 @@ Normal PDF viewers are excellent for one document at a time. Managing dozens of 
 - **Search with context.** Search the current document, every open tab, or every nested PDF in the current project.
 - **Reading and annotation tools.** Select and copy text, follow links, highlight, comment, draw, add shapes or text, export annotations, and use Reader or Presentation mode.
 - **Offline OCR.** Capture a region with Snip OCR, inspect its local result in a scrollable dialog, then choose whether to copy it. Math OCR is available as an experimental option.
+- **A study assistant beside the page.** Open ChatGPT or Gemini on the right, choose a model, and ask questions with an OCR text snip, a captured PDF figure, an image, or an entire PDF attached.
 
 **No imports, duplicate files, or cloud storage are required.** Your PDFs stay in their original locations; SnapPDF simply makes them easier to navigate, read, search, and return to.
 
 In short, SnapPDF is not just another PDF viewer. It is a fast, filesystem-first workspace for managing and reading PDFs across multiple projects.
 
-## Install SnapPDF
+## Install SnapPDF — no Git or development tools
+
+The recommended installation is the portable, checksum-verified AppImage. It installs only for your user account: no Rust, Cargo, compiler, `apt`, administrator password, or repository clone is needed.
+
+### Easiest safe installation
+
+Download the small installer, inspect it if you wish, then run it:
+
+```bash
+curl --proto '=https' --tlsv1.2 -fLO \
+  https://github.com/Rmehta-sudo/Snapdf/releases/latest/download/install-snappdf.sh
+less install-snappdf.sh
+sh install-snappdf.sh
+```
+
+The installer discovers the latest release, downloads the AppImage and its published `SHA256SUMS`, refuses to continue unless the checksum matches, and places SnapPDF under your home directory. It also creates the application-menu entry and icon. It never uses `sudo` and does not modify system directories.
+
+Afterward, open **SnapPDF** from the application menu and pin it to your dock, or run `snappdf` from a terminal. You can delete the downloaded `install-snappdf.sh` once installation finishes.
+
+Portable releases currently target **x86_64 Linux desktops**. The launcher uses AppImage's extract-and-run mode, so it does not require FUSE. Other CPU architectures can still use the source build until matching portable releases are added.
+
+### Install the AppImage manually
 
 Download the latest `SnapPDF-…-x86_64.AppImage` from the [SnapPDF releases page](https://github.com/Rmehta-sudo/Snapdf/releases/latest), then make it executable and open it:
 
@@ -26,7 +48,9 @@ chmod +x SnapPDF-*.AppImage
 ./SnapPDF-*.AppImage
 ```
 
-That is the complete installation for the PDF workspace. You do **not** need Rust, Cargo, a compiler, `apt`, administrator access, or a cloned repository. On first launch SnapPDF registers its application entry and icon for your user account, so you can find it in the application menu and pin it to your dock. If you move the AppImage later, launch it once from the new location to refresh that entry.
+For a manual integrity check, download `SHA256SUMS` from the same release into the same directory and run `sha256sum --check --ignore-missing SHA256SUMS` before opening the AppImage.
+
+That is the complete installation for the PDF workspace. On first launch SnapPDF registers its application entry and icon for your user account, so you can find it in the application menu and pin it to your dock. If you move the AppImage later, launch it once from the new location to refresh that entry.
 
 To open a document directly, pass its path to the same file:
 
@@ -48,7 +72,7 @@ This downloads the OCR runtime into `~/.local/share/snappdf/ocr`; the OCR models
 
 To update, download the newer AppImage and replace the old one. To remove SnapPDF, delete its AppImage. Your PDFs are never moved or modified by installation.
 
-SnapPDF’s workspace state is stored at `~/.config/snappdf/state.json`; its optional OCR runtime and models are stored under `~/.local/share/snappdf/ocr`. Remove those directories too only if you also want to erase SnapPDF’s saved workspace and OCR data.
+SnapPDF’s workspace state is stored at `~/.config/snappdf/state.json`; connected study-chat credentials are stored separately at `~/.config/snappdf/chat-credentials.json` with owner-only permissions; its optional OCR runtime and models are stored under `~/.local/share/snappdf/ocr`. Remove those paths too only if you also want to erase saved workspace data, provider connections, and OCR data.
 
 ### Build and install from source
 
@@ -80,6 +104,19 @@ Click a segment in the path bar to browse that directory within SnapPDF. The bui
 Draw a rectangle with **Snip OCR** to recognize text locally. SnapPDF first uses the PDF’s embedded text layer when it is available, which is immediate and more accurate than re-reading rendered text. Otherwise it runs local OCR on a high-resolution crop. The result appears in a scrollable dialog; review it and click **Copy text** only when you want it on the clipboard.
 
 **Math OCR (experimental)** is intended for equations and formula-heavy regions. Its quality depends on the source scan, font, and equation layout; treat its result as text to review rather than a replacement for the source PDF.
+
+### Study chat
+
+Click the chat-bubble button in the document toolbar to open the resizable panel on the right. Choose a provider and model, then use it as a focused companion while reading—ordinary chat, not an autonomous agent.
+
+- **ChatGPT:** click **Continue with ChatGPT**. Sign-in happens in your normal browser through OpenAI's [official open-source account flow](https://developers.openai.com/siwc/token-sharing-open-source); SnapPDF never sees your password. Available models are loaded from your eligible account after sign-in.
+- **Gemini:** click **Connect Gemini** and paste a key created in [Google AI Studio](https://aistudio.google.com/app/apikey). Available Gemini models are loaded after the key is validated. A direct Google-account sign-in requires SnapPDF to have a registered Google OAuth client, so the portable open-source build deliberately uses the official user-owned API-key route instead of pretending to provide OAuth.
+
+Use the `＋` button in the composer to attach a PDF, image, or text file. **Attach current PDF** sends the document you are reading. The capture button beside it changes the cursor into a crosshair; drag around a diagram, equation, map, or paragraph and the exact rendered region is added as an image—without sending it through Math OCR.
+
+Select ordinary PDF text and click **Ask** to attach it directly. After a normal Snip OCR operation, click **Add to study chat** to do the same with recognized text; it is not copied to the clipboard. Attachments remain local until you press **Send**. Each provider keeps a separate on-screen conversation; when you send, SnapPDF transmits that conversation's history and chosen attachments to that provider so follow-up questions retain context. SnapPDF does not upload projects or PDFs in the background.
+
+`Enter` sends a chat message; `Shift+Enter` adds another line. Remove an attachment with its `×` before sending, or close the study panel without affecting the PDF.
 
 ### Search
 
@@ -134,9 +171,9 @@ The controls beside the annotation tools provide three focused views:
 ```text
 Snapdf/
 ├── packaging/    # AppImage launcher and packaging files
-├── src/          # Application, PDF rendering, storage, gestures, and OCR integration
+├── src/          # Application, PDF rendering, study chat, storage, gestures, and OCR integration
 ├── resources/    # Desktop launcher, application icon, and local OCR worker
-├── scripts/      # AppImage build, source install, OCR setup, and uninstall scripts
+├── scripts/      # Verified portable install, AppImage build, source install, OCR, and uninstall scripts
 ├── Cargo.toml    # Rust package definition
 └── README.md     # User guide
 ```

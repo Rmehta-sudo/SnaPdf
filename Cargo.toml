@@ -1,21 +1,28 @@
 [package]
 name = "snappdf"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
-description = "A fast, project-oriented PDF viewer for Linux"
+description = "A fast, project-oriented PDF reading workspace"
 license = "MIT"
 
 [dependencies]
 anyhow = "1.0"
+base64 = "0.22"
 crossbeam-channel = "0.5"
 dirs = "6.0"
 eframe = { version = "0.35.0", default-features = false, features = ["default_fonts", "glow", "wayland", "x11"] }
-image = { version = "0.25", default-features = false }
+image = { version = "0.25", default-features = false, features = ["png"] }
+jsonwebtoken = "9.3"
 pdfium-bundled = { version = "0.2", features = ["bundled"] }
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
 rfd = { version = "0.17.2", default-features = false, features = ["pollster", "xdg-portal"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
+sha2 = "0.10"
+url = "2.5"
+uuid = { version = "1.18", features = ["v4"] }
 walkdir = "2.5"
+webbrowser = "1.0"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 raw-window-handle = "0.6"

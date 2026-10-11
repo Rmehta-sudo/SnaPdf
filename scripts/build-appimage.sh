@@ -28,7 +28,7 @@ APPIMAGETOOL="${TOOLS_DIR}/appimagetool-${APPIMAGETOOL_VERSION}-${ARCH}.AppImage
 OUTPUT="${DIST_DIR}/SnapPDF-${VERSION}-${ARCH}.AppImage"
 
 echo "Building SnapPDF ${VERSION}..."
-(cd "${PROJECT_ROOT}" && cargo build --release --locked)
+(cd "${PROJECT_ROOT}" && cargo build --release --locked --jobs "${SNAPPDF_BUILD_JOBS:-2}")
 
 rm -rf "${APPDIR}"
 install -d \

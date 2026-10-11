@@ -13,11 +13,13 @@
     <p>
       SnapPDF organizes PDFs from unrelated folders into one local workspace
       with nested projects, tabs, recents, search, annotations, offline OCR,
-      Reader mode, and Presentation mode.
+      Reader mode, Presentation mode, and an optional ChatGPT or Gemini study
+      panel for questions about selected text, figures, and documents.
     </p>
     <p>
       Documents remain in their original filesystem locations. SnapPDF does
-      not require imports, duplicate files, cloud storage, or an account.
+      not require imports, duplicate files, or cloud storage. A provider
+      connection is used only when the optional study panel is enabled.
     </p>
   </description>
   <launchable type="desktop-id">io.snappdf.SnapPDF.desktop</launchable>
@@ -25,4 +27,12 @@
     <mediatype>application/pdf</mediatype>
   </provides>
   <content_rating type="oars-1.1"/>
+  <releases>
+    <release version="0.2.0" date="2026-10-11">
+      <description>
+        <p>Adds the study chat, direct text and PDF-region handoff, model
+        selection, and checksum-verified user-level installation.</p>
+      </description>
+    </release>
+  </releases>
 </component>

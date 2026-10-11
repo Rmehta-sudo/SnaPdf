@@ -34,7 +34,11 @@ jobs:
         run: ./scripts/build-appimage.sh
 
       - name: Create checksum
-        run: cd dist && sha256sum *.AppImage > SHA256SUMS
+        run: |
+          cp scripts/install-appimage.sh dist/install-snappdf.sh
+          chmod +x dist/install-snappdf.sh
+          cd dist
+          sha256sum *.AppImage install-snappdf.sh > SHA256SUMS
 
       - name: Upload workflow artifact
         uses: actions/upload-artifact@v7
@@ -42,6 +46,7 @@ jobs:
           name: SnapPDF-AppImage
           path: |
             dist/*.AppImage
+            dist/install-snappdf.sh
             dist/SHA256SUMS
 
       - name: Publish GitHub release
@@ -50,6 +55,6 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           gh release create "${GITHUB_REF_NAME}" \
-            dist/*.AppImage dist/SHA256SUMS \
+            dist/*.AppImage dist/install-snappdf.sh dist/SHA256SUMS \
             --generate-notes \
             --title "SnapPDF ${GITHUB_REF_NAME}"
