@@ -4,6 +4,24 @@ set -eu
 APPDIR="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
 APP_ID="io.snapdf.SnaPdf"
 
+register_terminal_command() {
+    [ -n "${APPIMAGE:-}" ] || return 0
+    [ "${SNAPDF_NO_REGISTER:-0}" != "1" ] || return 0
+
+    bin_dir="${HOME}/.local/bin"
+    command_path="$bin_dir/snapdf"
+    launcher="${SNAPDF_EXECUTABLE:-$APPIMAGE}"
+
+    # The checksum-verifying installer already owns this wrapper. A directly
+    # launched AppImage gets a symlink to its current absolute location.
+    [ "$launcher" != "$command_path" ] || return 0
+    if [ -e "$command_path" ] && [ ! -L "$command_path" ]; then
+        return 0
+    fi
+    mkdir -p "$bin_dir"
+    ln -sfn "$launcher" "$command_path"
+}
+
 migrate_product_data() {
     data_home="${XDG_DATA_HOME:-${HOME}/.local/share}"
     current="$data_home/snapdf"
@@ -45,6 +63,7 @@ register_desktop_entry() {
 }
 
 migrate_product_data
+register_terminal_command
 
 if [ "${1:-}" = "--install-ocr" ]; then
     shift

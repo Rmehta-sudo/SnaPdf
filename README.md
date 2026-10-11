@@ -63,7 +63,7 @@ chmod +x SnaPdf-*.AppImage
 
 For a manual integrity check, download `SHA256SUMS` from the same release into the same directory and run `sha256sum --check --ignore-missing SHA256SUMS` before opening the AppImage.
 
-That is the complete installation for the PDF workspace. On first launch SnaPdf registers its application entry and icon for your user account, so you can find it in the application menu and pin it to your dock. If you move the AppImage later, launch it once from the new location to refresh that entry.
+That is the complete installation for the PDF workspace. On first launch SnaPdf registers its application entry, icon, and `~/.local/bin/snapdf` terminal command for your user account, so you can find it in the application menu, pin it to your dock, or run `snapdf`. If you move the AppImage later, launch it once from the new location to refresh those entries. If `~/.local/bin` is not already in your shell's `PATH`, log out and back in or add it to `PATH` once.
 
 To open a document directly, pass its path to the same file:
 
