@@ -16,7 +16,7 @@ pub struct AppState {
     /// Display-only names keyed by the real PDF path. Files are never renamed on disk.
     #[serde(default)]
     pub file_aliases: HashMap<PathBuf, String>,
-    /// SnapPDF-owned overlay annotations. Original PDF files are never modified.
+    /// SnaPdf-owned overlay annotations. Original PDF files are never modified.
     #[serde(default)]
     pub annotations: HashMap<PathBuf, Vec<Annotation>>,
     /// Open document tabs, restored across launches.

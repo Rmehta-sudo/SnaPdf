@@ -211,7 +211,7 @@ impl RenderWorker {
         let worker_generation = desired_generation.clone();
 
         std::thread::Builder::new()
-            .name("snappdf-renderer".to_owned())
+            .name("snapdf-renderer".to_owned())
             .spawn(move || {
                 worker_loop(
                     command_rx,
@@ -571,7 +571,7 @@ fn worker_loop(
                                         .map_err(|error| error.to_string())?;
                                 }
                                 highlight
-                                    .set_creator("SnapPDF")
+                                    .set_creator("SnaPdf")
                                     .map_err(|error| error.to_string())?;
                                 highlight
                                     .set_is_printed(true)
@@ -602,7 +602,7 @@ fn worker_loop(
                                     color[0], color[1], color[2], color[3],
                                 ))
                                 .map_err(|error| error.to_string())?;
-                                note.set_creator("SnapPDF")
+                                note.set_creator("SnaPdf")
                                     .map_err(|error| error.to_string())?;
                                 note.set_is_printed(true)
                                     .map_err(|error| error.to_string())?;
@@ -721,7 +721,7 @@ fn worker_loop(
                                     position[0] + 9.0,
                                 ))
                                 .map_err(|error| error.to_string())?;
-                                note.set_creator("SnapPDF")
+                                note.set_creator("SnaPdf")
                                     .map_err(|error| error.to_string())?;
                                 note.set_is_printed(true)
                                     .map_err(|error| error.to_string())?;

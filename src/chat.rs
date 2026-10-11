@@ -138,7 +138,7 @@ impl ChatWorker {
         let (command_tx, command_rx) = unbounded();
         let (event_tx, event_rx) = unbounded();
         std::thread::Builder::new()
-            .name("snappdf-study-chat".to_owned())
+            .name("snapdf-study-chat".to_owned())
             .spawn(move || worker_loop(command_rx, event_tx, repaint))
             .expect("could not start study chat worker");
         Self {
@@ -173,7 +173,7 @@ fn worker_loop(
 ) {
     let client = Client::builder()
         .timeout(Duration::from_secs(180))
-        .user_agent(concat!("SnapPDF/", env!("CARGO_PKG_VERSION")))
+        .user_agent(concat!("SnaPdf/", env!("CARGO_PKG_VERSION")))
         .build()
         .expect("could not create HTTP client");
     let mut credentials = load_credentials();
@@ -275,10 +275,7 @@ fn emit_account_state(events: &Sender<ChatEvent>, credentials: &Credentials) {
 }
 
 fn credentials_path() -> PathBuf {
-    dirs::config_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join("snappdf")
-        .join("chat-credentials.json")
+    crate::storage::config_dir().join("chat-credentials.json")
 }
 
 fn load_credentials() -> Credentials {
@@ -347,7 +344,7 @@ fn sign_in_chatgpt(
         .append_pair("state", &state)
         .append_pair("nonce", &nonce)
         .append_pair("ext_agent_host_id", &host_id)
-        .append_pair("agent_name_hint", "SnapPDF");
+        .append_pair("agent_name_hint", "SnaPdf");
 
     let _ = events.send(ChatEvent::AuthProgress {
         provider: ChatProvider::ChatGpt,
@@ -466,14 +463,11 @@ fn sign_in_chatgpt(
 fn reply_to_browser(stream: &mut std::net::TcpStream, success: bool) -> Result<()> {
     let (title, detail) = if success {
         (
-            "Connected to SnapPDF",
+            "Connected to SnaPdf",
             "You can close this tab and return to your document.",
         )
     } else {
-        (
-            "SnapPDF could not connect",
-            "Return to SnapPDF for details.",
-        )
+        ("SnaPdf could not connect", "Return to SnaPdf for details.")
     };
     let body = format!(
         "<!doctype html><meta charset=utf-8><title>{title}</title><style>body{{background:#181818;color:#eee;font:16px system-ui;display:grid;place-items:center;height:100vh;margin:0}}main{{text-align:center}}h1{{font-size:24px}}</style><main><h1>{title}</h1><p>{detail}</p></main>"

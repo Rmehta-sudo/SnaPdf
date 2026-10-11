@@ -1,12 +1,12 @@
 [Desktop Entry]
 Type=Application
-Name=SnapPDF
+Name=SnaPdf
 Comment=Fast project-oriented PDF viewer
 Exec=@EXEC@ %F
-Icon=io.snappdf.SnapPDF
+Icon=io.snapdf.SnaPdf
 Terminal=false
 Categories=Office;Viewer;
 MimeType=application/pdf;
 StartupNotify=true
-StartupWMClass=io.snappdf.SnapPDF
+StartupWMClass=io.snapdf.SnaPdf
 Keywords=PDF;Document;Viewer;Research;Study;Chat;

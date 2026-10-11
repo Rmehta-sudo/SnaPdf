@@ -2,39 +2,58 @@
 set -eu
 
 APPDIR="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
-APP_ID="io.snappdf.SnapPDF"
+APP_ID="io.snapdf.SnaPdf"
+
+migrate_product_data() {
+    data_home="${XDG_DATA_HOME:-${HOME}/.local/share}"
+    current="$data_home/snapdf"
+    legacy="$data_home/snappdf"
+
+    if [ ! -e "$current" ] && [ -d "$legacy" ]; then
+        mv "$legacy" "$current"
+    elif [ ! -e "$current/ocr" ] && [ -d "$legacy/ocr" ]; then
+        mkdir -p "$current"
+        mv "$legacy/ocr" "$current/ocr"
+    fi
+}
 
 register_desktop_entry() {
     [ -n "${APPIMAGE:-}" ] || return 0
+    [ "${SNAPDF_NO_REGISTER:-0}" != "1" ] || return 0
 
     data_home="${XDG_DATA_HOME:-${HOME}/.local/share}"
     applications_dir="$data_home/applications"
     icons_dir="$data_home/icons/hicolor/scalable/apps"
     desktop_file="$applications_dir/$APP_ID.desktop"
-    launcher="${SNAPPDF_EXECUTABLE:-$APPIMAGE}"
+    launcher="${SNAPDF_EXECUTABLE:-$APPIMAGE}"
     expected_exec="Exec=\"$launcher\" %F"
 
     if [ ! -f "$desktop_file" ] || ! grep -Fqx "$expected_exec" "$desktop_file"; then
         mkdir -p "$applications_dir" "$icons_dir"
         escaped_launcher="$(printf '%s' "$launcher" | sed 's/[&|]/\\&/g')"
         sed "s|@EXEC@|\"$escaped_launcher\"|g" \
-            "$APPDIR/usr/share/snappdf/$APP_ID.desktop" > "$desktop_file"
+            "$APPDIR/usr/share/snapdf/$APP_ID.desktop" > "$desktop_file"
         cp "$APPDIR/usr/share/icons/hicolor/scalable/apps/$APP_ID.svg" \
             "$icons_dir/$APP_ID.svg"
         command -v update-desktop-database >/dev/null 2>&1 \
             && update-desktop-database "$applications_dir" >/dev/null 2>&1 \
             || true
     fi
+
+    rm -f "$applications_dir/io.snappdf.SnapPDF.desktop"
+    rm -f "$icons_dir/io.snappdf.SnapPDF.svg"
 }
+
+migrate_product_data
 
 if [ "${1:-}" = "--install-ocr" ]; then
     shift
-    SNAPPDF_OCR_WORKER="$APPDIR/usr/share/snappdf/ocr_worker.py" \
-        exec "$APPDIR/usr/lib/snappdf/install-ocr.sh" "$@"
+    SNAPDF_OCR_WORKER="$APPDIR/usr/share/snapdf/ocr_worker.py" \
+        exec "$APPDIR/usr/lib/snapdf/install-ocr.sh" "$@"
 fi
 
 register_desktop_entry
 if [ "${1:-}" = "--register-only" ]; then
     exit 0
 fi
-exec "$APPDIR/usr/bin/snappdf" "$@"
+exec "$APPDIR/usr/bin/snapdf" "$@"

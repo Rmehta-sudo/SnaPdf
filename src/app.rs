@@ -342,22 +342,22 @@ pub fn run() -> Result<()> {
 
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_title("SnapPDF")
-            .with_app_id("io.snappdf.SnapPDF")
+            .with_title("SnaPdf")
+            .with_app_id("io.snapdf.SnaPdf")
             .with_inner_size([1360.0, 860.0])
             .with_min_inner_size([820.0, 560.0]),
         ..Default::default()
     };
 
     eframe::run_native(
-        "SnapPDF",
+        "SnaPdf",
         options,
-        Box::new(move |creation| Ok(Box::new(SnapPdfApp::new(creation, initial_path)))),
+        Box::new(move |creation| Ok(Box::new(SnaPdfApp::new(creation, initial_path)))),
     )
     .map_err(|error| anyhow!(error.to_string()))
 }
 
-pub struct SnapPdfApp {
+pub struct SnaPdfApp {
     state: AppState,
     /// Frozen at startup so clicking a PDF never reshuffles the visible recent list.
     session_recents: Vec<RecentDocument>,
@@ -458,7 +458,7 @@ pub struct SnapPdfApp {
     pending_source_save: Option<(PathBuf, PathBuf)>,
 }
 
-impl SnapPdfApp {
+impl SnaPdfApp {
     fn new(creation: &eframe::CreationContext<'_>, initial_path: Option<PathBuf>) -> Self {
         theme::apply(&creation.egui_ctx);
         let mut state = storage::load();
@@ -589,7 +589,7 @@ impl SnapPdfApp {
 
     fn open_document(&mut self, path: PathBuf) {
         if !path.is_file() || !is_pdf(&path) {
-            self.status = "SnapPDF can only open PDF files.".to_owned();
+            self.status = "SnaPdf can only open PDF files.".to_owned();
             return;
         }
 
@@ -841,7 +841,7 @@ impl SnapPdfApp {
             .and_then(|name| name.to_str())
             .unwrap_or("document.pdf");
         let temporary =
-            source.with_file_name(format!(".{name}.snappdf-saving-{}.pdf", std::process::id()));
+            source.with_file_name(format!(".{name}.snapdf-saving-{}.pdf", std::process::id()));
         let annotations = self.current_annotations().to_vec();
         self.pending_source_save = Some((temporary.clone(), source.clone()));
         self.status = "Writing annotations into the PDF...".to_owned();
@@ -1142,7 +1142,7 @@ impl SnapPdfApp {
                             .and_then(|name| name.to_str())
                             .unwrap_or("document");
                         let backup =
-                            source.with_file_name(format!("{stem}.snappdf-backup-{timestamp}.pdf"));
+                            source.with_file_name(format!("{stem}.snapdf-backup-{timestamp}.pdf"));
                         match fs::copy(&source, &backup)
                             .and_then(|_| fs::rename(&temporary, &source))
                         {
@@ -1169,7 +1169,7 @@ impl SnapPdfApp {
                             )
                         } else {
                             format!(
-                                "Exported {exported} annotations to {}; {skipped} unsupported items remain SnapPDF overlays.",
+                                "Exported {exported} annotations to {}; {skipped} unsupported items remain SnaPdf overlays.",
                                 destination.display()
                             )
                         };
@@ -3515,7 +3515,7 @@ impl SnapPdfApp {
         match fs::metadata(&path) {
             Ok(metadata) if metadata.len() > MAX_ATTACHMENT_BYTES => {
                 self.study_chat.status =
-                    "That attachment is larger than SnapPDF's 25 MB safety limit.".to_owned();
+                    "That attachment is larger than SnaPdf's 25 MB safety limit.".to_owned();
                 return;
             }
             Err(error) => {
@@ -3760,13 +3760,13 @@ impl SnapPdfApp {
                                 self.study_chat.status = "Opening secure ChatGPT sign-in…".to_owned();
                                 let _ = self.chat_worker.commands.send(ChatCommand::SignInChatGpt);
                             }
-                            ui.label(RichText::new("Official browser sign-in. SnapPDF never sees your password.").size(10.5).color(theme::MUTED));
+                            ui.label(RichText::new("Official browser sign-in. SnaPdf never sees your password.").size(10.5).color(theme::MUTED));
                         }
                         ChatProvider::Gemini => {
                             if ui.add_sized([ui.available_width(), 30.0], egui::Button::new("Connect Gemini")).clicked() {
                                 self.study_chat.show_gemini_key = true;
                             }
-                            ui.label(RichText::new("Uses your Google AI Studio API key. Google account OAuth requires a registered SnapPDF client.").size(10.5).color(theme::MUTED));
+                            ui.label(RichText::new("Uses your Google AI Studio API key. Google account OAuth requires a registered SnaPdf client.").size(10.5).color(theme::MUTED));
                         }
                     }
                 }
@@ -4003,9 +4003,9 @@ impl SnapPdfApp {
                     // for this frame below.
                     ctx.input_mut(|input| input.smooth_scroll_delta = egui::Vec2::ZERO);
                 }
-                if pinch_in_progress && std::env::var_os("SNAPPDF_PINCH_DEBUG").is_some() {
+                if pinch_in_progress && std::env::var_os("SNAPDF_PINCH_DEBUG").is_some() {
                     eprintln!(
-                        "[snappdf pinch] source={} native={:.5} egui={:.5} zoom={:.4} old_offset={:?}",
+                        "[snapdf pinch] source={} native={:.5} egui={:.5} zoom={:.4} old_offset={:?}",
                         if use_native { "xinput" } else { "egui" },
                         native_factor, egui_pinch_zoom, self.zoom, self.document_scroll_offset,
                     );
@@ -5262,7 +5262,7 @@ impl SnapPdfApp {
             .resizable(false)
             .default_width(360.0)
             .show(ctx, |ui| {
-                ui.label("This writes SnapPDF annotations into the PDF on disk so other viewers can see them.");
+                ui.label("This writes SnaPdf annotations into the PDF on disk so other viewers can see them.");
                 ui.add_space(6.0);
                 ui.label(
                     RichText::new("A timestamped backup of the original PDF will be created first.")
@@ -5380,7 +5380,7 @@ impl SnapPdfApp {
             .show(ctx, |ui| {
                 ui.label("Paste an API key from Google AI Studio.");
                 ui.label(
-                    RichText::new("The key is stored locally in SnapPDF's private credentials file and sent only to Google's Gemini API.")
+                    RichText::new("The key is stored locally in SnaPdf's private credentials file and sent only to Google's Gemini API.")
                         .size(11.0)
                         .color(theme::MUTED),
                 );
@@ -5663,7 +5663,7 @@ impl SnapPdfApp {
     }
 }
 
-impl eframe::App for SnapPdfApp {
+impl eframe::App for SnaPdfApp {
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.frame_number = self.frame_number.wrapping_add(1);
         self.handle_events(ctx);
@@ -8111,7 +8111,7 @@ fn available_pdf_apps() -> Vec<ExternalApp> {
             let Some(id) = path.file_name().and_then(|value| value.to_str()) else {
                 continue;
             };
-            if id == "io.snappdf.SnapPDF.desktop" || !seen.insert(id.to_owned()) {
+            if id == "io.snapdf.SnaPdf.desktop" || !seen.insert(id.to_owned()) {
                 continue;
             }
             let Ok(contents) = fs::read_to_string(&path) else {

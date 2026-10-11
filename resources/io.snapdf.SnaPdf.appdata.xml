@@ -1,33 +1,39 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <component type="desktop-application">
-  <id>io.snappdf.SnapPDF</id>
-  <name>SnapPDF</name>
+  <id>io.snapdf.SnaPdf</id>
+  <name>SnaPdf</name>
   <summary>A project-based PDF reading workspace</summary>
   <metadata_license>CC0-1.0</metadata_license>
   <project_license>MIT</project_license>
-  <developer id="io.snappdf">
-    <name>SnapPDF contributors</name>
+  <developer id="io.snapdf">
+    <name>SnaPdf contributors</name>
   </developer>
-  <url type="homepage">https://github.com/Rmehta-sudo/Snapdf</url>
+  <url type="homepage">https://github.com/Rmehta-sudo/SnaPdf</url>
   <description>
     <p>
-      SnapPDF organizes PDFs from unrelated folders into one local workspace
+      SnaPdf organizes PDFs from unrelated folders into one local workspace
       with nested projects, tabs, recents, search, annotations, offline OCR,
       Reader mode, Presentation mode, and an optional ChatGPT or Gemini study
       panel for questions about selected text, figures, and documents.
     </p>
     <p>
-      Documents remain in their original filesystem locations. SnapPDF does
+      Documents remain in their original filesystem locations. SnaPdf does
       not require imports, duplicate files, or cloud storage. A provider
       connection is used only when the optional study panel is enabled.
     </p>
   </description>
-  <launchable type="desktop-id">io.snappdf.SnapPDF.desktop</launchable>
+  <launchable type="desktop-id">io.snapdf.SnaPdf.desktop</launchable>
   <provides>
     <mediatype>application/pdf</mediatype>
   </provides>
   <content_rating type="oars-1.1"/>
   <releases>
+    <release version="0.3.0" date="2026-10-11">
+      <description>
+        <p>Renames the application to SnaPdf, adds backward-compatible data
+        migration, and introduces the lowercase snapdf package identity.</p>
+      </description>
+    </release>
     <release version="0.2.0" date="2026-10-11">
       <description>
         <p>Adds the study chat, direct text and PDF-region handoff, model

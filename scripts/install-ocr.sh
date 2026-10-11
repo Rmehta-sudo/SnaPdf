@@ -2,9 +2,9 @@
 set -euo pipefail
 
 PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-OCR_ROOT="${HOME}/.local/share/snappdf/ocr"
+OCR_ROOT="${HOME}/.local/share/snapdf/ocr"
 UV_BIN="${HOME}/.local/bin/uv"
-WORKER_SOURCE="${SNAPPDF_OCR_WORKER:-${PROJECT_ROOT}/resources/ocr_worker.py}"
+WORKER_SOURCE="${SNAPDF_OCR_WORKER:-${PROJECT_ROOT}/resources/ocr_worker.py}"
 
 if [[ ! -x "${UV_BIN}" ]]; then
   UV_BIN="$(command -v uv || true)"
@@ -23,10 +23,10 @@ install -d "${OCR_ROOT}"
 if [[ ! -x "${OCR_ROOT}/venv/bin/python" ]]; then
   "${UV_BIN}" venv --python 3.12 "${OCR_ROOT}/venv"
 fi
-UV_CACHE_DIR="${HOME}/.cache/snappdf/uv" UV_HTTP_TIMEOUT=600 "${UV_BIN}" pip install \
+UV_CACHE_DIR="${HOME}/.cache/snapdf/uv" UV_HTTP_TIMEOUT=600 "${UV_BIN}" pip install \
   --quiet \
   --python "${OCR_ROOT}/venv/bin/python" \
   "paddleocr[doc-parser]==3.7.0" "paddlepaddle>=3.2,<4"
 install -m 0644 "${WORKER_SOURCE}" "${OCR_ROOT}/ocr_worker.py"
 
-echo "SnapPDF local OCR installed. Models download once on first launch."
+echo "SnaPdf local OCR installed. Models download once on first launch."

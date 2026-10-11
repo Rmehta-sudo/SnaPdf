@@ -2,8 +2,8 @@
 set -euo pipefail
 
 PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-APP_ID="io.snappdf.SnapPDF"
-APPDIR="${PROJECT_ROOT}/.tmp/appimage/SnapPDF.AppDir"
+APP_ID="io.snapdf.SnaPdf"
+APPDIR="${PROJECT_ROOT}/.tmp/appimage/SnaPdf.AppDir"
 TOOLS_DIR="${PROJECT_ROOT}/.tmp/appimage/tools"
 DIST_DIR="${PROJECT_ROOT}/dist"
 APPIMAGETOOL_VERSION="1.9.1"
@@ -20,41 +20,41 @@ esac
 
 VERSION="$(sed -n 's/^version = "\([^"]*\)"/\1/p' "${PROJECT_ROOT}/Cargo.toml" | head -n 1)"
 if [[ -z "${VERSION}" ]]; then
-  echo "Could not read the SnapPDF version from Cargo.toml." >&2
+  echo "Could not read the SnaPdf version from Cargo.toml." >&2
   exit 1
 fi
 
 APPIMAGETOOL="${TOOLS_DIR}/appimagetool-${APPIMAGETOOL_VERSION}-${ARCH}.AppImage"
-OUTPUT="${DIST_DIR}/SnapPDF-${VERSION}-${ARCH}.AppImage"
+OUTPUT="${DIST_DIR}/SnaPdf-${VERSION}-${ARCH}.AppImage"
 
-echo "Building SnapPDF ${VERSION}..."
-(cd "${PROJECT_ROOT}" && cargo build --release --locked --jobs "${SNAPPDF_BUILD_JOBS:-2}")
+echo "Building SnaPdf ${VERSION}..."
+(cd "${PROJECT_ROOT}" && cargo build --release --locked --jobs "${SNAPDF_BUILD_JOBS:-2}")
 
 rm -rf "${APPDIR}"
 install -d \
   "${APPDIR}/usr/bin" \
-  "${APPDIR}/usr/lib/snappdf" \
+  "${APPDIR}/usr/lib/snapdf" \
   "${APPDIR}/usr/share/applications" \
   "${APPDIR}/usr/share/metainfo" \
   "${APPDIR}/usr/share/icons/hicolor/scalable/apps" \
-  "${APPDIR}/usr/share/snappdf" \
+  "${APPDIR}/usr/share/snapdf" \
   "${TOOLS_DIR}" \
   "${DIST_DIR}"
 
-install -m 0755 "${PROJECT_ROOT}/target/release/snappdf" "${APPDIR}/usr/bin/snappdf"
+install -m 0755 "${PROJECT_ROOT}/target/release/snapdf" "${APPDIR}/usr/bin/snapdf"
 install -m 0755 "${PROJECT_ROOT}/packaging/appimage/AppRun" "${APPDIR}/AppRun"
 install -m 0755 "${PROJECT_ROOT}/scripts/install-ocr.sh" \
-  "${APPDIR}/usr/lib/snappdf/install-ocr.sh"
+  "${APPDIR}/usr/lib/snapdf/install-ocr.sh"
 install -m 0644 "${PROJECT_ROOT}/resources/ocr_worker.py" \
-  "${APPDIR}/usr/share/snappdf/ocr_worker.py"
+  "${APPDIR}/usr/share/snapdf/ocr_worker.py"
 install -m 0644 "${PROJECT_ROOT}/resources/${APP_ID}.desktop" \
-  "${APPDIR}/usr/share/snappdf/${APP_ID}.desktop"
+  "${APPDIR}/usr/share/snapdf/${APP_ID}.desktop"
 install -m 0644 "${PROJECT_ROOT}/resources/${APP_ID}.svg" \
   "${APPDIR}/usr/share/icons/hicolor/scalable/apps/${APP_ID}.svg"
 install -m 0644 "${PROJECT_ROOT}/resources/${APP_ID}.appdata.xml" \
   "${APPDIR}/usr/share/metainfo/${APP_ID}.appdata.xml"
 
-sed 's|@EXEC@|snappdf|g' "${PROJECT_ROOT}/resources/${APP_ID}.desktop" \
+sed 's|@EXEC@|snapdf|g' "${PROJECT_ROOT}/resources/${APP_ID}.desktop" \
   > "${APPDIR}/${APP_ID}.desktop"
 install -m 0644 "${APPDIR}/${APP_ID}.desktop" \
   "${APPDIR}/usr/share/applications/${APP_ID}.desktop"

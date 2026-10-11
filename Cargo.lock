@@ -3051,8 +3051,8 @@ dependencies = [
 ]
 
 [[package]]
-name = "snappdf"
-version = "0.2.3"
+name = "snapdf"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "base64 0.22.1",

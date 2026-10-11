@@ -28,7 +28,7 @@ pub fn listen(creation: &eframe::CreationContext<'_>) -> Option<NativePinch> {
     let (sender, events) = mpsc::channel();
 
     std::thread::Builder::new()
-        .name("snappdf-x11-pinch".to_owned())
+        .name("snapdf-x11-pinch".to_owned())
         .spawn(move || {
             let Ok((connection, _screen)) = x11rb::connect(None) else {
                 return;

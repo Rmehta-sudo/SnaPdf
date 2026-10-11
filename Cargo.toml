@@ -1,6 +1,6 @@
 [package]
-name = "snappdf"
-version = "0.2.3"
+name = "snapdf"
+version = "0.3.0"
 edition = "2024"
 description = "A fast, project-oriented PDF reading workspace"
 license = "MIT"
