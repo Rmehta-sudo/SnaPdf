@@ -1,5 +1,5 @@
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 use walkdir::WalkDir;
@@ -33,8 +33,28 @@ pub struct AppState {
     pub ui_scale: f32,
     #[serde(default = "default_chrome_scale_ratio")]
     pub chrome_scale_ratio: f32,
+    /// Explorer scale relative to document scale. Toolbar scale remains chrome_scale_ratio.
+    #[serde(default = "default_sidebar_scale_ratio")]
+    pub sidebar_scale_ratio: f32,
+    /// Visual treatment for PDF entries in the sidebar.
+    #[serde(default)]
+    pub sidebar_file_icons: SidebarFileIcons,
+    /// PDF entries pinned into the workspace's dedicated Pinned section.
+    #[serde(default)]
+    pub pinned_files: Vec<PathBuf>,
+    /// Project roots and nested folders pinned to the top of the workspace.
+    #[serde(default)]
+    pub pinned_folders: Vec<PathBuf>,
     #[serde(default = "default_true")]
     pub recents_expanded: bool,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub enum SidebarFileIcons {
+    #[default]
+    Standard,
+    VsCode,
+    None,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -116,6 +136,10 @@ fn default_ui_scale() -> f32 {
 
 fn default_chrome_scale_ratio() -> f32 {
     0.6
+}
+
+fn default_sidebar_scale_ratio() -> f32 {
+    0.8
 }
 
 impl Project {
@@ -270,6 +294,13 @@ impl AppState {
                 .retain(|document| document.path.is_file());
         }
         self.file_aliases.retain(|path, _| path.is_file());
+        // Keep the explicit pin order: the most recently pinned item is shown first.
+        let mut seen_files = HashSet::new();
+        self.pinned_files
+            .retain(|path| path.is_file() && seen_files.insert(path.clone()));
+        let mut seen_folders = HashSet::new();
+        self.pinned_folders
+            .retain(|path| path.is_dir() && seen_folders.insert(path.clone()));
         self.annotations.retain(|path, _| path.is_file());
         self.open_documents.retain(|path| path.is_file());
         self.closed_documents.retain(|path| path.is_file());
@@ -290,6 +321,11 @@ impl AppState {
             default_chrome_scale_ratio()
         } else {
             self.chrome_scale_ratio.clamp(0.4, 1.0)
+        };
+        self.sidebar_scale_ratio = if self.sidebar_scale_ratio <= 0.0 {
+            default_sidebar_scale_ratio()
+        } else {
+            self.sidebar_scale_ratio.clamp(0.5, 1.25)
         };
         if self
             .last_document

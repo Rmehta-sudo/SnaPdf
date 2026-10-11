@@ -1,4 +1,6 @@
-use crate::model::{Annotation, AnnotationKind, AppState, RecentDocument, is_pdf};
+use crate::model::{
+    Annotation, AnnotationKind, AppState, RecentDocument, SidebarFileIcons, is_pdf,
+};
 use crate::ocr::{OcrCommand, OcrEvent, OcrWorker};
 use crate::pdf::{
     LinkTarget, PdfFileSearchMatches, PdfLinkRegion, PdfOutlineItem, PdfSearchMatch, RenderCommand,
@@ -55,11 +57,23 @@ impl TextSelection {
 
     // Return the selected glyph range on this page (including intermediate pages).
     fn bounds_on_page(self, page: usize, glyph_count: usize) -> Option<(usize, usize)> {
-        if glyph_count == 0 { return None; }
+        if glyph_count == 0 {
+            return None;
+        }
         let (start, end) = self.ordered();
-        if page < start.page || page > end.page { return None; }
-        let first = if page == start.page { start.glyph.min(glyph_count - 1) } else { 0 };
-        let last = if page == end.page { end.glyph.min(glyph_count - 1) } else { glyph_count - 1 };
+        if page < start.page || page > end.page {
+            return None;
+        }
+        let first = if page == start.page {
+            start.glyph.min(glyph_count - 1)
+        } else {
+            0
+        };
+        let last = if page == end.page {
+            end.glyph.min(glyph_count - 1)
+        } else {
+            glyph_count - 1
+        };
         (first <= last).then_some((first, last))
     }
 }
@@ -202,8 +216,13 @@ struct PdfTreeNode {
 enum TreeAction {
     Open(PathBuf),
     OpenWith(PathBuf),
+    OpenInFiles(PathBuf),
     Rename(PathBuf, String),
     ResetName(PathBuf),
+    PinFile(PathBuf),
+    UnpinFile(PathBuf),
+    PinFolder(PathBuf),
+    UnpinFolder(PathBuf),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -599,6 +618,18 @@ impl SnapPdfApp {
             .then(|| "No other registered PDF applications were found.".to_owned());
     }
 
+    fn open_path_in_file_manager(&mut self, path: &Path) {
+        let directory = if path.is_dir() {
+            path.to_path_buf()
+        } else {
+            path.parent().unwrap_or(path).to_path_buf()
+        };
+        match Command::new("xdg-open").arg(&directory).spawn() {
+            Ok(_) => self.status = format!("Opened {}.", directory.display()),
+            Err(error) => self.status = format!("Could not open the folder: {error}"),
+        }
+    }
+
     fn open_current_directory(&mut self) {
         let directory = self.browser_directory.clone().or_else(|| {
             self.current_path
@@ -609,10 +640,7 @@ impl SnapPdfApp {
         let Some(directory) = directory else {
             return;
         };
-        match Command::new("xdg-open").arg(&directory).spawn() {
-            Ok(_) => self.status = format!("Opened {}.", directory.display()),
-            Err(error) => self.status = format!("Could not open the folder: {error}"),
-        }
+        self.open_path_in_file_manager(&directory);
     }
 
     fn launch_external_app(&mut self, app: &ExternalApp, path: &Path) {
@@ -1192,10 +1220,8 @@ impl SnapPdfApp {
             // Use the nearest point *on* a page rather than dropping the anchor.
             let (page, rect) = self.page_rects.iter().min_by(|(_, a), (_, b)| {
                 let distance_sq = |rect: &Rect| {
-                    let dx = (rect.left() - cursor.x).max(0.0)
-                        + (cursor.x - rect.right()).max(0.0);
-                    let dy = (rect.top() - cursor.y).max(0.0)
-                        + (cursor.y - rect.bottom()).max(0.0);
+                    let dx = (rect.left() - cursor.x).max(0.0) + (cursor.x - rect.right()).max(0.0);
+                    let dy = (rect.top() - cursor.y).max(0.0) + (cursor.y - rect.bottom()).max(0.0);
                     dx * dx + dy * dy
                 };
                 distance_sq(a).total_cmp(&distance_sq(b))
@@ -1761,6 +1787,16 @@ impl SnapPdfApp {
                     .inner_margin(Margin::same(10)),
             )
             .show(root, |ui| {
+                // The document uses the global zoom; the explorer has its own readable scale.
+                let explorer_factor = (self.state.sidebar_scale_ratio
+                    / self.state.chrome_scale_ratio.max(0.1))
+                .clamp(0.7, 2.0);
+                ui.style_mut().spacing.item_spacing *= explorer_factor;
+                ui.style_mut().spacing.button_padding *= explorer_factor;
+                ui.style_mut().spacing.interact_size *= explorer_factor;
+                for font in ui.style_mut().text_styles.values_mut() {
+                    font.size *= explorer_factor;
+                }
                 ui.horizontal(|ui| {
                     if ui
                         .button("Open")
@@ -1809,12 +1845,87 @@ impl SnapPdfApp {
                     .id_salt("sidebar-scroll")
                     .auto_shrink([false, false])
                     .show(ui, |ui| {
-                        sidebar_section_header(ui, "PROJECTS", "", theme::MUTED);
                         let mut remove_project = None;
                         let mut open_after_ui = None;
                         let mut open_with_request = None;
                         let mut rename_request = None;
                         let mut clear_file_alias = None;
+                        let mut open_in_files = None;
+                        let mut pin_file = None;
+                        let mut unpin_file = None;
+                        let mut pin_folder = None;
+                        let mut unpin_folder = None;
+                        if !self.state.pinned_folders.is_empty()
+                            || !self.state.pinned_files.is_empty()
+                        {
+                            sidebar_section_header(ui, "PINNED", "", theme::MUTED);
+                            for folder in self.state.pinned_folders.clone() {
+                                let row = nav_row(
+                                    ui,
+                                    &file_name(&folder),
+                                    false,
+                                    NavIcon::Folder,
+                                    0.0,
+                                    self.state.sidebar_file_icons,
+                                );
+                                if row.body.clicked() && !row.options.clicked() {
+                                    self.open_folder_browser(folder.clone());
+                                }
+                                if let Some(action) =
+                                    sidebar_options_popup(&row.options, false, false, false, true)
+                                {
+                                    match action {
+                                        SidebarMenuAction::Unpin => unpin_folder = Some(folder),
+                                        SidebarMenuAction::OpenInFiles => {
+                                            open_in_files = Some(folder)
+                                        }
+                                        _ => {}
+                                    }
+                                }
+                            }
+                            for path in self.state.pinned_files.clone() {
+                                let row = nav_row(
+                                    ui,
+                                    &self.state.display_name(&path),
+                                    self.current_path.as_deref() == Some(path.as_path()),
+                                    NavIcon::File,
+                                    0.0,
+                                    self.state.sidebar_file_icons,
+                                );
+                                if row.body.clicked() && !row.options.clicked() {
+                                    open_after_ui = Some(path.clone());
+                                }
+                                if let Some(action) = sidebar_options_popup(
+                                    &row.options,
+                                    self.state.file_aliases.contains_key(&path),
+                                    false,
+                                    true,
+                                    true,
+                                ) {
+                                    match action {
+                                        SidebarMenuAction::OpenWith => {
+                                            open_with_request = Some(path)
+                                        }
+                                        SidebarMenuAction::OpenInFiles => {
+                                            open_in_files = Some(path)
+                                        }
+                                        SidebarMenuAction::Unpin => unpin_file = Some(path),
+                                        SidebarMenuAction::Rename => {
+                                            rename_request = Some((
+                                                RenameTarget::File(path.clone()),
+                                                self.state.display_name(&path),
+                                            ))
+                                        }
+                                        SidebarMenuAction::ResetName => {
+                                            clear_file_alias = Some(path)
+                                        }
+                                        _ => {}
+                                    }
+                                }
+                            }
+                            ui.add_space(10.0);
+                        }
+                        sidebar_section_header(ui, "PROJECTS", "", theme::MUTED);
 
                         if self.state.projects.is_empty() {
                             ui.add_space(6.0);
@@ -1866,9 +1977,10 @@ impl SnapPdfApp {
                             }
                             if let Some(action) = sidebar_options_popup(
                                 &header.options,
-                                "PROJECT OPTIONS",
                                 false,
                                 true,
+                                false,
+                                self.state.pinned_folders.contains(&project.root),
                             ) {
                                 match action {
                                     SidebarMenuAction::OpenWith => {}
@@ -1880,6 +1992,15 @@ impl SnapPdfApp {
                                     }
                                     SidebarMenuAction::Remove => remove_project = Some(index),
                                     SidebarMenuAction::ResetName => {}
+                                    SidebarMenuAction::Pin => {
+                                        pin_folder = Some(project.root.clone())
+                                    }
+                                    SidebarMenuAction::Unpin => {
+                                        unpin_folder = Some(project.root.clone())
+                                    }
+                                    SidebarMenuAction::OpenInFiles => {
+                                        open_in_files = Some(project.root.clone())
+                                    }
                                 }
                             }
 
@@ -1892,18 +2013,26 @@ impl SnapPdfApp {
                                     self.current_path.as_deref(),
                                     &self.state.file_aliases,
                                     &mut self.collapsed_directories,
+                                    &self.state.pinned_files,
+                                    &self.state.pinned_folders,
+                                    self.state.sidebar_file_icons,
                                 ) {
                                     match action {
                                         TreeAction::Open(path) => open_after_ui = Some(path),
                                         TreeAction::OpenWith(path) => {
                                             open_with_request = Some(path)
                                         }
+                                        TreeAction::OpenInFiles(path) => open_in_files = Some(path),
                                         TreeAction::Rename(path, name) => {
                                             rename_request = Some((RenameTarget::File(path), name));
                                         }
                                         TreeAction::ResetName(path) => {
                                             clear_file_alias = Some(path)
                                         }
+                                        TreeAction::PinFile(path) => pin_file = Some(path),
+                                        TreeAction::UnpinFile(path) => unpin_file = Some(path),
+                                        TreeAction::PinFolder(path) => pin_folder = Some(path),
+                                        TreeAction::UnpinFolder(path) => unpin_folder = Some(path),
                                     }
                                 }
                             }
@@ -1932,22 +2061,35 @@ impl SnapPdfApp {
                                     selected,
                                     NavIcon::Recent,
                                     0.0,
+                                    self.state.sidebar_file_icons,
                                 );
-                                row.body
-                                    .clone()
-                                    .on_hover_text(item.path.display().to_string());
+                                if self.state.display_name(&item.path).chars().count()
+                                    > max_sidebar_label_chars(
+                                        &row.body,
+                                        0.0,
+                                        self.state.sidebar_file_icons,
+                                    )
+                                {
+                                    row.body
+                                        .clone()
+                                        .on_hover_text(self.state.display_name(&item.path));
+                                }
                                 if row.body.clicked() && !row.options.clicked() {
                                     open_after_ui = Some(item.path.clone());
                                 }
                                 if let Some(action) = sidebar_options_popup(
                                     &row.options,
-                                    "RECENT PDF",
                                     self.state.file_aliases.contains_key(&item.path),
                                     false,
+                                    true,
+                                    self.state.pinned_files.contains(&item.path),
                                 ) {
                                     match action {
                                         SidebarMenuAction::OpenWith => {
                                             open_with_request = Some(item.path.clone());
+                                        }
+                                        SidebarMenuAction::OpenInFiles => {
+                                            open_in_files = Some(item.path.clone())
                                         }
                                         SidebarMenuAction::Rename => {
                                             rename_request = Some((
@@ -1959,6 +2101,12 @@ impl SnapPdfApp {
                                             clear_file_alias = Some(item.path.clone());
                                         }
                                         SidebarMenuAction::Remove => {}
+                                        SidebarMenuAction::Pin => {
+                                            pin_file = Some(item.path.clone())
+                                        }
+                                        SidebarMenuAction::Unpin => {
+                                            unpin_file = Some(item.path.clone())
+                                        }
                                     }
                                 }
                             }
@@ -1967,6 +2115,36 @@ impl SnapPdfApp {
                         if let Some(index) = remove_project {
                             let project = self.state.projects.remove(index);
                             self.project_files.remove(&project.root);
+                            self.state
+                                .pinned_folders
+                                .retain(|path| path != &project.root);
+                            self.persist();
+                        }
+                        if let Some(path) = pin_file {
+                            self.state.pinned_files.retain(|item| item != &path);
+                            self.state.pinned_files.insert(0, path);
+                            self.persist();
+                        }
+                        if let Some(path) = unpin_file {
+                            self.state.pinned_files.retain(|item| item != &path);
+                            self.persist();
+                        }
+                        if let Some(path) = pin_folder {
+                            self.state.pinned_folders.retain(|item| item != &path);
+                            self.state.pinned_folders.insert(0, path.clone());
+                            if let Some(index) = self
+                                .state
+                                .projects
+                                .iter()
+                                .position(|project| project.root == path)
+                            {
+                                let project = self.state.projects.remove(index);
+                                self.state.projects.insert(0, project);
+                            }
+                            self.persist();
+                        }
+                        if let Some(path) = unpin_folder {
+                            self.state.pinned_folders.retain(|item| item != &path);
                             self.persist();
                         }
                         if let Some(path) = clear_file_alias {
@@ -1983,6 +2161,9 @@ impl SnapPdfApp {
                         }
                         if let Some(path) = open_with_request {
                             self.request_open_with(path);
+                        }
+                        if let Some(path) = open_in_files {
+                            self.open_path_in_file_manager(&path);
                         }
                     });
             });
@@ -2454,6 +2635,7 @@ impl SnapPdfApp {
                     .inner_margin(Margin::symmetric(8, 1)),
             )
             .show(root, |ui| {
+                ui.add_space(3.0);
                 self.document_tabs(ui);
                 ui.separator();
                 let mut breadcrumb_action = None;
@@ -2725,7 +2907,10 @@ impl SnapPdfApp {
                                     self.redo_annotation();
                                 }
                                 ui.separator();
-                                ui.color_edit_button_srgba(&mut self.annotation_color);
+                                ui.scope(|ui| {
+                                    ui.spacing_mut().interact_size = vec2(26.0, 26.0);
+                                    ui.color_edit_button_srgba(&mut self.annotation_color);
+                                });
                                 ui.separator();
                                 if icon_button(
                                     ui,
@@ -2918,8 +3103,10 @@ impl SnapPdfApp {
                     )
                 });
 
-                let mut scroll_source = egui::containers::scroll_area::ScrollSource::default();
-                scroll_source.mouse_wheel = !pinch_in_progress;
+                let scroll_source = egui::containers::scroll_area::ScrollSource {
+                    mouse_wheel: !pinch_in_progress,
+                    ..Default::default()
+                };
                 let mut document_scroll = ScrollArea::both()
                     .id_salt("document-scroll")
                     .auto_shrink([false, false])
@@ -3037,10 +3224,8 @@ impl SnapPdfApp {
                                     if let Some(glyphs) = self.text_layers.get(page) {
                                         if let Some(glyph) = nearest_drag_glyph(
                                             glyphs, *rect, page_sizes[*page], clamped,
-                                        ) {
-                                            if let Some(selection) = self.text_selection.as_mut() {
-                                                selection.focus = TextPosition { page: *page, glyph };
-                                            }
+                                        ) && let Some(selection) = self.text_selection.as_mut() {
+                                            selection.focus = TextPosition { page: *page, glyph };
                                         }
                                     } else {
                                         self.request_text(*page, generation);
@@ -3287,12 +3472,10 @@ impl SnapPdfApp {
                                                 } else if response.dragged()
                                                     && self.text_selection_dragging
                                                     && page_rect.contains(pointer)
+                                                    && let Some(glyph) = nearest_drag_glyph(glyphs, page_rect, source_size, pointer)
+                                                    && let Some(selection) = self.text_selection.as_mut()
                                                 {
-                                                    if let Some(glyph) = nearest_drag_glyph(glyphs, page_rect, source_size, pointer)
-                                                        && let Some(selection) = self.text_selection.as_mut()
-                                                    {
-                                                        selection.focus = TextPosition { page: index, glyph };
-                                                    }
+                                                    selection.focus = TextPosition { page: index, glyph };
                                                 }
                                                 if response.hovered() { ctx.set_cursor_icon(CursorIcon::Text); }
                                             }
@@ -3691,23 +3874,27 @@ impl SnapPdfApp {
         let mut parts = Vec::new();
         for page in first.page..=last.page {
             let glyphs = self.text_layers.get(&page)?;
-            if let Some((start, end)) = selection.bounds_on_page(page, glyphs.len()) {
-                if let Some(text) = selected_glyph_text(glyphs, start, end) {
-                    parts.push(text);
-                }
+            if let Some((start, end)) = selection.bounds_on_page(page, glyphs.len())
+                && let Some(text) = selected_glyph_text(glyphs, start, end)
+            {
+                parts.push(text);
             }
         }
         (!parts.is_empty()).then(|| parts.join("\n"))
     }
 
     fn selection_text_ready(&self) -> bool {
-        let Some(selection) = self.text_selection else { return false; };
+        let Some(selection) = self.text_selection else {
+            return false;
+        };
         let (first, last) = selection.ordered();
         (first.page..=last.page).all(|page| self.text_layers.contains_key(&page))
     }
 
     fn highlight_text_selection(&mut self) {
-        let Some(selection) = self.text_selection else { return; };
+        let Some(selection) = self.text_selection else {
+            return;
+        };
         if !self.selection_text_ready() {
             self.pending_selection_highlight = true;
             let (first, last) = selection.ordered();
@@ -3722,21 +3909,35 @@ impl SnapPdfApp {
         let (first, last) = selection.ordered();
         let mut saved = 0;
         for page in first.page..=last.page {
-            let Some(glyphs) = self.text_layers.get(&page) else { continue; };
-            let Some((start, end)) = selection.bounds_on_page(page, glyphs.len()) else { continue; };
+            let Some(glyphs) = self.text_layers.get(&page) else {
+                continue;
+            };
+            let Some((start, end)) = selection.bounds_on_page(page, glyphs.len()) else {
+                continue;
+            };
             let rects = glyphs[start..=end]
                 .iter()
                 .filter_map(|glyph| glyph.bounds)
                 .collect::<Vec<_>>();
             if !rects.is_empty() {
-                self.add_annotation(page, AnnotationKind::Highlight {
-                    rects,
-                    color: [self.annotation_color.r(), self.annotation_color.g(), self.annotation_color.b(), 86],
-                });
+                self.add_annotation(
+                    page,
+                    AnnotationKind::Highlight {
+                        rects,
+                        color: [
+                            self.annotation_color.r(),
+                            self.annotation_color.g(),
+                            self.annotation_color.b(),
+                            86,
+                        ],
+                    },
+                );
                 saved += 1;
             }
         }
-        if saved > 0 { self.status = "Highlight saved locally.".to_owned(); }
+        if saved > 0 {
+            self.status = "Highlight saved locally.".to_owned();
+        }
     }
 
     fn rename_dialog(&mut self, ctx: &egui::Context) {
@@ -3888,7 +4089,9 @@ impl SnapPdfApp {
             return;
         }
         let mut open = true;
-        let mut ratio = self.state.chrome_scale_ratio;
+        let mut toolbar_ratio = self.state.chrome_scale_ratio;
+        let mut sidebar_ratio = self.state.sidebar_scale_ratio;
+        let mut file_icons = self.state.sidebar_file_icons;
         let mut changed = false;
         egui::Window::new("View settings")
             .open(&mut open)
@@ -3898,34 +4101,62 @@ impl SnapPdfApp {
             .show(ctx, |ui| {
                 ui.label(RichText::new("Interface scale").strong());
                 ui.label(
-                    RichText::new(
-                        "Size of tabs, toolbar, navigation rail, and sidebar relative to PDF zoom.",
-                    )
-                    .size(11.5)
-                    .color(theme::MUTED),
+                    RichText::new("Keep controls compact while making the PDF the visual focus.")
+                        .size(11.5)
+                        .color(theme::MUTED),
                 );
                 ui.add_space(8.0);
-                changed = ui
+                ui.label(RichText::new("Top bar").size(12.0));
+                changed |= ui
                     .add(
-                        egui::Slider::new(&mut ratio, 0.4..=1.0)
+                        egui::Slider::new(&mut toolbar_ratio, 0.4..=1.0)
                             .step_by(0.05)
                             .custom_formatter(|value, _| {
                                 format!("{}%", (value * 100.0).round() as i32)
                             }),
                     )
                     .changed();
-                ui.add_space(4.0);
-                if ui.small_button("Reset to 60%").clicked() {
-                    ratio = 0.6;
+                ui.add_space(7.0);
+                ui.label(RichText::new("File explorer").size(12.0));
+                changed |= ui
+                    .add(
+                        egui::Slider::new(&mut sidebar_ratio, 0.5..=1.25)
+                            .step_by(0.05)
+                            .custom_formatter(|value, _| {
+                                format!("{}%", (value * 100.0).round() as i32)
+                            }),
+                    )
+                    .changed();
+                ui.add_space(6.0);
+                if ui.small_button("Reset defaults (60% / 80%)").clicked() {
+                    toolbar_ratio = 0.6;
+                    sidebar_ratio = 0.8;
                     changed = true;
                 }
+                ui.add_space(10.0);
+                ui.label(RichText::new("PDF icons in explorer").size(12.0));
+                changed |= ui
+                    .radio_value(&mut file_icons, SidebarFileIcons::Standard, "Standard")
+                    .changed();
+                changed |= ui
+                    .radio_value(
+                        &mut file_icons,
+                        SidebarFileIcons::VsCode,
+                        "VS Code-style PDF",
+                    )
+                    .changed();
+                changed |= ui
+                    .radio_value(&mut file_icons, SidebarFileIcons::None, "No icons")
+                    .changed();
             });
         if !open {
             self.show_view_settings = false;
         }
         if changed {
-            self.state.chrome_scale_ratio = ratio;
-            ctx.set_zoom_factor(chrome_zoom(self.state.ui_scale, ratio));
+            self.state.chrome_scale_ratio = toolbar_ratio;
+            self.state.sidebar_scale_ratio = sidebar_ratio;
+            self.state.sidebar_file_icons = file_icons;
+            ctx.set_zoom_factor(chrome_zoom(self.state.ui_scale, toolbar_ratio));
             self.persist();
         }
     }
@@ -4282,6 +4513,7 @@ impl eframe::App for SnapPdfApp {
 enum NavIcon {
     Recent,
     File,
+    Folder,
 }
 
 #[derive(Clone, Copy)]
@@ -4355,8 +4587,11 @@ struct SidebarRowResponse {
 #[derive(Clone, Copy)]
 enum SidebarMenuAction {
     OpenWith,
+    OpenInFiles,
     Rename,
     ResetName,
+    Pin,
+    Unpin,
     Remove,
 }
 
@@ -4393,6 +4628,7 @@ fn build_pdf_tree(root: &Path, files: &[PathBuf]) -> PdfTreeNode {
     tree
 }
 
+#[allow(clippy::too_many_arguments)]
 fn render_pdf_tree(
     ui: &mut egui::Ui,
     node: &PdfTreeNode,
@@ -4400,30 +4636,58 @@ fn render_pdf_tree(
     current_path: Option<&Path>,
     aliases: &HashMap<PathBuf, String>,
     collapsed: &mut HashSet<PathBuf>,
+    pinned_files: &[PathBuf],
+    pinned_folders: &[PathBuf],
+    file_icons: SidebarFileIcons,
 ) -> Option<TreeAction> {
     let mut action = None;
-    for child in node.directories.values() {
+    let mut directories: Vec<_> = node.directories.values().collect();
+    directories.sort_by_key(|child| !pinned_folders.contains(&child.path));
+    for child in directories {
         let is_collapsed = collapsed.contains(&child.path);
-        let response = directory_row(
+        let row = directory_row(
             ui,
             &child.name,
             pdf_tree_count(child),
             !is_collapsed,
             24.0 + depth as f32 * 14.0,
         );
-        response
+        row.body
             .clone()
             .on_hover_text(child.path.display().to_string());
-        if response.clicked() {
+        if row.body.clicked() && !row.options.clicked() {
             if is_collapsed {
                 collapsed.remove(&child.path);
             } else {
                 collapsed.insert(child.path.clone());
             }
         }
+        if let Some(menu_action) = sidebar_options_popup(
+            &row.options,
+            false,
+            false,
+            false,
+            pinned_folders.contains(&child.path),
+        ) {
+            action = match menu_action {
+                SidebarMenuAction::Pin => Some(TreeAction::PinFolder(child.path.clone())),
+                SidebarMenuAction::Unpin => Some(TreeAction::UnpinFolder(child.path.clone())),
+                _ => action,
+            };
+        }
         if !is_collapsed {
-            action =
-                render_pdf_tree(ui, child, depth + 1, current_path, aliases, collapsed).or(action);
+            action = render_pdf_tree(
+                ui,
+                child,
+                depth + 1,
+                current_path,
+                aliases,
+                collapsed,
+                pinned_files,
+                pinned_folders,
+                file_icons,
+            )
+            .or(action);
         }
     }
     for path in &node.files {
@@ -4438,22 +4702,31 @@ fn render_pdf_tree(
             selected,
             NavIcon::File,
             24.0 + depth as f32 * 14.0,
+            file_icons,
         );
-        row.body.clone().on_hover_text(path.display().to_string());
+        if label.chars().count()
+            > max_sidebar_label_chars(&row.body, 24.0 + depth as f32 * 14.0, file_icons)
+        {
+            row.body.clone().on_hover_text(label.clone());
+        }
         if row.body.clicked() && !row.options.clicked() {
             action = Some(TreeAction::Open(path.clone()));
         }
         if let Some(menu_action) = sidebar_options_popup(
             &row.options,
-            "PDF OPTIONS",
             aliases.contains_key(path),
             false,
+            true,
+            pinned_files.contains(path),
         ) {
             action = match menu_action {
                 SidebarMenuAction::OpenWith => Some(TreeAction::OpenWith(path.clone())),
+                SidebarMenuAction::OpenInFiles => Some(TreeAction::OpenInFiles(path.clone())),
                 SidebarMenuAction::Rename => Some(TreeAction::Rename(path.clone(), label)),
                 SidebarMenuAction::ResetName => Some(TreeAction::ResetName(path.clone())),
-                SidebarMenuAction::Remove => action,
+                SidebarMenuAction::Pin => Some(TreeAction::PinFile(path.clone())),
+                SidebarMenuAction::Unpin => Some(TreeAction::UnpinFile(path.clone())),
+                _ => action,
             };
         }
     }
@@ -4470,7 +4743,7 @@ fn directory_row(
     count: usize,
     expanded: bool,
     indent: f32,
-) -> Response {
+) -> SidebarRowResponse {
     let (rect, response) = ui.allocate_exact_size(vec2(ui.available_width(), 30.0), Sense::click());
     if response.hovered() {
         ui.painter().rect_filled(
@@ -4512,7 +4785,11 @@ fn directory_row(
         FontId::proportional(10.5),
         theme::MUTED,
     );
-    response
+    let options = sidebar_options_button(ui, rect, &response);
+    SidebarRowResponse {
+        body: response,
+        options,
+    }
 }
 
 fn project_header(
@@ -4582,6 +4859,7 @@ fn nav_row(
     selected: bool,
     icon: NavIcon,
     indent: f32,
+    file_icons: SidebarFileIcons,
 ) -> SidebarRowResponse {
     let (rect, response) = ui.allocate_exact_size(vec2(ui.available_width(), 34.0), Sense::click());
     let painter = ui.painter();
@@ -4604,12 +4882,20 @@ fn nav_row(
     } else {
         theme::MUTED
     };
+    let is_pdf = matches!(icon, NavIcon::Recent | NavIcon::File);
+    let show_icon = !is_pdf || file_icons != SidebarFileIcons::None;
     let icon_center = pos2(rect.left() + indent + 13.0, rect.center().y);
-    match icon {
-        NavIcon::Recent => paint_recent_icon(painter, icon_center, icon_color),
-        NavIcon::File => paint_file_icon(painter, icon_center, icon_color),
+    if show_icon {
+        match icon {
+            NavIcon::Recent | NavIcon::File if file_icons == SidebarFileIcons::VsCode => {
+                paint_vscode_pdf_icon(painter, icon_center)
+            }
+            NavIcon::Recent => paint_recent_icon(painter, icon_center, icon_color),
+            NavIcon::File => paint_file_icon(painter, icon_center, icon_color),
+            NavIcon::Folder => paint_folder_icon(painter, icon_center, icon_color),
+        }
     }
-    let text_left = rect.left() + indent + 28.0;
+    let text_left = rect.left() + indent + if show_icon { 28.0 } else { 8.0 };
     let max_chars = ((rect.right() - text_left - 32.0) / 7.0).max(4.0) as usize;
     painter.text(
         pos2(text_left, rect.center().y),
@@ -4627,6 +4913,21 @@ fn nav_row(
         body: response,
         options,
     }
+}
+
+fn max_sidebar_label_chars(
+    response: &Response,
+    indent: f32,
+    file_icons: SidebarFileIcons,
+) -> usize {
+    let text_left = response.rect.left()
+        + indent
+        + if file_icons == SidebarFileIcons::None {
+            8.0
+        } else {
+            28.0
+        };
+    ((response.rect.right() - text_left - 32.0) / 7.0).max(4.0) as usize
 }
 
 fn sidebar_options_button(ui: &mut egui::Ui, row_rect: Rect, row: &Response) -> Response {
@@ -4650,25 +4951,44 @@ fn sidebar_options_button(ui: &mut egui::Ui, row_rect: Rect, row: &Response) -> 
 
 fn sidebar_options_popup(
     response: &Response,
-    title: &str,
     can_reset_name: bool,
     can_remove: bool,
+    include_file_actions: bool,
+    pinned: bool,
 ) -> Option<SidebarMenuAction> {
     let mut action = None;
     egui::Popup::menu(response)
-        .width(214.0)
+        .width(172.0)
         .frame(
             Frame::new()
                 .fill(Color32::from_rgb(29, 31, 37))
                 .stroke(Stroke::new(1.0, Color32::from_rgb(61, 64, 75)))
-                .corner_radius(CornerRadius::same(10))
-                .inner_margin(Margin::same(7)),
+                .corner_radius(CornerRadius::same(8))
+                .inner_margin(Margin::same(5)),
         )
         .show(|ui| {
-            ui.label(RichText::new(title).size(11.0).strong().color(theme::MUTED));
-            ui.add_space(3.0);
-            if !can_remove && popup_menu_row(ui, "Open with...", Color32::from_rgb(225, 227, 234)) {
+            if include_file_actions
+                && popup_menu_row(ui, "Open with...", Color32::from_rgb(225, 227, 234))
+            {
                 action = Some(SidebarMenuAction::OpenWith);
+                ui.close();
+            }
+            if include_file_actions
+                && popup_menu_row(ui, "Open in Files", Color32::from_rgb(225, 227, 234))
+            {
+                action = Some(SidebarMenuAction::OpenInFiles);
+                ui.close();
+            }
+            if popup_menu_row(
+                ui,
+                if pinned { "Unpin" } else { "Pin to top" },
+                Color32::from_rgb(225, 227, 234),
+            ) {
+                action = Some(if pinned {
+                    SidebarMenuAction::Unpin
+                } else {
+                    SidebarMenuAction::Pin
+                });
                 ui.close();
             }
             if popup_menu_row(ui, "Rename display name", Color32::from_rgb(225, 227, 234)) {
@@ -4726,6 +5046,34 @@ fn paint_file_icon(painter: &egui::Painter, center: egui::Pos2, color: Color32) 
             pos2(rect.right() - 2.0, center.y + 2.0),
         ],
         Stroke::new(1.0, color.gamma_multiply(0.8)),
+    );
+}
+
+/// Compact red PDF glyph inspired by the file association used in VS Code.
+fn paint_vscode_pdf_icon(painter: &egui::Painter, center: egui::Pos2) {
+    let page = Rect::from_center_size(center, vec2(12.0, 15.0));
+    painter.rect_filled(
+        page,
+        CornerRadius::same(1),
+        Color32::from_rgb(246, 246, 246),
+    );
+    painter.rect_stroke(
+        page,
+        CornerRadius::same(1),
+        Stroke::new(0.8, Color32::from_rgb(172, 172, 172)),
+        StrokeKind::Inside,
+    );
+    let band = Rect::from_min_max(
+        pos2(page.left(), page.center().y - 3.0),
+        pos2(page.right(), page.center().y + 3.0),
+    );
+    painter.rect_filled(band, 0.0, Color32::from_rgb(220, 63, 54));
+    painter.text(
+        band.center(),
+        Align2::CENTER_CENTER,
+        "PDF",
+        FontId::proportional(5.0),
+        Color32::WHITE,
     );
 }
 
@@ -5025,7 +5373,9 @@ fn paint_text_selection(
     page_rect: Rect,
     source_size: [f32; 2],
 ) {
-    let Some(selected) = glyphs.get(first..=last) else { return; };
+    let Some(selected) = glyphs.get(first..=last) else {
+        return;
+    };
     for glyph in selected {
         if let Some(rect) = glyph_screen_rect(glyph, page_rect, source_size) {
             painter.rect_filled(
@@ -5060,12 +5410,17 @@ fn nearest_drag_glyph(
     source_size: [f32; 2],
     pointer: egui::Pos2,
 ) -> Option<usize> {
-    glyphs.iter().enumerate().filter_map(|(index, glyph)| {
-        let rect = glyph_screen_rect(glyph, page_rect, source_size)?;
-        let dx = (rect.left() - pointer.x).max(0.0) + (pointer.x - rect.right()).max(0.0);
-        let dy = (rect.top() - pointer.y).max(0.0) + (pointer.y - rect.bottom()).max(0.0);
-        Some((index, dx * dx + dy * dy))
-    }).min_by(|a, b| a.1.total_cmp(&b.1)).map(|(index, _)| index)
+    glyphs
+        .iter()
+        .enumerate()
+        .filter_map(|(index, glyph)| {
+            let rect = glyph_screen_rect(glyph, page_rect, source_size)?;
+            let dx = (rect.left() - pointer.x).max(0.0) + (pointer.x - rect.right()).max(0.0);
+            let dy = (rect.top() - pointer.y).max(0.0) + (pointer.y - rect.bottom()).max(0.0);
+            Some((index, dx * dx + dy * dy))
+        })
+        .min_by(|a, b| a.1.total_cmp(&b.1))
+        .map(|(index, _)| index)
 }
 
 /// Positive values move PDF content down, negative values move it up.
@@ -5640,6 +5995,7 @@ fn chrome_zoom(document_zoom: f32, ratio: f32) -> f32 {
 /// coordinate is the sum of prior page heights plus its relative position;
 /// page gaps cancel because they are not zoomed. Horizontally, each page is
 /// centered within the (possibly wider) document canvas.
+#[allow(clippy::too_many_arguments)]
 fn pinch_anchored_offset(
     previous_offset: egui::Vec2,
     anchor: PinchAnchor,
@@ -6550,11 +6906,18 @@ mod tests {
     fn pinch_preserves_document_point_using_absolute_scroll_offset() {
         let pages = [[400.0, 600.0], [400.0, 800.0]];
         let anchor = PinchAnchor {
-            page: 1, fraction: vec2(0.25, 0.5),
+            page: 1,
+            fraction: vec2(0.25, 0.5),
         };
         let actual = pinch_anchored_offset(
-            vec2(50.0, 200.0), anchor, &pages, 1.0, 1.5,
-            600.0, 656.0, false,
+            vec2(50.0, 200.0),
+            anchor,
+            &pages,
+            1.0,
+            1.5,
+            600.0,
+            656.0,
+            false,
         );
         // Y: 200 + (600 + 800*0.5)*0.5 = 700.
         // X: 50 + (656-600)/2 + (0.25-0.5)*400*0.5 = 28.
@@ -6566,11 +6929,18 @@ mod tests {
     fn pinch_offset_excludes_hidden_pages_in_presentation_mode() {
         let pages = [[400.0, 600.0], [400.0, 800.0]];
         let anchor = PinchAnchor {
-            page: 1, fraction: vec2(0.5, 0.25),
+            page: 1,
+            fraction: vec2(0.5, 0.25),
         };
         let actual = pinch_anchored_offset(
-            vec2(0.0, 100.0), anchor, &pages, 1.0, 1.5,
-            700.0, 700.0, true,
+            vec2(0.0, 100.0),
+            anchor,
+            &pages,
+            1.0,
+            1.5,
+            700.0,
+            700.0,
+            true,
         );
         assert!((actual.y - 200.0).abs() < 0.001);
         assert_eq!(actual.x, 0.0);
@@ -6579,11 +6949,18 @@ mod tests {
     #[test]
     fn pinch_offset_never_goes_negative() {
         let anchor = PinchAnchor {
-            page: 0, fraction: vec2(0.2, 0.2),
+            page: 0,
+            fraction: vec2(0.2, 0.2),
         };
         let actual = pinch_anchored_offset(
-            vec2(0.0, 0.0), anchor, &[[400.0, 600.0]], 2.0, 1.0,
-            856.0, 456.0, false,
+            vec2(0.0, 0.0),
+            anchor,
+            &[[400.0, 600.0]],
+            2.0,
+            1.0,
+            856.0,
+            456.0,
+            false,
         );
         assert_eq!(actual, egui::Vec2::ZERO);
     }
@@ -6593,8 +6970,14 @@ mod tests {
         let start = TextPosition { page: 2, glyph: 3 };
         let end = TextPosition { page: 4, glyph: 1 };
         for selection in [
-            TextSelection { anchor: start, focus: end },
-            TextSelection { anchor: end, focus: start },
+            TextSelection {
+                anchor: start,
+                focus: end,
+            },
+            TextSelection {
+                anchor: end,
+                focus: start,
+            },
         ] {
             assert_eq!(selection.ordered(), (start, end));
             assert_eq!(selection.bounds_on_page(1, 9), None);
@@ -6617,11 +7000,22 @@ mod tests {
     fn drag_extends_selection_in_page_margin() {
         let page = Rect::from_min_max(pos2(0.0, 0.0), pos2(200.0, 200.0));
         let glyphs = vec![
-            TextGlyph { text: "A".to_owned(), bounds: Some([15.0, 175.0, 25.0, 190.0]) },
-            TextGlyph { text: "B".to_owned(), bounds: Some([15.0, 10.0, 25.0, 25.0]) },
+            TextGlyph {
+                text: "A".to_owned(),
+                bounds: Some([15.0, 175.0, 25.0, 190.0]),
+            },
+            TextGlyph {
+                text: "B".to_owned(),
+                bounds: Some([15.0, 10.0, 25.0, 25.0]),
+            },
         ];
-        assert_eq!(nearest_drag_glyph(&glyphs, page, [200.0, 200.0], pos2(150.0, 230.0)), Some(1));
-        assert_eq!(nearest_drag_glyph(&glyphs, page, [200.0, 200.0], pos2(150.0, -20.0)), Some(0));
+        assert_eq!(
+            nearest_drag_glyph(&glyphs, page, [200.0, 200.0], pos2(150.0, 230.0)),
+            Some(1)
+        );
+        assert_eq!(
+            nearest_drag_glyph(&glyphs, page, [200.0, 200.0], pos2(150.0, -20.0)),
+            Some(0)
+        );
     }
-
 }
