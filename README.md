@@ -1,6 +1,6 @@
 # SnapPDF
 
-## A Project-Based PDF Reading Workspace
+## 1. Introduction
 
 Normal PDF viewers are excellent for one document at a time. Managing dozens of lecture notes, research papers, and PDFs spread across unrelated folders is a different problem.
 
@@ -18,7 +18,9 @@ Normal PDF viewers are excellent for one document at a time. Managing dozens of 
 
 In short, SnapPDF is not just another PDF viewer. It is a fast, filesystem-first workspace for managing and reading PDFs across multiple projects.
 
-## Install SnapPDF — no Git or development tools
+## 2. Installation
+
+### Install SnapPDF — no Git or development tools
 
 The recommended installation is the portable, checksum-verified AppImage. It installs only for your user account: no Rust, Cargo, compiler, `apt`, administrator password, or repository clone is needed.
 
@@ -86,9 +88,11 @@ cd Snapdf
 
 The source installer installs compilation dependencies on systems with `apt`, installs Rust when needed, builds SnapPDF, registers the desktop entry, and sets up OCR. Those build dependencies are needed only for compiling from source—not for the AppImage.
 
-## Getting started
+## 3. Usage
 
-### Build a PDF workspace
+### Getting started
+
+#### Build a PDF workspace
 
 1. Click **+ Project**, or press `Ctrl+K` then `Ctrl+O`.
 2. Choose the root folder for a course, project, or document collection.
@@ -112,11 +116,11 @@ Click the chat-bubble button in the document toolbar to open the resizable panel
 - **ChatGPT:** click **Continue with ChatGPT**. Sign-in happens in your normal browser through OpenAI's [official open-source account flow](https://developers.openai.com/siwc/token-sharing-open-source); SnapPDF never sees your password. Available models are loaded from your eligible account after sign-in.
 - **Gemini:** click **Connect Gemini** and paste a key created in [Google AI Studio](https://aistudio.google.com/app/apikey). Available Gemini models are loaded after the key is validated. A direct Google-account sign-in requires SnapPDF to have a registered Google OAuth client, so the portable open-source build deliberately uses the official user-owned API-key route instead of pretending to provide OAuth.
 
-Use the `＋` button in the composer to attach a PDF, image, or text file. **Attach current PDF** sends the document you are reading. The capture button beside it changes the cursor into a crosshair; drag around a diagram, equation, map, or paragraph and the exact rendered region is added as an image—without sending it through Math OCR.
+Use the paperclip button in the composer to attach a PDF, image, or text file. **Attach current PDF** sends the document you are reading. The capture button beside it changes the cursor into a crosshair; drag around a diagram, equation, map, or paragraph and the exact rendered region is added as an image—without sending it through Math OCR.
 
 Select ordinary PDF text and click **Ask** to attach it directly. After a normal Snip OCR operation, click **Add to study chat** to do the same with recognized text; it is not copied to the clipboard. Attachments remain local until you press **Send**. Each provider keeps a separate on-screen conversation; when you send, SnapPDF transmits that conversation's history and chosen attachments to that provider so follow-up questions retain context. SnapPDF does not upload projects or PDFs in the background.
 
-`Enter` sends a chat message; `Shift+Enter` adds another line. Remove an attachment with its `×` before sending, or close the study panel without affecting the PDF.
+`Enter` sends a chat message; `Shift+Enter` adds another line. Remove an attachment with its `×` before sending, or close the study panel without affecting the PDF. Closing the panel or SnapPDF does not delete a conversation. Use the chat selector to move between the five saved conversations, the new-chat button to start another, and the separate trash button to delete the current chat. When all five slots are occupied, SnapPDF warns before replacing the least recently opened chat; that warning can be disabled in the dialog or View settings.
 
 ### Search
 
@@ -139,7 +143,7 @@ Annotations are stored locally by default so the original file stays untouched. 
 
 Use the path-row buttons to print, open the PDF in another installed app, export, or save.
 
-## Reading modes
+### Reading modes
 
 The controls beside the annotation tools provide three focused views:
 
@@ -147,7 +151,7 @@ The controls beside the annotation tools provide three focused views:
 - **Reader mode** hides the sidebar and toolbar for distraction-free continuous reading. Page gaps are reduced. Temporary zoom changes made in this mode are discarded when you exit.
 - **Presentation mode** enters fullscreen and displays one page at a time. Each page fits the available screen height independently, which keeps different page sizes readable. `Space` / `Backspace`, `Right` / `Left`, and `J` / `K` move between pages. Press `Esc` or use the small top-left exit button to return. Temporary presentation zoom is discarded on exit.
 
-## Shortcuts
+### Shortcuts
 
 | Shortcut | Action |
 | --- | --- |
@@ -166,7 +170,9 @@ The controls beside the annotation tools provide three focused views:
 | `Ctrl+Z` / `Ctrl+Shift+Z` | Undo / redo an annotation |
 | `Esc` | Exit Reader or Presentation mode |
 
-## Project layout
+## 4. Reference and project details
+
+### Project layout
 
 ```text
 Snapdf/
@@ -178,7 +184,7 @@ Snapdf/
 └── README.md     # User guide
 ```
 
-## Build from source manually
+### Build from source manually
 
 For normal use, the AppImage is recommended. If Rust is already installed and you only want a development run:
 

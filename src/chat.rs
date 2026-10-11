@@ -22,7 +22,8 @@ const OPENAI_DISCOVERY: &str = "https://auth.openai.com/.well-known/openid-confi
 const OPENAI_API: &str = "https://api.openai.com/v1";
 const GEMINI_API: &str = "https://generativelanguage.googleapis.com/v1beta";
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum ChatProvider {
     ChatGpt,
     Gemini,
@@ -37,7 +38,8 @@ impl ChatProvider {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum ChatRole {
     User,
     Assistant,
@@ -70,10 +72,13 @@ impl ChatAttachment {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChatMessage {
     pub role: ChatRole,
     pub text: String,
+    /// Binary attachments are deliberately session-only. Persisting them would make the
+    /// workspace state unexpectedly huge; the surrounding conversation text is retained.
+    #[serde(skip, default)]
     pub attachments: Vec<ChatAttachment>,
 }
 
@@ -922,5 +927,23 @@ mod tests {
             value["parts"][0]["inline_data"]["mime_type"],
             "application/pdf"
         );
+    }
+
+    #[test]
+    fn persisted_chat_keeps_text_without_binary_attachments() {
+        let message = ChatMessage {
+            role: ChatRole::User,
+            text: "Explain the figure".to_owned(),
+            attachments: vec![ChatAttachment {
+                name: "large.png".to_owned(),
+                mime: "image/png".to_owned(),
+                bytes: vec![7; 1024],
+            }],
+        };
+        let encoded = serde_json::to_string(&message).unwrap();
+        assert!(!encoded.contains("large.png"));
+        let restored: ChatMessage = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(restored.text, "Explain the figure");
+        assert!(restored.attachments.is_empty());
     }
 }

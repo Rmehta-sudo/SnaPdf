@@ -3,7 +3,8 @@ use crate::chat::{
     mime_for_path,
 };
 use crate::model::{
-    Annotation, AnnotationKind, AppState, RecentDocument, SidebarFileIcons, is_pdf,
+    Annotation, AnnotationKind, AppState, RecentDocument, SidebarFileIcons, StudyChatSession,
+    is_pdf,
 };
 use crate::ocr::{OcrCommand, OcrEvent, OcrWorker};
 use crate::pdf::{
@@ -189,7 +190,9 @@ struct StudyChat {
     accounts: HashMap<ChatProvider, String>,
     models: HashMap<ChatProvider, Vec<String>>,
     selected_models: HashMap<ChatProvider, String>,
-    messages: HashMap<ChatProvider, Vec<ChatMessage>>,
+    sessions: Vec<StudyChatSession>,
+    active_session_id: u64,
+    pending_replacement_warning: bool,
     prompt: String,
     attachments: Vec<ChatAttachment>,
     status: String,
@@ -201,8 +204,17 @@ struct StudyChat {
     show_gemini_key: bool,
 }
 
-impl Default for StudyChat {
-    fn default() -> Self {
+impl StudyChat {
+    fn from_state(state: &AppState) -> Self {
+        let mut sessions = state.study_chats.clone();
+        if sessions.is_empty() {
+            sessions.push(new_study_chat_session(1));
+        }
+        sessions.truncate(5);
+        let active_session_id = state
+            .active_study_chat
+            .filter(|id| sessions.iter().any(|session| session.id == *id))
+            .unwrap_or(sessions[0].id);
         Self {
             visible: false,
             provider: ChatProvider::ChatGpt,
@@ -210,7 +222,9 @@ impl Default for StudyChat {
             accounts: HashMap::new(),
             models: HashMap::new(),
             selected_models: HashMap::new(),
-            messages: HashMap::new(),
+            sessions,
+            active_session_id,
+            pending_replacement_warning: false,
             prompt: String::new(),
             attachments: Vec::new(),
             status: "Connect a provider to start studying.".to_owned(),
@@ -222,6 +236,38 @@ impl Default for StudyChat {
             show_gemini_key: false,
         }
     }
+
+    fn active_session(&self) -> &StudyChatSession {
+        self.sessions
+            .iter()
+            .find(|session| session.id == self.active_session_id)
+            .unwrap_or(&self.sessions[0])
+    }
+
+    fn active_session_mut(&mut self) -> &mut StudyChatSession {
+        let index = self
+            .sessions
+            .iter()
+            .position(|session| session.id == self.active_session_id)
+            .unwrap_or(0);
+        &mut self.sessions[index]
+    }
+}
+
+fn new_study_chat_session(id: u64) -> StudyChatSession {
+    StudyChatSession {
+        id,
+        title: "New chat".to_owned(),
+        messages: HashMap::new(),
+        last_opened: unix_timestamp(),
+    }
+}
+
+fn unix_timestamp() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
 }
 
 struct NoteDraft {
@@ -418,6 +464,9 @@ impl SnapPdfApp {
         let mut state = storage::load();
         state.prune_missing();
         state.normalize_recents();
+        if state.study_chats.is_empty() && state.active_study_chat.is_none() {
+            state.warn_before_replacing_study_chat = true;
+        }
         let initial_path = initial_path
             .or_else(|| state.active_document.clone())
             .or_else(|| state.last_document.clone());
@@ -436,13 +485,14 @@ impl SnapPdfApp {
 
         let ocr_worker = OcrWorker::spawn(creation.egui_ctx.clone());
         let _ = ocr_worker.commands.send(OcrCommand::Warmup);
+        let study_chat = StudyChat::from_state(&state);
         let mut app = Self {
             state,
             session_recents,
             worker: RenderWorker::spawn(creation.egui_ctx.clone()),
             ocr_worker,
             chat_worker: ChatWorker::spawn(creation.egui_ctx.clone()),
-            study_chat: StudyChat::default(),
+            study_chat,
             project_files,
             current_path: None,
             page_sizes: Vec::new(),
@@ -880,9 +930,90 @@ impl SnapPdfApp {
     }
 
     fn persist(&mut self) {
+        self.state.study_chats = self.study_chat.sessions.clone();
+        self.state.active_study_chat = Some(self.study_chat.active_session_id);
         if let Err(error) = storage::save(&self.state) {
             self.status = format!("Could not save app state: {error}");
         }
+    }
+
+    fn activate_study_chat(&mut self, id: u64) {
+        if self.study_chat.busy || !self.study_chat.sessions.iter().any(|chat| chat.id == id) {
+            return;
+        }
+        self.study_chat.active_session_id = id;
+        self.study_chat.active_session_mut().last_opened = unix_timestamp();
+        self.study_chat.attachments.clear();
+        self.study_chat.prompt.clear();
+        self.study_chat.status = "Ready".to_owned();
+        self.persist();
+    }
+
+    fn replace_oldest_study_chat(&mut self) {
+        if self.study_chat.busy {
+            return;
+        }
+        let id = self
+            .study_chat
+            .sessions
+            .iter()
+            .map(|chat| chat.id)
+            .max()
+            .unwrap_or(0)
+            .wrapping_add(1);
+        if self.study_chat.sessions.len() < 5 {
+            self.study_chat.sessions.push(new_study_chat_session(id));
+        } else if let Some((index, _)) = self
+            .study_chat
+            .sessions
+            .iter()
+            .enumerate()
+            .min_by_key(|(_, chat)| chat.last_opened)
+        {
+            self.study_chat.sessions[index] = new_study_chat_session(id);
+        }
+        self.study_chat.active_session_id = id;
+        self.study_chat.pending_replacement_warning = false;
+        self.study_chat.attachments.clear();
+        self.study_chat.prompt.clear();
+        self.study_chat.status = "New chat ready.".to_owned();
+        self.persist();
+    }
+
+    fn request_new_study_chat(&mut self) {
+        if self.study_chat.busy {
+            return;
+        }
+        if self.study_chat.sessions.len() >= 5 && self.state.warn_before_replacing_study_chat {
+            self.study_chat.pending_replacement_warning = true;
+        } else {
+            self.replace_oldest_study_chat();
+        }
+    }
+
+    fn delete_active_study_chat(&mut self) {
+        if self.study_chat.busy {
+            return;
+        }
+        let active = self.study_chat.active_session_id;
+        self.study_chat.sessions.retain(|chat| chat.id != active);
+        if self.study_chat.sessions.is_empty() {
+            self.study_chat
+                .sessions
+                .push(new_study_chat_session(active.wrapping_add(1)));
+        }
+        let next = self
+            .study_chat
+            .sessions
+            .iter()
+            .max_by_key(|chat| chat.last_opened)
+            .map(|chat| chat.id)
+            .unwrap_or(1);
+        self.study_chat.active_session_id = next;
+        self.study_chat.attachments.clear();
+        self.study_chat.prompt.clear();
+        self.study_chat.status = "Chat deleted.".to_owned();
+        self.persist();
     }
 
     fn handle_events(&mut self, ctx: &egui::Context) {
@@ -1176,10 +1307,14 @@ impl SnapPdfApp {
                 ChatEvent::ResponseDelta { request_id, text }
                     if self.study_chat.active_request == Some(request_id) =>
                 {
-                    if let Some(message) = self
-                        .study_chat
-                        .active_provider
-                        .and_then(|provider| self.study_chat.messages.get_mut(&provider))
+                    let provider = self.study_chat.active_provider;
+                    if let Some(message) = provider
+                        .and_then(|provider| {
+                            self.study_chat
+                                .active_session_mut()
+                                .messages
+                                .get_mut(&provider)
+                        })
                         .and_then(|messages| messages.last_mut())
                         && message.role == ChatRole::Assistant
                     {
@@ -1193,6 +1328,7 @@ impl SnapPdfApp {
                     self.study_chat.active_request = None;
                     self.study_chat.active_provider = None;
                     self.study_chat.status = "Ready".to_owned();
+                    self.persist();
                 }
                 ChatEvent::Error {
                     provider,
@@ -1202,10 +1338,14 @@ impl SnapPdfApp {
                     if request_id.is_some() && request_id == self.study_chat.active_request {
                         self.study_chat.busy = false;
                         self.study_chat.active_request = None;
-                        if let Some(reply) = self
-                            .study_chat
-                            .active_provider
-                            .and_then(|provider| self.study_chat.messages.get_mut(&provider))
+                        let active_provider = self.study_chat.active_provider;
+                        if let Some(reply) = active_provider
+                            .and_then(|provider| {
+                                self.study_chat
+                                    .active_session_mut()
+                                    .messages
+                                    .get_mut(&provider)
+                            })
                             .and_then(|messages| messages.last_mut())
                             && reply.role == ChatRole::Assistant
                             && reply.text.is_empty()
@@ -1984,100 +2124,307 @@ impl SnapPdfApp {
                     .inner_margin(Margin::same(10)),
             )
             .show(root, |ui| {
-                // The document uses the global zoom; the explorer has its own readable scale.
-                let explorer_factor = (self.state.sidebar_scale_ratio
-                    / self.state.chrome_scale_ratio.max(0.1))
-                .clamp(0.1, 4.0);
-                ui.style_mut().spacing.item_spacing *= explorer_factor;
-                ui.style_mut().spacing.button_padding *= explorer_factor;
-                ui.style_mut().spacing.interact_size *= explorer_factor;
-                for font in ui.style_mut().text_styles.values_mut() {
-                    font.size *= explorer_factor;
-                }
-                ui.horizontal(|ui| {
-                    if ui
-                        .button("Open")
-                        .on_hover_text("Open a PDF (Ctrl+O)")
-                        .clicked()
-                    {
-                        self.open_file_dialog();
+                bounded_panel_content(ui, "project-sidebar-content", |ui| {
+                    // The document uses the global zoom; the explorer has its own readable scale.
+                    let explorer_factor = (self.state.sidebar_scale_ratio
+                        / self.state.chrome_scale_ratio.max(0.1))
+                    .clamp(0.1, 4.0);
+                    ui.style_mut().spacing.item_spacing *= explorer_factor;
+                    ui.style_mut().spacing.button_padding *= explorer_factor;
+                    ui.style_mut().spacing.interact_size *= explorer_factor;
+                    for font in ui.style_mut().text_styles.values_mut() {
+                        font.size *= explorer_factor;
                     }
-                    ui.separator();
-                    if ui
-                        .button("+ Project")
-                        .on_hover_text("Add a PDF project folder")
-                        .clicked()
-                    {
-                        self.add_project_dialog();
-                    }
-                    ui.separator();
-                    if ui
-                        .button("Refresh")
-                        .on_hover_text("Rescan project folders")
-                        .clicked()
-                    {
-                        self.refresh_projects();
-                    }
-                });
-                ui.add_space(4.0);
-                if self.sidebar_tab == SidebarTab::Contents {
-                    self.outline_sidebar(ui);
-                    return;
-                }
-                if self.sidebar_tab == SidebarTab::Search {
-                    self.search_sidebar(ui);
-                    return;
-                }
-                ui.add_sized(
-                    [ui.available_width(), 34.0],
-                    egui::TextEdit::singleline(&mut self.sidebar_search)
-                        .hint_text("Filter PDFs")
-                        .desired_width(f32::INFINITY)
-                        .vertical_align(Align::Center)
-                        .margin(Margin::symmetric(9, 6)),
-                );
-                ui.add_space(7.0);
-
-                ScrollArea::vertical()
-                    .id_salt("sidebar-scroll")
-                    .auto_shrink([false, false])
-                    .show(ui, |ui| {
-                        let mut remove_project = None;
-                        let mut remove_recent = None;
-                        let mut open_after_ui = None;
-                        let mut open_with_request = None;
-                        let mut rename_request = None;
-                        let mut clear_file_alias = None;
-                        let mut open_in_files = None;
-                        let mut pin_file = None;
-                        let mut unpin_file = None;
-                        let mut pin_folder = None;
-                        let mut unpin_folder = None;
-                        if !self.state.pinned_folders.is_empty()
-                            || !self.state.pinned_files.is_empty()
+                    ui.horizontal(|ui| {
+                        if ui
+                            .button("Open")
+                            .on_hover_text("Open a PDF (Ctrl+O)")
+                            .clicked()
                         {
-                            sidebar_section_header(ui, "PINNED", "", theme::MUTED);
-                            for folder in self.state.pinned_folders.clone() {
-                                if let Some(index) = self
-                                    .state
-                                    .projects
-                                    .iter()
-                                    .position(|project| project.root == folder)
-                                {
-                                    let project = self.state.projects[index].clone();
-                                    let files = self
-                                        .project_files
-                                        .get(&project.root)
-                                        .cloned()
-                                        .unwrap_or_default();
-                                    let matching_files: Vec<_> = files
-                                        .into_iter()
-                                        .filter(|path| {
-                                            matches_search(
-                                                path,
-                                                &project.root,
-                                                &self.sidebar_search,
-                                            ) || self
+                            self.open_file_dialog();
+                        }
+                        ui.separator();
+                        if ui
+                            .button("+ Project")
+                            .on_hover_text("Add a PDF project folder")
+                            .clicked()
+                        {
+                            self.add_project_dialog();
+                        }
+                        ui.separator();
+                        if ui
+                            .button("Refresh")
+                            .on_hover_text("Rescan project folders")
+                            .clicked()
+                        {
+                            self.refresh_projects();
+                        }
+                    });
+                    ui.add_space(4.0);
+                    if self.sidebar_tab == SidebarTab::Contents {
+                        self.outline_sidebar(ui);
+                        return;
+                    }
+                    if self.sidebar_tab == SidebarTab::Search {
+                        self.search_sidebar(ui);
+                        return;
+                    }
+                    ui.add_sized(
+                        [ui.available_width(), 34.0],
+                        egui::TextEdit::singleline(&mut self.sidebar_search)
+                            .hint_text("Filter PDFs")
+                            .desired_width(f32::INFINITY)
+                            .vertical_align(Align::Center)
+                            .margin(Margin::symmetric(9, 6)),
+                    );
+                    ui.add_space(7.0);
+
+                    ScrollArea::vertical()
+                        .id_salt("sidebar-scroll")
+                        .auto_shrink([false, false])
+                        .show(ui, |ui| {
+                            let mut remove_project = None;
+                            let mut remove_recent = None;
+                            let mut open_after_ui = None;
+                            let mut open_with_request = None;
+                            let mut rename_request = None;
+                            let mut clear_file_alias = None;
+                            let mut open_in_files = None;
+                            let mut pin_file = None;
+                            let mut unpin_file = None;
+                            let mut pin_folder = None;
+                            let mut unpin_folder = None;
+                            if !self.state.pinned_folders.is_empty()
+                                || !self.state.pinned_files.is_empty()
+                            {
+                                sidebar_section_header(ui, "PINNED", "", theme::MUTED);
+                                for folder in self.state.pinned_folders.clone() {
+                                    if let Some(index) = self
+                                        .state
+                                        .projects
+                                        .iter()
+                                        .position(|project| project.root == folder)
+                                    {
+                                        let project = self.state.projects[index].clone();
+                                        let files = self
+                                            .project_files
+                                            .get(&project.root)
+                                            .cloned()
+                                            .unwrap_or_default();
+                                        let matching_files: Vec<_> = files
+                                            .into_iter()
+                                            .filter(|path| {
+                                                matches_search(
+                                                    path,
+                                                    &project.root,
+                                                    &self.sidebar_search,
+                                                ) || self
+                                                    .state
+                                                    .file_aliases
+                                                    .get(path.as_path())
+                                                    .is_some_and(|alias| {
+                                                        alias.to_lowercase().contains(
+                                                            &self
+                                                                .sidebar_search
+                                                                .trim()
+                                                                .to_lowercase(),
+                                                        )
+                                                    })
+                                            })
+                                            .collect();
+                                        let header = project_header(
+                                            ui,
+                                            &project.name,
+                                            matching_files.len(),
+                                            self.state.projects[index].expanded,
+                                        );
+                                        header
+                                            .body
+                                            .clone()
+                                            .on_hover_text(project.root.display().to_string());
+                                        if header.body.clicked() && !header.options.clicked() {
+                                            self.state.projects[index].expanded =
+                                                !self.state.projects[index].expanded;
+                                            self.persist();
+                                        }
+                                        if let Some(action) = sidebar_options_popup(
+                                            &header.options,
+                                            false,
+                                            Some("Remove from sidebar"),
+                                            false,
+                                            true,
+                                        ) {
+                                            match action {
+                                                SidebarMenuAction::Rename => {
+                                                    rename_request = Some((
+                                                        RenameTarget::Project(index),
+                                                        project.name.clone(),
+                                                    ));
+                                                }
+                                                SidebarMenuAction::Remove => {
+                                                    remove_project = Some(index)
+                                                }
+                                                SidebarMenuAction::Unpin => {
+                                                    unpin_folder = Some(folder.clone())
+                                                }
+                                                SidebarMenuAction::OpenInFiles => {
+                                                    open_in_files = Some(folder.clone())
+                                                }
+                                                _ => {}
+                                            }
+                                        }
+                                        if self.state.projects[index].expanded {
+                                            let tree =
+                                                build_pdf_tree(&project.root, &matching_files);
+                                            if let Some(action) = render_pdf_tree(
+                                                ui,
+                                                &tree,
+                                                0,
+                                                self.current_path.as_deref(),
+                                                &self.state.file_aliases,
+                                                &mut self.collapsed_directories,
+                                                &self.state.pinned_files,
+                                                &self.state.pinned_folders,
+                                                self.state.sidebar_file_icons,
+                                            ) {
+                                                match action {
+                                                    TreeAction::Open(path) => {
+                                                        open_after_ui = Some(path)
+                                                    }
+                                                    TreeAction::OpenWith(path) => {
+                                                        open_with_request = Some(path)
+                                                    }
+                                                    TreeAction::OpenInFiles(path) => {
+                                                        open_in_files = Some(path)
+                                                    }
+                                                    TreeAction::Rename(path, name) => {
+                                                        rename_request =
+                                                            Some((RenameTarget::File(path), name));
+                                                    }
+                                                    TreeAction::ResetName(path) => {
+                                                        clear_file_alias = Some(path)
+                                                    }
+                                                    TreeAction::PinFile(path) => {
+                                                        pin_file = Some(path)
+                                                    }
+                                                    TreeAction::UnpinFile(path) => {
+                                                        unpin_file = Some(path)
+                                                    }
+                                                    TreeAction::PinFolder(path) => {
+                                                        pin_folder = Some(path)
+                                                    }
+                                                    TreeAction::UnpinFolder(path) => {
+                                                        unpin_folder = Some(path)
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    } else {
+                                        let row = nav_row(
+                                            ui,
+                                            &file_name(&folder),
+                                            false,
+                                            NavIcon::Folder,
+                                            0.0,
+                                            self.state.sidebar_file_icons,
+                                        );
+                                        if row.body.clicked() && !row.options.clicked() {
+                                            self.open_folder_browser(folder.clone());
+                                        }
+                                        if let Some(action) = sidebar_options_popup(
+                                            &row.options,
+                                            false,
+                                            None,
+                                            false,
+                                            true,
+                                        ) {
+                                            match action {
+                                                SidebarMenuAction::Unpin => {
+                                                    unpin_folder = Some(folder)
+                                                }
+                                                SidebarMenuAction::OpenInFiles => {
+                                                    open_in_files = Some(folder)
+                                                }
+                                                _ => {}
+                                            }
+                                        }
+                                    }
+                                }
+                                for path in self.state.pinned_files.clone() {
+                                    let row = nav_row(
+                                        ui,
+                                        &self.state.display_name(&path),
+                                        self.current_path.as_deref() == Some(path.as_path()),
+                                        NavIcon::File,
+                                        0.0,
+                                        self.state.sidebar_file_icons,
+                                    );
+                                    if row.body.clicked() && !row.options.clicked() {
+                                        open_after_ui = Some(path.clone());
+                                    }
+                                    if let Some(action) = sidebar_options_popup(
+                                        &row.options,
+                                        self.state.file_aliases.contains_key(&path),
+                                        None,
+                                        true,
+                                        true,
+                                    ) {
+                                        match action {
+                                            SidebarMenuAction::OpenWith => {
+                                                open_with_request = Some(path)
+                                            }
+                                            SidebarMenuAction::OpenInFiles => {
+                                                open_in_files = Some(path)
+                                            }
+                                            SidebarMenuAction::Unpin => unpin_file = Some(path),
+                                            SidebarMenuAction::Rename => {
+                                                rename_request = Some((
+                                                    RenameTarget::File(path.clone()),
+                                                    self.state.display_name(&path),
+                                                ))
+                                            }
+                                            SidebarMenuAction::ResetName => {
+                                                clear_file_alias = Some(path)
+                                            }
+                                            _ => {}
+                                        }
+                                    }
+                                }
+                                ui.add_space(10.0);
+                            }
+                            let has_unpinned_projects =
+                                self.state.projects.iter().any(|project| {
+                                    !self.state.pinned_folders.contains(&project.root)
+                                });
+                            if has_unpinned_projects || self.state.projects.is_empty() {
+                                sidebar_section_header(ui, "PROJECTS", "", theme::MUTED);
+                            }
+                            if self.state.projects.is_empty() {
+                                ui.add_space(6.0);
+                                ui.label(
+                                    RichText::new(
+                                        "Add a course or research folder. Only PDFs are shown.",
+                                    )
+                                    .color(theme::MUTED)
+                                    .size(13.0 * explorer_factor),
+                                );
+                            }
+
+                            for index in 0..self.state.projects.len() {
+                                let project = self.state.projects[index].clone();
+                                if self.state.pinned_folders.contains(&project.root) {
+                                    continue;
+                                }
+                                let files = self
+                                    .project_files
+                                    .get(&project.root)
+                                    .cloned()
+                                    .unwrap_or_default();
+                                let matching_files: Vec<_> = files
+                                    .into_iter()
+                                    .filter(|path| {
+                                        matches_search(path, &project.root, &self.sidebar_search)
+                                            || self
                                                 .state
                                                 .file_aliases
                                                 .get(path.as_path())
@@ -2086,421 +2433,230 @@ impl SnapPdfApp {
                                                         &self.sidebar_search.trim().to_lowercase(),
                                                     )
                                                 })
-                                        })
-                                        .collect();
-                                    let header = project_header(
-                                        ui,
-                                        &project.name,
-                                        matching_files.len(),
-                                        self.state.projects[index].expanded,
-                                    );
-                                    header
-                                        .body
-                                        .clone()
-                                        .on_hover_text(project.root.display().to_string());
-                                    if header.body.clicked() && !header.options.clicked() {
-                                        self.state.projects[index].expanded =
-                                            !self.state.projects[index].expanded;
-                                        self.persist();
+                                    })
+                                    .collect();
+
+                                ui.add_space(3.0);
+                                let header = project_header(
+                                    ui,
+                                    &project.name,
+                                    matching_files.len(),
+                                    self.state.projects[index].expanded,
+                                );
+                                header
+                                    .body
+                                    .clone()
+                                    .on_hover_text(project.root.display().to_string());
+                                if header.body.clicked() && !header.options.clicked() {
+                                    self.state.projects[index].expanded =
+                                        !self.state.projects[index].expanded;
+                                    self.persist();
+                                }
+                                if let Some(action) = sidebar_options_popup(
+                                    &header.options,
+                                    false,
+                                    Some("Remove from sidebar"),
+                                    false,
+                                    self.state.pinned_folders.contains(&project.root),
+                                ) {
+                                    match action {
+                                        SidebarMenuAction::OpenWith => {}
+                                        SidebarMenuAction::Rename => {
+                                            rename_request = Some((
+                                                RenameTarget::Project(index),
+                                                project.name.clone(),
+                                            ));
+                                        }
+                                        SidebarMenuAction::Remove => remove_project = Some(index),
+                                        SidebarMenuAction::ResetName => {}
+                                        SidebarMenuAction::Pin => {
+                                            pin_folder = Some(project.root.clone())
+                                        }
+                                        SidebarMenuAction::Unpin => {
+                                            unpin_folder = Some(project.root.clone())
+                                        }
+                                        SidebarMenuAction::OpenInFiles => {
+                                            open_in_files = Some(project.root.clone())
+                                        }
                                     }
-                                    if let Some(action) = sidebar_options_popup(
-                                        &header.options,
-                                        false,
-                                        Some("Remove from sidebar"),
-                                        false,
-                                        true,
+                                }
+
+                                if self.state.projects[index].expanded {
+                                    let tree = build_pdf_tree(&project.root, &matching_files);
+                                    if let Some(action) = render_pdf_tree(
+                                        ui,
+                                        &tree,
+                                        0,
+                                        self.current_path.as_deref(),
+                                        &self.state.file_aliases,
+                                        &mut self.collapsed_directories,
+                                        &self.state.pinned_files,
+                                        &self.state.pinned_folders,
+                                        self.state.sidebar_file_icons,
                                     ) {
                                         match action {
-                                            SidebarMenuAction::Rename => {
-                                                rename_request = Some((
-                                                    RenameTarget::Project(index),
-                                                    project.name.clone(),
-                                                ));
+                                            TreeAction::Open(path) => open_after_ui = Some(path),
+                                            TreeAction::OpenWith(path) => {
+                                                open_with_request = Some(path)
                                             }
-                                            SidebarMenuAction::Remove => {
-                                                remove_project = Some(index)
+                                            TreeAction::OpenInFiles(path) => {
+                                                open_in_files = Some(path)
                                             }
-                                            SidebarMenuAction::Unpin => {
-                                                unpin_folder = Some(folder.clone())
+                                            TreeAction::Rename(path, name) => {
+                                                rename_request =
+                                                    Some((RenameTarget::File(path), name));
                                             }
-                                            SidebarMenuAction::OpenInFiles => {
-                                                open_in_files = Some(folder.clone())
+                                            TreeAction::ResetName(path) => {
+                                                clear_file_alias = Some(path)
                                             }
-                                            _ => {}
-                                        }
-                                    }
-                                    if self.state.projects[index].expanded {
-                                        let tree = build_pdf_tree(&project.root, &matching_files);
-                                        if let Some(action) = render_pdf_tree(
-                                            ui,
-                                            &tree,
-                                            0,
-                                            self.current_path.as_deref(),
-                                            &self.state.file_aliases,
-                                            &mut self.collapsed_directories,
-                                            &self.state.pinned_files,
-                                            &self.state.pinned_folders,
-                                            self.state.sidebar_file_icons,
-                                        ) {
-                                            match action {
-                                                TreeAction::Open(path) => {
-                                                    open_after_ui = Some(path)
-                                                }
-                                                TreeAction::OpenWith(path) => {
-                                                    open_with_request = Some(path)
-                                                }
-                                                TreeAction::OpenInFiles(path) => {
-                                                    open_in_files = Some(path)
-                                                }
-                                                TreeAction::Rename(path, name) => {
-                                                    rename_request =
-                                                        Some((RenameTarget::File(path), name));
-                                                }
-                                                TreeAction::ResetName(path) => {
-                                                    clear_file_alias = Some(path)
-                                                }
-                                                TreeAction::PinFile(path) => pin_file = Some(path),
-                                                TreeAction::UnpinFile(path) => {
-                                                    unpin_file = Some(path)
-                                                }
-                                                TreeAction::PinFolder(path) => {
-                                                    pin_folder = Some(path)
-                                                }
-                                                TreeAction::UnpinFolder(path) => {
-                                                    unpin_folder = Some(path)
-                                                }
+                                            TreeAction::PinFile(path) => pin_file = Some(path),
+                                            TreeAction::UnpinFile(path) => unpin_file = Some(path),
+                                            TreeAction::PinFolder(path) => pin_folder = Some(path),
+                                            TreeAction::UnpinFolder(path) => {
+                                                unpin_folder = Some(path)
                                             }
                                         }
                                     }
-                                } else {
+                                }
+                            }
+
+                            ui.add_space(18.0);
+                            if collapsible_section_header(
+                                ui,
+                                "RECENTS",
+                                self.session_recents.len().min(15),
+                                self.state.recents_expanded,
+                            )
+                            .clicked()
+                            {
+                                self.state.recents_expanded = !self.state.recents_expanded;
+                                self.persist();
+                            }
+                            let recent = self.session_recents.clone();
+                            if self.state.recents_expanded {
+                                for item in recent.iter().take(15) {
+                                    let selected =
+                                        self.current_path.as_deref() == Some(item.path.as_path());
                                     let row = nav_row(
                                         ui,
-                                        &file_name(&folder),
-                                        false,
-                                        NavIcon::Folder,
+                                        &self.state.display_name(&item.path),
+                                        selected,
+                                        NavIcon::Recent,
                                         0.0,
                                         self.state.sidebar_file_icons,
                                     );
+                                    if self.state.display_name(&item.path).chars().count()
+                                        > max_sidebar_label_chars(
+                                            &row.body,
+                                            0.0,
+                                            self.state.sidebar_file_icons,
+                                        )
+                                    {
+                                        row.body
+                                            .clone()
+                                            .on_hover_text(self.state.display_name(&item.path));
+                                    }
                                     if row.body.clicked() && !row.options.clicked() {
-                                        self.open_folder_browser(folder.clone());
+                                        open_after_ui = Some(item.path.clone());
                                     }
                                     if let Some(action) = sidebar_options_popup(
                                         &row.options,
-                                        false,
-                                        None,
-                                        false,
+                                        self.state.file_aliases.contains_key(&item.path),
+                                        Some("Remove from recents"),
                                         true,
+                                        self.state.pinned_files.contains(&item.path),
                                     ) {
                                         match action {
-                                            SidebarMenuAction::Unpin => unpin_folder = Some(folder),
-                                            SidebarMenuAction::OpenInFiles => {
-                                                open_in_files = Some(folder)
+                                            SidebarMenuAction::OpenWith => {
+                                                open_with_request = Some(item.path.clone());
                                             }
-                                            _ => {}
+                                            SidebarMenuAction::OpenInFiles => {
+                                                open_in_files = Some(item.path.clone())
+                                            }
+                                            SidebarMenuAction::Rename => {
+                                                rename_request = Some((
+                                                    RenameTarget::File(item.path.clone()),
+                                                    self.state.display_name(&item.path),
+                                                ));
+                                            }
+                                            SidebarMenuAction::ResetName => {
+                                                clear_file_alias = Some(item.path.clone());
+                                            }
+                                            SidebarMenuAction::Remove => {
+                                                remove_recent = Some(item.path.clone())
+                                            }
+                                            SidebarMenuAction::Pin => {
+                                                pin_file = Some(item.path.clone())
+                                            }
+                                            SidebarMenuAction::Unpin => {
+                                                unpin_file = Some(item.path.clone())
+                                            }
                                         }
                                     }
                                 }
                             }
-                            for path in self.state.pinned_files.clone() {
-                                let row = nav_row(
-                                    ui,
-                                    &self.state.display_name(&path),
-                                    self.current_path.as_deref() == Some(path.as_path()),
-                                    NavIcon::File,
-                                    0.0,
-                                    self.state.sidebar_file_icons,
-                                );
-                                if row.body.clicked() && !row.options.clicked() {
-                                    open_after_ui = Some(path.clone());
-                                }
-                                if let Some(action) = sidebar_options_popup(
-                                    &row.options,
-                                    self.state.file_aliases.contains_key(&path),
-                                    None,
-                                    true,
-                                    true,
-                                ) {
-                                    match action {
-                                        SidebarMenuAction::OpenWith => {
-                                            open_with_request = Some(path)
-                                        }
-                                        SidebarMenuAction::OpenInFiles => {
-                                            open_in_files = Some(path)
-                                        }
-                                        SidebarMenuAction::Unpin => unpin_file = Some(path),
-                                        SidebarMenuAction::Rename => {
-                                            rename_request = Some((
-                                                RenameTarget::File(path.clone()),
-                                                self.state.display_name(&path),
-                                            ))
-                                        }
-                                        SidebarMenuAction::ResetName => {
-                                            clear_file_alias = Some(path)
-                                        }
-                                        _ => {}
-                                    }
-                                }
-                            }
-                            ui.add_space(10.0);
-                        }
-                        let has_unpinned_projects = self
-                            .state
-                            .projects
-                            .iter()
-                            .any(|project| !self.state.pinned_folders.contains(&project.root));
-                        if has_unpinned_projects || self.state.projects.is_empty() {
-                            sidebar_section_header(ui, "PROJECTS", "", theme::MUTED);
-                        }
-                        if self.state.projects.is_empty() {
-                            ui.add_space(6.0);
-                            ui.label(
-                                RichText::new(
-                                    "Add a course or research folder. Only PDFs are shown.",
-                                )
-                                .color(theme::MUTED)
-                                .size(13.0 * explorer_factor),
-                            );
-                        }
 
-                        for index in 0..self.state.projects.len() {
-                            let project = self.state.projects[index].clone();
-                            if self.state.pinned_folders.contains(&project.root) {
-                                continue;
-                            }
-                            let files = self
-                                .project_files
-                                .get(&project.root)
-                                .cloned()
-                                .unwrap_or_default();
-                            let matching_files: Vec<_> = files
-                                .into_iter()
-                                .filter(|path| {
-                                    matches_search(path, &project.root, &self.sidebar_search)
-                                        || self.state.file_aliases.get(path.as_path()).is_some_and(
-                                            |alias| {
-                                                alias.to_lowercase().contains(
-                                                    &self.sidebar_search.trim().to_lowercase(),
-                                                )
-                                            },
-                                        )
-                                })
-                                .collect();
-
-                            ui.add_space(3.0);
-                            let header = project_header(
-                                ui,
-                                &project.name,
-                                matching_files.len(),
-                                self.state.projects[index].expanded,
-                            );
-                            header
-                                .body
-                                .clone()
-                                .on_hover_text(project.root.display().to_string());
-                            if header.body.clicked() && !header.options.clicked() {
-                                self.state.projects[index].expanded =
-                                    !self.state.projects[index].expanded;
+                            if let Some(index) = remove_project {
+                                let project = self.state.projects.remove(index);
+                                self.project_files.remove(&project.root);
+                                self.state
+                                    .pinned_folders
+                                    .retain(|path| path != &project.root);
                                 self.persist();
                             }
-                            if let Some(action) = sidebar_options_popup(
-                                &header.options,
-                                false,
-                                Some("Remove from sidebar"),
-                                false,
-                                self.state.pinned_folders.contains(&project.root),
-                            ) {
-                                match action {
-                                    SidebarMenuAction::OpenWith => {}
-                                    SidebarMenuAction::Rename => {
-                                        rename_request = Some((
-                                            RenameTarget::Project(index),
-                                            project.name.clone(),
-                                        ));
-                                    }
-                                    SidebarMenuAction::Remove => remove_project = Some(index),
-                                    SidebarMenuAction::ResetName => {}
-                                    SidebarMenuAction::Pin => {
-                                        pin_folder = Some(project.root.clone())
-                                    }
-                                    SidebarMenuAction::Unpin => {
-                                        unpin_folder = Some(project.root.clone())
-                                    }
-                                    SidebarMenuAction::OpenInFiles => {
-                                        open_in_files = Some(project.root.clone())
-                                    }
-                                }
+                            if let Some(path) = remove_recent {
+                                self.session_recents
+                                    .retain(|document| document.path != path);
+                                self.state.remove_recent(&path);
+                                self.persist();
                             }
-
-                            if self.state.projects[index].expanded {
-                                let tree = build_pdf_tree(&project.root, &matching_files);
-                                if let Some(action) = render_pdf_tree(
-                                    ui,
-                                    &tree,
-                                    0,
-                                    self.current_path.as_deref(),
-                                    &self.state.file_aliases,
-                                    &mut self.collapsed_directories,
-                                    &self.state.pinned_files,
-                                    &self.state.pinned_folders,
-                                    self.state.sidebar_file_icons,
-                                ) {
-                                    match action {
-                                        TreeAction::Open(path) => open_after_ui = Some(path),
-                                        TreeAction::OpenWith(path) => {
-                                            open_with_request = Some(path)
-                                        }
-                                        TreeAction::OpenInFiles(path) => open_in_files = Some(path),
-                                        TreeAction::Rename(path, name) => {
-                                            rename_request = Some((RenameTarget::File(path), name));
-                                        }
-                                        TreeAction::ResetName(path) => {
-                                            clear_file_alias = Some(path)
-                                        }
-                                        TreeAction::PinFile(path) => pin_file = Some(path),
-                                        TreeAction::UnpinFile(path) => unpin_file = Some(path),
-                                        TreeAction::PinFolder(path) => pin_folder = Some(path),
-                                        TreeAction::UnpinFolder(path) => unpin_folder = Some(path),
-                                    }
-                                }
+                            if let Some(path) = pin_file {
+                                self.state.pinned_files.retain(|item| item != &path);
+                                self.state.pinned_files.insert(0, path);
+                                self.persist();
                             }
-                        }
-
-                        ui.add_space(18.0);
-                        if collapsible_section_header(
-                            ui,
-                            "RECENTS",
-                            self.session_recents.len().min(15),
-                            self.state.recents_expanded,
-                        )
-                        .clicked()
-                        {
-                            self.state.recents_expanded = !self.state.recents_expanded;
-                            self.persist();
-                        }
-                        let recent = self.session_recents.clone();
-                        if self.state.recents_expanded {
-                            for item in recent.iter().take(15) {
-                                let selected =
-                                    self.current_path.as_deref() == Some(item.path.as_path());
-                                let row = nav_row(
-                                    ui,
-                                    &self.state.display_name(&item.path),
-                                    selected,
-                                    NavIcon::Recent,
-                                    0.0,
-                                    self.state.sidebar_file_icons,
-                                );
-                                if self.state.display_name(&item.path).chars().count()
-                                    > max_sidebar_label_chars(
-                                        &row.body,
-                                        0.0,
-                                        self.state.sidebar_file_icons,
-                                    )
+                            if let Some(path) = unpin_file {
+                                self.state.pinned_files.retain(|item| item != &path);
+                                self.persist();
+                            }
+                            if let Some(path) = pin_folder {
+                                self.state.pinned_folders.retain(|item| item != &path);
+                                self.state.pinned_folders.insert(0, path.clone());
+                                if let Some(index) = self
+                                    .state
+                                    .projects
+                                    .iter()
+                                    .position(|project| project.root == path)
                                 {
-                                    row.body
-                                        .clone()
-                                        .on_hover_text(self.state.display_name(&item.path));
+                                    let project = self.state.projects.remove(index);
+                                    self.state.projects.insert(0, project);
                                 }
-                                if row.body.clicked() && !row.options.clicked() {
-                                    open_after_ui = Some(item.path.clone());
-                                }
-                                if let Some(action) = sidebar_options_popup(
-                                    &row.options,
-                                    self.state.file_aliases.contains_key(&item.path),
-                                    Some("Remove from recents"),
-                                    true,
-                                    self.state.pinned_files.contains(&item.path),
-                                ) {
-                                    match action {
-                                        SidebarMenuAction::OpenWith => {
-                                            open_with_request = Some(item.path.clone());
-                                        }
-                                        SidebarMenuAction::OpenInFiles => {
-                                            open_in_files = Some(item.path.clone())
-                                        }
-                                        SidebarMenuAction::Rename => {
-                                            rename_request = Some((
-                                                RenameTarget::File(item.path.clone()),
-                                                self.state.display_name(&item.path),
-                                            ));
-                                        }
-                                        SidebarMenuAction::ResetName => {
-                                            clear_file_alias = Some(item.path.clone());
-                                        }
-                                        SidebarMenuAction::Remove => {
-                                            remove_recent = Some(item.path.clone())
-                                        }
-                                        SidebarMenuAction::Pin => {
-                                            pin_file = Some(item.path.clone())
-                                        }
-                                        SidebarMenuAction::Unpin => {
-                                            unpin_file = Some(item.path.clone())
-                                        }
-                                    }
-                                }
+                                self.persist();
                             }
-                        }
-
-                        if let Some(index) = remove_project {
-                            let project = self.state.projects.remove(index);
-                            self.project_files.remove(&project.root);
-                            self.state
-                                .pinned_folders
-                                .retain(|path| path != &project.root);
-                            self.persist();
-                        }
-                        if let Some(path) = remove_recent {
-                            self.session_recents
-                                .retain(|document| document.path != path);
-                            self.state.remove_recent(&path);
-                            self.persist();
-                        }
-                        if let Some(path) = pin_file {
-                            self.state.pinned_files.retain(|item| item != &path);
-                            self.state.pinned_files.insert(0, path);
-                            self.persist();
-                        }
-                        if let Some(path) = unpin_file {
-                            self.state.pinned_files.retain(|item| item != &path);
-                            self.persist();
-                        }
-                        if let Some(path) = pin_folder {
-                            self.state.pinned_folders.retain(|item| item != &path);
-                            self.state.pinned_folders.insert(0, path.clone());
-                            if let Some(index) = self
-                                .state
-                                .projects
-                                .iter()
-                                .position(|project| project.root == path)
-                            {
-                                let project = self.state.projects.remove(index);
-                                self.state.projects.insert(0, project);
+                            if let Some(path) = unpin_folder {
+                                self.state.pinned_folders.retain(|item| item != &path);
+                                self.persist();
                             }
-                            self.persist();
-                        }
-                        if let Some(path) = unpin_folder {
-                            self.state.pinned_folders.retain(|item| item != &path);
-                            self.persist();
-                        }
-                        if let Some(path) = clear_file_alias {
-                            self.state.clear_file_alias(&path);
-                            self.persist();
-                        }
-                        if let Some((target, current_name)) = rename_request {
-                            self.rename_target = Some(target);
-                            self.rename_buffer = current_name;
-                            self.rename_focus_requested = true;
-                        }
-                        if let Some(path) = open_after_ui {
-                            self.open_document(path);
-                        }
-                        if let Some(path) = open_with_request {
-                            self.request_open_with(path);
-                        }
-                        if let Some(path) = open_in_files {
-                            self.open_path_in_file_manager(&path);
-                        }
-                    });
+                            if let Some(path) = clear_file_alias {
+                                self.state.clear_file_alias(&path);
+                                self.persist();
+                            }
+                            if let Some((target, current_name)) = rename_request {
+                                self.rename_target = Some(target);
+                                self.rename_buffer = current_name;
+                                self.rename_focus_requested = true;
+                            }
+                            if let Some(path) = open_after_ui {
+                                self.open_document(path);
+                            }
+                            if let Some(path) = open_with_request {
+                                self.request_open_with(path);
+                            }
+                            if let Some(path) = open_in_files {
+                                self.open_path_in_file_manager(&path);
+                            }
+                        });
+                });
             });
     }
 
@@ -3064,204 +3220,227 @@ impl SnapPdfApp {
                 }
                 if self.current_path.is_some() {
                     ui.separator();
-                    ScrollArea::horizontal()
-                        .id_salt("viewer-tools-scroll")
-                        .auto_shrink([false, true])
-                        .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden)
-                        .scroll_source(egui::scroll_area::ScrollSource::ALL)
-                        .show(ui, |ui| {
-                            ui.horizontal(|ui| {
-                                // Zoom group: document zoom is primary; surrounding chrome follows the configured ratio.
-                                if compact_text_button(ui, "−", "Zoom out (Ctrl+-)").clicked() {
-                                    let previous = self.state.ui_scale;
-                                    self.state.ui_scale = (self.state.ui_scale - 0.1).max(0.7);
-                                    self.zoom *= self.state.ui_scale / previous.max(0.1);
-                                    ui.ctx().set_zoom_factor(chrome_zoom(
-                                        self.state.ui_scale,
-                                        self.state.chrome_scale_ratio,
-                                    ));
-                                    self.persist();
-                                }
-                                ui.label(
-                                    RichText::new(format!(
-                                        "{}%",
-                                        (self.state.ui_scale * 100.0).round() as i32
-                                    ))
-                                    .monospace(),
-                                );
-                                if compact_text_button(ui, "+", "Zoom in (Ctrl++)").clicked() {
-                                    let previous = self.state.ui_scale;
-                                    self.state.ui_scale = (self.state.ui_scale + 0.1).min(5.0);
-                                    self.zoom *= self.state.ui_scale / previous.max(0.1);
-                                    ui.ctx().set_zoom_factor(chrome_zoom(
-                                        self.state.ui_scale,
-                                        self.state.chrome_scale_ratio,
-                                    ));
-                                    self.persist();
-                                }
-                                ui.add_space(5.0);
-                                ui.separator();
-                                ui.add_space(5.0);
-                                if !self.page_sizes.is_empty() {
-                                    if !self.page_entry_editing {
-                                        self.page_entry = (self.current_page + 1).to_string();
-                                    }
-                                    let response = ui.add_sized(
-                                        [42.0, 20.0],
-                                        egui::TextEdit::singleline(&mut self.page_entry)
-                                            .horizontal_align(Align::Center)
-                                            .margin(Margin::symmetric(4, 2)),
-                                    );
-                                    self.page_entry_editing = response.has_focus();
-                                    if response.changed()
-                                        && let Ok(page) = self.page_entry.trim().parse::<usize>()
-                                        && (1..=self.page_sizes.len()).contains(&page)
+                    ui.scope(|ui| {
+                        let row =
+                            Rect::from_min_size(ui.cursor().min, vec2(ui.available_width(), 26.0));
+                        ui.allocate_rect(row, Sense::hover());
+                        let third = row.width() / 3.0;
+                        let left =
+                            Rect::from_min_max(row.min, pos2(row.left() + third, row.bottom()));
+                        let center = Rect::from_min_max(
+                            pos2(row.left() + third, row.top()),
+                            pos2(row.right() - third, row.bottom()),
+                        );
+                        let right =
+                            Rect::from_min_max(pos2(row.right() - third, row.top()), row.max);
+                        ui.scope_builder(
+                            egui::UiBuilder::new()
+                                .max_rect(center)
+                                .layout(Layout::top_down(Align::Center)),
+                            |ui| {
+                                ui.horizontal(|ui| {
+                                    // Zoom group: document zoom is primary; surrounding chrome follows the configured ratio.
+                                    if compact_text_button(ui, "−", "Zoom out (Ctrl+-)").clicked()
                                     {
-                                        self.jump_to_page = Some(page - 1);
-                                    }
-                                    if response.lost_focus()
-                                        && !response.has_focus()
-                                        && !self.page_entry.trim().parse::<usize>().is_ok_and(
-                                            |page| (1..=self.page_sizes.len()).contains(&page),
-                                        )
-                                    {
-                                        self.page_entry = (self.current_page + 1).to_string();
+                                        let previous = self.state.ui_scale;
+                                        self.state.ui_scale = (self.state.ui_scale - 0.1).max(0.7);
+                                        self.zoom *= self.state.ui_scale / previous.max(0.1);
+                                        ui.ctx().set_zoom_factor(chrome_zoom(
+                                            self.state.ui_scale,
+                                            self.state.chrome_scale_ratio,
+                                        ));
+                                        self.persist();
                                     }
                                     ui.label(
-                                        RichText::new(format!("of {}", self.page_sizes.len()))
-                                            .color(theme::MUTED),
+                                        RichText::new(format!(
+                                            "{}%",
+                                            (self.state.ui_scale * 100.0).round() as i32
+                                        ))
+                                        .monospace(),
                                     );
-                                }
-                                ui.add_space(5.0);
-                                ui.separator();
-                                ui.add_space(5.0);
-                                tool_icon_button(
-                                    ui,
-                                    &mut self.tool_mode,
-                                    ToolMode::Highlight,
-                                    ToolbarIcon::Highlight,
-                                    "Highlight text",
-                                );
-                                tool_icon_button(
-                                    ui,
-                                    &mut self.tool_mode,
-                                    ToolMode::Pen,
-                                    ToolbarIcon::Pen,
-                                    "Draw",
-                                );
-                                tool_icon_button(
-                                    ui,
-                                    &mut self.tool_mode,
-                                    ToolMode::Eraser,
-                                    ToolbarIcon::Eraser,
-                                    "Erase annotations",
-                                );
-                                tool_icon_button(
-                                    ui,
-                                    &mut self.tool_mode,
-                                    ToolMode::Note,
-                                    ToolbarIcon::Comment,
-                                    "Add comment",
-                                );
-                                ui.menu_button("···", |ui| {
-                                    tool_button(
-                                        ui,
-                                        &mut self.tool_mode,
-                                        ToolMode::TextBox,
-                                        "Text box",
-                                        "Place editable text directly on the page",
-                                    );
-                                    tool_button(
-                                        ui,
-                                        &mut self.tool_mode,
-                                        ToolMode::Rectangle,
-                                        "Rectangle",
-                                        "Drag a rectangle",
-                                    );
-                                    tool_button(
-                                        ui,
-                                        &mut self.tool_mode,
-                                        ToolMode::Ellipse,
-                                        "Ellipse",
-                                        "Drag an ellipse",
-                                    );
-                                    tool_button(
-                                        ui,
-                                        &mut self.tool_mode,
-                                        ToolMode::Signature,
-                                        "Signature",
-                                        "Draw a signature with a black pen",
-                                    );
-                                    tool_button(
-                                        ui,
-                                        &mut self.tool_mode,
-                                        ToolMode::Stamp,
-                                        "Stamp",
-                                        "Place a custom text stamp",
-                                    );
-                                    tool_button(
-                                        ui,
-                                        &mut self.tool_mode,
-                                        ToolMode::Attachment,
-                                        "Attach file",
-                                        "Attach a local file reference to the page",
-                                    );
+                                    if compact_text_button(ui, "+", "Zoom in (Ctrl++)").clicked() {
+                                        let previous = self.state.ui_scale;
+                                        self.state.ui_scale = (self.state.ui_scale + 0.1).min(5.0);
+                                        self.zoom *= self.state.ui_scale / previous.max(0.1);
+                                        ui.ctx().set_zoom_factor(chrome_zoom(
+                                            self.state.ui_scale,
+                                            self.state.chrome_scale_ratio,
+                                        ));
+                                        self.persist();
+                                    }
+                                    ui.add_space(5.0);
+                                    ui.separator();
+                                    ui.add_space(5.0);
+                                    if !self.page_sizes.is_empty() {
+                                        if !self.page_entry_editing {
+                                            self.page_entry = (self.current_page + 1).to_string();
+                                        }
+                                        let response = ui.add_sized(
+                                            [42.0, 20.0],
+                                            egui::TextEdit::singleline(&mut self.page_entry)
+                                                .horizontal_align(Align::Center)
+                                                .margin(Margin::symmetric(4, 2)),
+                                        );
+                                        self.page_entry_editing = response.has_focus();
+                                        if response.changed()
+                                            && let Ok(page) =
+                                                self.page_entry.trim().parse::<usize>()
+                                            && (1..=self.page_sizes.len()).contains(&page)
+                                        {
+                                            self.jump_to_page = Some(page - 1);
+                                        }
+                                        if response.lost_focus()
+                                            && !response.has_focus()
+                                            && !self.page_entry.trim().parse::<usize>().is_ok_and(
+                                                |page| (1..=self.page_sizes.len()).contains(&page),
+                                            )
+                                        {
+                                            self.page_entry = (self.current_page + 1).to_string();
+                                        }
+                                        ui.label(
+                                            RichText::new(format!("of {}", self.page_sizes.len()))
+                                                .color(theme::MUTED),
+                                        );
+                                    }
                                 });
-                                tool_icon_button(
-                                    ui,
-                                    &mut self.tool_mode,
-                                    ToolMode::Ocr,
-                                    ToolbarIcon::Ocr,
-                                    "Snip OCR",
-                                );
-                                tool_icon_button(
-                                    ui,
-                                    &mut self.tool_mode,
-                                    ToolMode::MathOcr,
-                                    ToolbarIcon::Math,
-                                    "Math OCR (experimental)",
-                                );
-                                ui.separator();
-                                if icon_button(
-                                    ui,
-                                    ToolbarIcon::Chat,
-                                    self.study_chat.visible,
-                                    true,
-                                    "Study chat",
-                                )
-                                .clicked()
-                                {
-                                    self.study_chat.visible = !self.study_chat.visible;
-                                }
-                                ui.separator();
-                                if icon_button(
-                                    ui,
-                                    ToolbarIcon::Undo,
-                                    false,
-                                    !self.annotation_undo.is_empty(),
-                                    "Undo",
-                                )
-                                .clicked()
-                                {
-                                    self.undo_annotation();
-                                }
-                                if icon_button(
-                                    ui,
-                                    ToolbarIcon::Redo,
-                                    false,
-                                    !self.annotation_redo.is_empty(),
-                                    "Redo",
-                                )
-                                .clicked()
-                                {
-                                    self.redo_annotation();
-                                }
-                                ui.separator();
-                                ui.scope(|ui| {
-                                    ui.spacing_mut().interact_size = vec2(22.0, 22.0);
-                                    ui.color_edit_button_srgba(&mut self.annotation_color);
-                                });
-                                ui.separator();
+                            },
+                        );
+                        ui.scope_builder(
+                            egui::UiBuilder::new()
+                                .max_rect(left)
+                                .layout(Layout::left_to_right(Align::Center)),
+                            |ui| {
+                                ScrollArea::horizontal()
+                                    .id_salt("viewer-editing-tools-scroll")
+                                    .scroll_bar_visibility(
+                                        egui::scroll_area::ScrollBarVisibility::AlwaysHidden,
+                                    )
+                                    .show(ui, |ui| {
+                                        ui.horizontal(|ui| {
+                                            tool_icon_button(
+                                                ui,
+                                                &mut self.tool_mode,
+                                                ToolMode::Highlight,
+                                                ToolbarIcon::Highlight,
+                                                "Highlight text",
+                                            );
+                                            tool_icon_button(
+                                                ui,
+                                                &mut self.tool_mode,
+                                                ToolMode::Pen,
+                                                ToolbarIcon::Pen,
+                                                "Draw",
+                                            );
+                                            tool_icon_button(
+                                                ui,
+                                                &mut self.tool_mode,
+                                                ToolMode::Eraser,
+                                                ToolbarIcon::Eraser,
+                                                "Erase annotations",
+                                            );
+                                            tool_icon_button(
+                                                ui,
+                                                &mut self.tool_mode,
+                                                ToolMode::Note,
+                                                ToolbarIcon::Comment,
+                                                "Add comment",
+                                            );
+                                            ui.menu_button("···", |ui| {
+                                                tool_button(
+                                                    ui,
+                                                    &mut self.tool_mode,
+                                                    ToolMode::TextBox,
+                                                    "Text box",
+                                                    "Place editable text directly on the page",
+                                                );
+                                                tool_button(
+                                                    ui,
+                                                    &mut self.tool_mode,
+                                                    ToolMode::Rectangle,
+                                                    "Rectangle",
+                                                    "Drag a rectangle",
+                                                );
+                                                tool_button(
+                                                    ui,
+                                                    &mut self.tool_mode,
+                                                    ToolMode::Ellipse,
+                                                    "Ellipse",
+                                                    "Drag an ellipse",
+                                                );
+                                                tool_button(
+                                                    ui,
+                                                    &mut self.tool_mode,
+                                                    ToolMode::Signature,
+                                                    "Signature",
+                                                    "Draw a signature with a black pen",
+                                                );
+                                                tool_button(
+                                                    ui,
+                                                    &mut self.tool_mode,
+                                                    ToolMode::Stamp,
+                                                    "Stamp",
+                                                    "Place a custom text stamp",
+                                                );
+                                                tool_button(
+                                                    ui,
+                                                    &mut self.tool_mode,
+                                                    ToolMode::Attachment,
+                                                    "Attach file",
+                                                    "Attach a local file reference to the page",
+                                                );
+                                            });
+                                            tool_icon_button(
+                                                ui,
+                                                &mut self.tool_mode,
+                                                ToolMode::Ocr,
+                                                ToolbarIcon::Ocr,
+                                                "Snip OCR",
+                                            );
+                                            tool_icon_button(
+                                                ui,
+                                                &mut self.tool_mode,
+                                                ToolMode::MathOcr,
+                                                ToolbarIcon::Math,
+                                                "Math OCR (experimental)",
+                                            );
+                                            if icon_button(
+                                                ui,
+                                                ToolbarIcon::Undo,
+                                                false,
+                                                !self.annotation_undo.is_empty(),
+                                                "Undo",
+                                            )
+                                            .clicked()
+                                            {
+                                                self.undo_annotation();
+                                            }
+                                            if icon_button(
+                                                ui,
+                                                ToolbarIcon::Redo,
+                                                false,
+                                                !self.annotation_redo.is_empty(),
+                                                "Redo",
+                                            )
+                                            .clicked()
+                                            {
+                                                self.redo_annotation();
+                                            }
+                                            ui.separator();
+                                            ui.scope(|ui| {
+                                                ui.spacing_mut().interact_size = vec2(22.0, 22.0);
+                                                ui.color_edit_button_srgba(
+                                                    &mut self.annotation_color,
+                                                );
+                                            });
+                                        });
+                                    });
+                            },
+                        );
+                        ui.scope_builder(
+                            egui::UiBuilder::new()
+                                .max_rect(right)
+                                .layout(Layout::right_to_left(Align::Center)),
+                            |ui| {
                                 if icon_button(
                                     ui,
                                     ToolbarIcon::Reader,
@@ -3295,8 +3474,9 @@ impl SnapPdfApp {
                                 {
                                     self.toolbar_visible = false;
                                 }
-                            });
-                        });
+                            },
+                        );
+                    });
                 }
             });
     }
@@ -3387,14 +3567,29 @@ impl SnapPdfApp {
             attachments: std::mem::take(&mut self.study_chat.attachments),
         };
         self.study_chat.prompt.clear();
-        let messages = self.study_chat.messages.entry(provider).or_default();
-        messages.push(user_message);
-        let conversation = messages.clone();
-        messages.push(ChatMessage {
-            role: ChatRole::Assistant,
-            text: String::new(),
-            attachments: Vec::new(),
-        });
+        {
+            let session = self.study_chat.active_session_mut();
+            if session.title == "New chat" && !user_message.text.trim().is_empty() {
+                session.title = elide(user_message.text.trim(), 34);
+            }
+            session.last_opened = unix_timestamp();
+        }
+        let conversation = {
+            let messages = self
+                .study_chat
+                .active_session_mut()
+                .messages
+                .entry(provider)
+                .or_default();
+            messages.push(user_message);
+            let conversation = messages.clone();
+            messages.push(ChatMessage {
+                role: ChatRole::Assistant,
+                text: String::new(),
+                attachments: Vec::new(),
+            });
+            conversation
+        };
         let request_id = self.study_chat.next_request;
         self.study_chat.next_request = request_id.wrapping_add(1);
         self.study_chat.active_request = Some(request_id);
@@ -3426,7 +3621,8 @@ impl SnapPdfApp {
         egui::Panel::right("study-chat")
             .resizable(true)
             .default_size(380.0)
-            .min_size(300.0)
+            .min_size(0.0)
+            .max_size(f32::INFINITY)
             .frame(
                 Frame::new()
                     .fill(Color32::from_rgb(28, 28, 28))
@@ -3434,32 +3630,52 @@ impl SnapPdfApp {
                     .inner_margin(Margin::same(12)),
             )
             .show(root, |ui| {
+                bounded_panel_content(ui, "study-chat-content", |ui| {
                 let provider = self.study_chat.provider;
                 ui.horizontal(|ui| {
                     ui.label(RichText::new("Study").size(17.0).strong());
-                    ui.label(RichText::new("Ask about what you're reading").size(11.0).color(theme::MUTED));
+                    let active_title = self.study_chat.active_session().title.clone();
+                    let mut switch_to = None;
+                    egui::ComboBox::from_id_salt("study-chat-history")
+                        .width(132.0)
+                        .selected_text(elide(&active_title, 22))
+                        .show_ui(ui, |ui| {
+                            for chat in &self.study_chat.sessions {
+                                if ui
+                                    .selectable_label(
+                                        chat.id == self.study_chat.active_session_id,
+                                        elide(&chat.title, 28),
+                                    )
+                                    .clicked()
+                                {
+                                    switch_to = Some(chat.id);
+                                }
+                            }
+                        });
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        if ui.add(egui::Button::new("×").frame(false)).on_hover_text("Close study chat").clicked() {
+                        if chat_icon_button(ui, ToolbarIcon::Close, true, "Close study chat").clicked() {
                             self.study_chat.visible = false;
+                            self.persist();
                         }
-                        if ui
-                            .add_enabled(
-                                self.study_chat
-                                    .messages
-                                    .get(&provider)
-                                    .is_some_and(|messages| !messages.is_empty())
-                                    && !self.study_chat.busy,
-                                egui::Button::new("＋").frame(false),
-                            )
-                            .on_hover_text("New study chat")
+                        if chat_icon_button(
+                            ui,
+                            ToolbarIcon::DeleteChat,
+                            !self.study_chat.busy,
+                            "Delete this chat",
+                        )
+                        .clicked()
+                        {
+                            self.delete_active_study_chat();
+                        }
+                        if chat_icon_button(ui, ToolbarIcon::NewChat, !self.study_chat.busy, "New study chat")
                             .clicked()
                         {
-                            self.study_chat.messages.remove(&provider);
-                            self.study_chat.attachments.clear();
-                            self.study_chat.prompt.clear();
-                            self.study_chat.status = "New chat ready.".to_owned();
+                            self.request_new_study_chat();
                         }
                     });
+                    if let Some(id) = switch_to {
+                        self.activate_study_chat(id);
+                    }
                 });
                 ui.add_space(7.0);
                 ui.horizontal(|ui| {
@@ -3543,6 +3759,7 @@ impl SnapPdfApp {
                     .show(ui, |ui| {
                         let messages = self
                             .study_chat
+                            .active_session()
                             .messages
                             .get(&provider)
                             .map(Vec::as_slice)
@@ -3635,7 +3852,8 @@ impl SnapPdfApp {
                 let send_with_enter = prompt_response.has_focus()
                     && ui.input(|input| input.key_pressed(Key::Enter) && !input.modifiers.shift);
                 ui.horizontal(|ui| {
-                    ui.menu_button("＋", |ui| {
+                    let attach = chat_icon_button(ui, ToolbarIcon::Attach, true, "Attach a file or the current PDF");
+                    egui::Popup::menu(&attach).show(|ui| {
                         if ui.button("Choose PDF, image, or text…").clicked() {
                             ui.close();
                             self.choose_chat_attachment();
@@ -3649,24 +3867,29 @@ impl SnapPdfApp {
                             self.add_chat_attachment(path);
                         }
                     });
-                    if ui
-                        .add_enabled(self.current_path.is_some(), egui::Button::new("▣"))
-                        .on_hover_text("Capture a region of the PDF for chat")
-                        .clicked()
+                    if chat_icon_button(
+                        ui,
+                        ToolbarIcon::Capture,
+                        self.current_path.is_some(),
+                        "Capture a region of the PDF for chat",
+                    )
+                    .clicked()
+                        && self.current_path.is_some()
                     {
                         self.tool_mode = ToolMode::ChatCapture;
                         self.study_chat.status = "Drag over a figure or equation in the PDF.".to_owned();
                     }
-                    ui.label(RichText::new(&self.study_chat.status).size(10.0).color(theme::MUTED));
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        if ui
-                            .add_enabled(!self.study_chat.busy, egui::Button::new("Send  ↑"))
-                            .clicked()
+                        if chat_icon_button(ui, ToolbarIcon::Send, !self.study_chat.busy, "Send message (Enter)").clicked()
+                            && !self.study_chat.busy
                         {
                             self.send_chat_message();
                         }
                     });
                 });
+                if !self.study_chat.status.is_empty() {
+                    ui.label(RichText::new(&self.study_chat.status).size(10.0).color(theme::MUTED));
+                }
                 if send_with_enter {
                     // TextEdit inserts the newline before this frame. Remove it so Enter behaves like chat.
                     while self.study_chat.prompt.ends_with('\n') {
@@ -3674,6 +3897,7 @@ impl SnapPdfApp {
                     }
                     self.send_chat_message();
                 }
+                });
             });
     }
 
@@ -4891,6 +5115,13 @@ impl SnapPdfApp {
                 changed |= ui
                     .radio_value(&mut file_icons, SidebarFileIcons::None, "No icons")
                     .changed();
+                ui.add_space(10.0);
+                changed |= ui
+                    .checkbox(
+                        &mut self.state.warn_before_replacing_study_chat,
+                        "Warn before replacing the oldest Study chat",
+                    )
+                    .changed();
             });
         if !open {
             self.show_view_settings = false;
@@ -4902,6 +5133,44 @@ impl SnapPdfApp {
             self.state.sidebar_file_icons_initialized = true;
             ctx.set_zoom_factor(chrome_zoom(self.state.ui_scale, toolbar_ratio));
             self.persist();
+        }
+    }
+
+    fn study_chat_replacement_dialog(&mut self, ctx: &egui::Context) {
+        if !self.study_chat.pending_replacement_warning {
+            return;
+        }
+        let mut open = true;
+        let mut replace = false;
+        let mut cancel = false;
+        let mut do_not_show_again = false;
+        egui::Window::new("Replace oldest chat?")
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(false)
+            .default_width(330.0)
+            .show(ctx, |ui| {
+                ui.label("Study chat keeps up to five conversations. Starting another will replace the least recently opened chat.");
+                ui.add_space(8.0);
+                ui.checkbox(&mut do_not_show_again, "Do not show this warning again");
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    if ui.button("Cancel").clicked() {
+                        cancel = true;
+                    }
+                    if ui.button("Replace oldest").clicked() {
+                        replace = true;
+                    }
+                });
+            });
+        if !open || cancel {
+            self.study_chat.pending_replacement_warning = false;
+        }
+        if replace {
+            if do_not_show_again {
+                self.state.warn_before_replacing_study_chat = false;
+            }
+            self.replace_oldest_study_chat();
         }
     }
 
@@ -5336,6 +5605,7 @@ impl eframe::App for SnapPdfApp {
         self.rename_dialog(ui.ctx());
         self.note_dialog(ui.ctx());
         self.view_settings_dialog(ui.ctx());
+        self.study_chat_replacement_dialog(ui.ctx());
         self.save_to_source_dialog(ui.ctx());
         self.text_annotation_dialog(ui.ctx());
         self.ocr_result_dialog(ui.ctx());
@@ -6469,7 +6739,12 @@ enum ToolbarIcon {
     CollapseToolbar,
     Reader,
     Present,
-    Chat,
+    Attach,
+    Capture,
+    Send,
+    NewChat,
+    DeleteChat,
+    Close,
 }
 
 #[derive(Clone, Copy)]
@@ -6565,6 +6840,44 @@ fn icon_button(
     };
     paint_toolbar_icon(ui.painter(), rect.center(), icon, color);
     response.on_hover_text(help)
+}
+
+/// A compact icon-only action for the Study chat composer. Unlike text or emoji
+/// buttons, it has no font fallback dependency and therefore cannot turn into a
+/// missing-glyph square on a minimal desktop installation.
+fn chat_icon_button(ui: &mut egui::Ui, icon: ToolbarIcon, enabled: bool, help: &str) -> Response {
+    let (rect, response) = ui.allocate_exact_size(vec2(27.0, 25.0), Sense::click());
+    let color = if enabled {
+        Color32::from_rgb(210, 210, 210)
+    } else {
+        Color32::from_rgb(88, 88, 88)
+    };
+    if response.hovered() && enabled {
+        ui.painter()
+            .rect_filled(rect, CornerRadius::same(5), Color32::from_rgb(48, 48, 48));
+    }
+    paint_toolbar_icon(ui.painter(), rect.center(), icon, color);
+    response.on_hover_text(help)
+}
+
+/// Render panel contents inside the exact rectangle granted by a side panel.
+/// This prevents a long label, message, or horizontal button row from feeding
+/// a larger intrinsic width back into egui's panel state after a resize drag.
+fn bounded_panel_content<R>(
+    ui: &mut egui::Ui,
+    id: impl egui::AsIdSalt,
+    add_contents: impl FnOnce(&mut egui::Ui) -> R,
+) -> R {
+    let rect = ui.available_rect_before_wrap();
+    ui.allocate_rect(rect, Sense::hover());
+    let mut content = ui.new_child(
+        egui::UiBuilder::new()
+            .id_salt(id)
+            .max_rect(rect)
+            .layout(Layout::top_down(Align::Min)),
+    );
+    content.set_clip_rect(rect);
+    add_contents(&mut content)
 }
 
 fn paint_toolbar_icon(
@@ -6833,20 +7146,96 @@ fn paint_toolbar_icon(
             painter.line_segment([center + vec2(-3.0, 7.0), center + vec2(3.0, 7.0)], stroke);
             painter.line_segment([center + vec2(0.0, 4.0), center + vec2(0.0, 7.0)], stroke);
         }
-        ToolbarIcon::Chat => {
-            let bubble = Rect::from_center_size(center - vec2(0.0, 1.0), vec2(15.0, 11.0));
-            painter.rect_stroke(bubble, 3.0, stroke, StrokeKind::Inside);
+        ToolbarIcon::Attach => {
+            // Paperclip: two nested open curves, drawn as lines so it remains
+            // clear at the small composer-control size.
             painter.line_segment(
-                [
-                    bubble.left_bottom() + vec2(4.0, 0.0),
-                    bubble.left_bottom() + vec2(1.5, 3.5),
-                ],
+                [center + vec2(2.0, -7.0), center + vec2(-4.0, -1.0)],
                 stroke,
             );
             painter.line_segment(
-                [center + vec2(-3.5, -1.0), center + vec2(3.5, -1.0)],
-                Stroke::new(1.2, color),
+                [center + vec2(-4.0, -1.0), center + vec2(-4.0, 4.0)],
+                stroke,
             );
+            painter.line_segment([center + vec2(-4.0, 4.0), center + vec2(-1.3, 6.7)], stroke);
+            painter.line_segment([center + vec2(-1.3, 6.7), center + vec2(2.0, 6.7)], stroke);
+            painter.line_segment([center + vec2(2.0, 6.7), center + vec2(6.0, 2.7)], stroke);
+            painter.line_segment([center + vec2(6.0, 2.7), center + vec2(6.0, -4.2)], stroke);
+            painter.line_segment([center + vec2(6.0, -4.2), center + vec2(3.3, -6.8)], stroke);
+            painter.line_segment([center + vec2(3.3, -6.8), center + vec2(0.0, -6.8)], stroke);
+            painter.line_segment(
+                [center + vec2(0.0, -6.8), center + vec2(-2.0, -4.8)],
+                stroke,
+            );
+            painter.line_segment(
+                [center + vec2(-2.0, -4.8), center + vec2(-2.0, 2.8)],
+                stroke,
+            );
+        }
+        ToolbarIcon::Capture => {
+            let corner = 5.8;
+            for (x, y, sx, sy) in [
+                (-corner, -corner, 1.0, 1.0),
+                (corner, -corner, -1.0, 1.0),
+                (-corner, corner, 1.0, -1.0),
+                (corner, corner, -1.0, -1.0),
+            ] {
+                let start = center + vec2(x, y + 4.0 * sy);
+                let elbow = center + vec2(x, y);
+                let end = center + vec2(x + 4.0 * sx, y);
+                painter.line_segment([start, elbow], stroke);
+                painter.line_segment([elbow, end], stroke);
+            }
+        }
+        ToolbarIcon::Send => {
+            let plane = vec![
+                center + vec2(-7.0, -5.5),
+                center + vec2(7.5, 0.0),
+                center + vec2(-7.0, 5.5),
+                center + vec2(-3.8, 0.0),
+            ];
+            painter.add(egui::Shape::convex_polygon(plane, color, Stroke::NONE));
+            painter.line_segment(
+                [center + vec2(-3.8, 0.0), center + vec2(1.0, 0.0)],
+                Stroke::new(1.0, theme::PANEL_BG),
+            );
+        }
+        ToolbarIcon::NewChat => {
+            let bubble = Rect::from_center_size(center + vec2(-1.5, -1.0), vec2(13.0, 10.0));
+            painter.rect_stroke(bubble, 3.0, stroke, StrokeKind::Inside);
+            painter.line_segment(
+                [
+                    bubble.left_bottom() + vec2(3.5, 0.0),
+                    bubble.left_bottom() + vec2(1.5, 3.0),
+                ],
+                stroke,
+            );
+            painter.line_segment([center + vec2(4.0, 3.5), center + vec2(8.0, 3.5)], stroke);
+            painter.line_segment([center + vec2(6.0, 1.5), center + vec2(6.0, 5.5)], stroke);
+        }
+        ToolbarIcon::DeleteChat => {
+            let body = Rect::from_center_size(center + vec2(0.0, 2.0), vec2(10.0, 11.0));
+            painter.rect_stroke(body, 1.5, stroke, StrokeKind::Inside);
+            painter.line_segment(
+                [center + vec2(-6.0, -5.0), center + vec2(6.0, -5.0)],
+                stroke,
+            );
+            painter.line_segment(
+                [center + vec2(-2.5, -7.0), center + vec2(2.5, -7.0)],
+                stroke,
+            );
+            painter.line_segment(
+                [center + vec2(-2.0, -1.0), center + vec2(-2.0, 5.0)],
+                Stroke::new(1.0, color),
+            );
+            painter.line_segment(
+                [center + vec2(2.0, -1.0), center + vec2(2.0, 5.0)],
+                Stroke::new(1.0, color),
+            );
+        }
+        ToolbarIcon::Close => {
+            painter.line_segment([center + vec2(-4.5, -4.5), center + vec2(4.5, 4.5)], stroke);
+            painter.line_segment([center + vec2(4.5, -4.5), center + vec2(-4.5, 4.5)], stroke);
         }
     }
 }
@@ -7671,6 +8060,26 @@ fn pdf_desktop_app_name(contents: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bounded_panel_content_does_not_restore_a_wider_intrinsic_size() {
+        egui::__run_test_ui(|ui| {
+            let response = egui::Panel::left("bounded-panel-test")
+                .resizable(true)
+                .default_size(42.0)
+                .min_size(0.0)
+                .show(ui, |ui| {
+                    bounded_panel_content(ui, "bounded-panel-test-content", |ui| {
+                        ui.label("This deliberately long label must not widen the side panel.");
+                    });
+                });
+            assert!(
+                response.response.rect.width() <= 42.0,
+                "panel expanded to {} despite its 42px requested width",
+                response.response.rect.width()
+            );
+        });
+    }
 
     #[test]
     fn selected_pdf_text_is_copied_in_document_order() {

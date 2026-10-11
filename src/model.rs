@@ -1,3 +1,4 @@
+use crate::chat::{ChatMessage, ChatProvider};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -50,6 +51,24 @@ pub struct AppState {
     pub pinned_folders: Vec<PathBuf>,
     #[serde(default = "default_true")]
     pub recents_expanded: bool,
+    /// Up to five durable Study-chat conversations. Attachments are session-only, while
+    /// message text and provider context survive closing the panel or application.
+    #[serde(default)]
+    pub study_chats: Vec<StudyChatSession>,
+    #[serde(default)]
+    pub active_study_chat: Option<u64>,
+    #[serde(default = "default_true")]
+    pub warn_before_replacing_study_chat: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StudyChatSession {
+    pub id: u64,
+    pub title: String,
+    #[serde(default)]
+    pub messages: HashMap<ChatProvider, Vec<ChatMessage>>,
+    #[serde(default)]
+    pub last_opened: u64,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
