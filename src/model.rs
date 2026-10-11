@@ -59,6 +59,9 @@ pub struct AppState {
     pub active_study_chat: Option<u64>,
     #[serde(default = "default_true")]
     pub warn_before_replacing_study_chat: bool,
+    /// Completely removes Study chat and all of its entry points from the interface.
+    #[serde(default)]
+    pub hide_study_chat: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -122,6 +122,8 @@ Select ordinary PDF text and click **Ask** to attach it directly. After a normal
 
 `Enter` sends a chat message; `Shift+Enter` adds another line. Remove an attachment with its `×` before sending, or close the study panel without affecting the PDF. Closing the panel or SnapPDF does not delete a conversation. Use the chat selector to move between the five saved conversations, the new-chat button to start another, and the separate trash button to delete the current chat. When all five slots are occupied, SnapPDF warns before replacing the least recently opened chat; that warning can be disabled in the dialog or View settings.
 
+If you do not want chat features in the reading workspace, enable **Hide Study chat and disable its actions** in View settings. This removes the chat button and the Ask/OCR-to-chat actions until the setting is switched off.
+
 ### Search
 
 Open Search with `Ctrl+F`. Results update as you type and are organized into collapsible sections:
@@ -149,7 +151,7 @@ The controls beside the annotation tools provide three focused views:
 
 - **Hide toolbar** leaves the sidebar and document visible.
 - **Reader mode** hides the sidebar and toolbar for distraction-free continuous reading. Page gaps are reduced. Temporary zoom changes made in this mode are discarded when you exit.
-- **Presentation mode** enters fullscreen and displays one page at a time. Each page fits the available screen height independently, which keeps different page sizes readable. `Space` / `Backspace`, `Right` / `Left`, and `J` / `K` move between pages. Press `Esc` or use the small top-left exit button to return. Temporary presentation zoom is discarded on exit.
+- **Presentation mode** enters fullscreen and displays one centered page at a time. Each page is independently scaled by whichever screen dimension is more restrictive, so the complete page remains visible whether it is portrait or landscape. `Space` / `Backspace`, `Right` / `Left`, and `J` / `K` move between pages. Press `Esc` or use the small top-left exit button to return. Temporary presentation zoom is discarded on exit.
 
 ### Shortcuts
 

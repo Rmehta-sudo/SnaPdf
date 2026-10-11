@@ -1183,6 +1183,10 @@ impl SnapPdfApp {
                     rgb,
                 } if generation == self.generation => {
                     if let Some(page_index) = self.chat_capture_requests.remove(&request_id) {
+                        if self.state.hide_study_chat {
+                            self.tool_mode = ToolMode::Select;
+                            continue;
+                        }
                         match png_from_rgb(width, height, rgb) {
                             Ok(bytes) => {
                                 self.study_chat.attachments.push(ChatAttachment {
@@ -2090,9 +2094,10 @@ impl SnapPdfApp {
                             self.sidebar_tab = SidebarTab::Search;
                         }
                     }
-                    if rail_button(ui, self.study_chat.visible, RailIcon::Chat)
-                        .on_hover_text("Study chat")
-                        .clicked()
+                    if !self.state.hide_study_chat
+                        && rail_button(ui, self.study_chat.visible, RailIcon::Chat)
+                            .on_hover_text("Study chat")
+                            .clicked()
                     {
                         self.study_chat.visible = !self.study_chat.visible;
                     }
@@ -2856,9 +2861,14 @@ impl SnapPdfApp {
                         let active = self.current_path.as_deref() == Some(path.as_path());
                         Frame::new()
                             .fill(if active {
-                                Color32::from_rgb(37, 37, 37)
+                                Color32::from_rgb(50, 53, 58)
                             } else {
                                 Color32::TRANSPARENT
+                            })
+                            .stroke(if active {
+                                Stroke::new(1.0, Color32::from_rgb(91, 126, 170))
+                            } else {
+                                Stroke::NONE
                             })
                             .corner_radius(CornerRadius::same(6))
                             .inner_margin(Margin::symmetric(6, 1))
@@ -2871,7 +2881,12 @@ impl SnapPdfApp {
                                                     &self.state.display_name(path),
                                                     28,
                                                 ))
-                                                .size(11.8),
+                                                .size(11.8)
+                                                .color(if active {
+                                                    Color32::from_rgb(245, 247, 250)
+                                                } else {
+                                                    theme::MUTED
+                                                }),
                                             )
                                             .frame(false),
                                         )
@@ -3482,6 +3497,9 @@ impl SnapPdfApp {
     }
 
     fn add_chat_attachment(&mut self, path: PathBuf) {
+        if self.state.hide_study_chat {
+            return;
+        }
         const MAX_ATTACHMENT_BYTES: u64 = 25 * 1024 * 1024;
         if self.study_chat.attachments.len() >= 6 {
             self.study_chat.status =
@@ -3615,7 +3633,11 @@ impl SnapPdfApp {
     }
 
     fn study_chat_panel(&mut self, root: &mut egui::Ui) {
-        if !self.study_chat.visible || self.reader_mode || self.presentation_mode {
+        if self.state.hide_study_chat
+            || !self.study_chat.visible
+            || self.reader_mode
+            || self.presentation_mode
+        {
             return;
         }
         egui::Panel::right("study-chat")
@@ -3998,15 +4020,20 @@ impl SnapPdfApp {
                     self.zoom = (available_page_width / first_width).clamp(0.4, 3.0);
                     self.fit_width_requested = false;
                 }
+                let mut presentation_fit_applied = false;
                 if self.presentation_fit_height_requested {
                     if self.presentation_fit_delay_frames > 0 {
                         self.presentation_fit_delay_frames -= 1;
                         ctx.request_repaint();
                     } else if let Some(size) = self.page_sizes.get(self.current_page) {
-                        // Presentation has no chrome: every newly shown page is
-                        // independently fit to the available screen height.
-                        self.zoom = ((ui.available_height() - 2.0) / size[1].max(1.0))
-                            .clamp(0.2, 8.0);
+                        // Keep every page completely visible. Tall pages are constrained by
+                        // height; wide pages are constrained by width.
+                        self.zoom = presentation_fit_zoom(
+                            *size,
+                            vec2(ui.available_width(), ui.available_height()),
+                        );
+                        self.document_scroll_offset = egui::Vec2::ZERO;
+                        presentation_fit_applied = true;
                         self.presentation_fit_height_requested = false;
                     }
                 }
@@ -4028,19 +4055,35 @@ impl SnapPdfApp {
                 // Keep a real horizontal canvas when a pinched page is wider than
                 // the viewport. `ScrollArea::both` then maps a two-finger slide to
                 // natural vertical and horizontal panning instead of clipping it.
-                let canvas_width = page_sizes
-                    .iter()
-                    .map(|size| size[0] * zoom + 56.0)
-                    .fold(ui.available_width(), f32::max);
+                let canvas_width = if self.presentation_mode {
+                    page_sizes
+                        .get(presentation_page)
+                        .map(|size| (size[0] * zoom).max(ui.available_width()))
+                        .unwrap_or_else(|| ui.available_width())
+                } else {
+                    page_sizes
+                        .iter()
+                        .map(|size| size[0] * zoom + 56.0)
+                        .fold(ui.available_width(), f32::max)
+                };
 
                 // Solve the new scroll offset *before* egui lays out the pages.
                 // A queued scroll_with_delta() adjusts a later frame and causes
                 // oscillation when gesture updates arrive every frame.
                 let anchored_offset = self.pinch_anchor.take().map(|anchor| {
-                    let previous_canvas_width = page_sizes
-                        .iter()
-                        .map(|size| size[0] * zoom_before_pinch + 56.0)
-                        .fold(ui.available_width(), f32::max);
+                    let previous_canvas_width = if self.presentation_mode {
+                        page_sizes
+                            .get(presentation_page)
+                            .map(|size| {
+                                (size[0] * zoom_before_pinch).max(ui.available_width())
+                            })
+                            .unwrap_or_else(|| ui.available_width())
+                    } else {
+                        page_sizes
+                            .iter()
+                            .map(|size| size[0] * zoom_before_pinch + 56.0)
+                            .fold(ui.available_width(), f32::max)
+                    };
                     pinch_anchored_offset(
                         self.document_scroll_offset,
                         anchor,
@@ -4068,9 +4111,11 @@ impl SnapPdfApp {
                     ));
                 if let Some(offset) = anchored_offset {
                     document_scroll = document_scroll.scroll_offset(offset);
+                } else if presentation_fit_applied {
+                    document_scroll = document_scroll.scroll_offset(egui::Vec2::ZERO);
                 }
                 let scroll_output = document_scroll
-                    .show_viewport(ui, |ui, _viewport| {
+                    .show_viewport(ui, |ui, viewport| {
                         ui.set_min_width(canvas_width);
                         if self.keyboard_scroll != 0.0 {
                             ui.scroll_with_delta(vec2(0.0, self.keyboard_scroll));
@@ -4084,14 +4129,26 @@ impl SnapPdfApp {
                             }
                             let display_size = vec2(source_size[0] * zoom, source_size[1] * zoom);
                             let row_width = canvas_width;
+                            let row_height = if self.presentation_mode {
+                                viewport.height().max(display_size.y)
+                            } else {
+                                display_size.y + page_gap
+                            };
                             let (row_rect, _) = ui.allocate_exact_size(
-                                vec2(row_width, display_size.y + page_gap),
+                                vec2(row_width, row_height),
                                 Sense::hover(),
                             );
-                            let page_rect = Rect::from_min_size(
-                                pos2(row_rect.center().x - display_size.x / 2.0, row_rect.min.y),
-                                display_size,
-                            );
+                            let page_rect = if self.presentation_mode {
+                                centered_page_rect(row_rect, display_size)
+                            } else {
+                                Rect::from_min_size(
+                                    pos2(
+                                        row_rect.center().x - display_size.x / 2.0,
+                                        row_rect.min.y,
+                                    ),
+                                    display_size,
+                                )
+                            };
                             laid_out_pages.push((index, page_rect));
                         }
                         self.page_rects = laid_out_pages.clone();
@@ -4588,7 +4645,11 @@ impl SnapPdfApp {
                             && let Some(selection) = self.text_selection
                             && selection.anchor != selection.focus
                             && let Some(rect) = selection_action_rect
-                            && let Some(action) = selection_action_bar(&ctx, rect)
+                            && let Some(action) = selection_action_bar(
+                                &ctx,
+                                rect,
+                                !self.state.hide_study_chat,
+                            )
                         {
                             match action {
                                 SelectionAction::Copy => {
@@ -5122,6 +5183,12 @@ impl SnapPdfApp {
                         "Warn before replacing the oldest Study chat",
                     )
                     .changed();
+                changed |= ui
+                    .checkbox(
+                        &mut self.state.hide_study_chat,
+                        "Hide Study chat and disable its actions",
+                    )
+                    .changed();
             });
         if !open {
             self.show_view_settings = false;
@@ -5131,6 +5198,14 @@ impl SnapPdfApp {
             self.state.sidebar_scale_ratio = sidebar_ratio;
             self.state.sidebar_file_icons = file_icons;
             self.state.sidebar_file_icons_initialized = true;
+            if self.state.hide_study_chat {
+                self.study_chat.visible = false;
+                self.study_chat.show_gemini_key = false;
+                if self.tool_mode == ToolMode::ChatCapture {
+                    self.tool_mode = ToolMode::Select;
+                    self.drag_start = None;
+                }
+            }
             ctx.set_zoom_factor(chrome_zoom(self.state.ui_scale, toolbar_ratio));
             self.persist();
         }
@@ -5259,12 +5334,13 @@ impl SnapPdfApp {
                         ctx.copy_text(popup.text.clone());
                         popup.detail = "Copied to clipboard.".to_owned();
                     }
-                    if ui
-                        .add_enabled(
-                            !popup.text.is_empty(),
-                            egui::Button::new("Add to study chat"),
-                        )
-                        .clicked()
+                    if !self.state.hide_study_chat
+                        && ui
+                            .add_enabled(
+                                !popup.text.is_empty(),
+                                egui::Button::new("Add to study chat"),
+                            )
+                            .clicked()
                     {
                         add_to_chat = Some(popup.text.clone());
                     }
@@ -6531,7 +6607,9 @@ fn paint_search_hits(
                 painter.rect_filled(
                     pdf_bounds_screen_rect(bounds, page_rect, source_size),
                     1.0,
-                    Color32::from_rgba_unmultiplied(255, 196, 54, 92),
+                    // Search matches are violet so they remain visually distinct from
+                    // user-created highlights, whose default ink is warm yellow.
+                    Color32::from_rgba_unmultiplied(176, 104, 255, 92),
                 );
             }
         }
@@ -6607,7 +6685,11 @@ fn selection_edge_scroll(pointer_y: f32, viewport: Rect) -> f32 {
     above.min(2.0) * MAX_SPEED - below.min(2.0) * MAX_SPEED
 }
 
-fn selection_action_bar(ctx: &egui::Context, selection_rect: Rect) -> Option<SelectionAction> {
+fn selection_action_bar(
+    ctx: &egui::Context,
+    selection_rect: Rect,
+    show_study_chat: bool,
+) -> Option<SelectionAction> {
     let mut action = None;
     egui::Area::new(egui::Id::new("text-selection-actions"))
         .order(egui::Order::Tooltip)
@@ -6629,7 +6711,7 @@ fn selection_action_bar(ctx: &egui::Context, selection_rect: Rect) -> Option<Sel
                         if ui.small_button("Highlight").clicked() {
                             action = Some(SelectionAction::Highlight);
                         }
-                        if ui.small_button("Ask").clicked() {
+                        if show_study_chat && ui.small_button("Ask").clicked() {
                             action = Some(SelectionAction::Chat);
                         }
                     });
@@ -7304,6 +7386,16 @@ fn path_breadcrumbs(ui: &mut egui::Ui, path: Option<&Path>) -> Option<Breadcrumb
 
 fn chrome_zoom(document_zoom: f32, ratio: f32) -> f32 {
     (document_zoom * ratio).clamp(0.28, 5.0)
+}
+
+fn presentation_fit_zoom(page_size: [f32; 2], viewport: egui::Vec2) -> f32 {
+    let fit_width = (viewport.x - 8.0).max(1.0) / page_size[0].max(1.0);
+    let fit_height = (viewport.y - 8.0).max(1.0) / page_size[1].max(1.0);
+    fit_width.min(fit_height).clamp(0.2, 8.0)
+}
+
+fn centered_page_rect(container: Rect, display_size: egui::Vec2) -> Rect {
+    Rect::from_center_size(container.center(), display_size)
 }
 
 /// Compute the *absolute* ScrollArea offset that preserves a PDF point
@@ -8079,6 +8171,23 @@ mod tests {
                 response.response.rect.width()
             );
         });
+    }
+
+    #[test]
+    fn presentation_fit_keeps_portrait_and_landscape_pages_fully_visible() {
+        let viewport = vec2(1200.0, 800.0);
+        for page in [[600.0, 1000.0], [1600.0, 700.0]] {
+            let zoom = presentation_fit_zoom(page, viewport);
+            assert!(page[0] * zoom <= viewport.x);
+            assert!(page[1] * zoom <= viewport.y);
+        }
+    }
+
+    #[test]
+    fn presentation_page_is_centered_on_both_axes() {
+        let viewport = Rect::from_min_size(pos2(0.0, 0.0), vec2(1200.0, 800.0));
+        let page = centered_page_rect(viewport, vec2(480.0, 720.0));
+        assert_eq!(page.center(), viewport.center());
     }
 
     #[test]
