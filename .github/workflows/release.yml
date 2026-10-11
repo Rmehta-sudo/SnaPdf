@@ -34,7 +34,7 @@ jobs:
         run: ./scripts/build-appimage.sh
 
       - name: Create checksum
-        run: sha256sum dist/*.AppImage > dist/SHA256SUMS
+        run: cd dist && sha256sum *.AppImage > SHA256SUMS
 
       - name: Upload workflow artifact
         uses: actions/upload-artifact@v7
