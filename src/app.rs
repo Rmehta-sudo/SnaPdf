@@ -1373,6 +1373,8 @@ impl SnapPdfApp {
         let print = KeyboardShortcut::new(Modifiers::CTRL, Key::P);
         let close_tab = KeyboardShortcut::new(Modifiers::CTRL, Key::W);
         let reopen_tab = KeyboardShortcut::new(Modifiers::CTRL | Modifiers::SHIFT, Key::T);
+        let next_tab = KeyboardShortcut::new(Modifiers::CTRL, Key::Tab);
+        let previous_tab = KeyboardShortcut::new(Modifiers::CTRL | Modifiers::SHIFT, Key::Tab);
         let undo = KeyboardShortcut::new(Modifiers::CTRL, Key::Z);
         let redo = KeyboardShortcut::new(Modifiers::CTRL | Modifiers::SHIFT, Key::Z);
 
@@ -1476,6 +1478,27 @@ impl SnapPdfApp {
         }
         if ctx.input_mut(|input| input.consume_shortcut(&print)) {
             self.request_print();
+        }
+        let tab_direction = ctx.input_mut(|input| {
+            if input.consume_shortcut(&previous_tab) {
+                Some(-1_isize)
+            } else if input.consume_shortcut(&next_tab) {
+                Some(1_isize)
+            } else {
+                None
+            }
+        });
+        if let Some(direction) = tab_direction
+            && self.state.open_documents.len() > 1
+        {
+            let documents = self.state.open_documents.clone();
+            let current = self
+                .current_path
+                .as_ref()
+                .and_then(|path| documents.iter().position(|document| document == path))
+                .unwrap_or(0);
+            let next = (current as isize + direction).rem_euclid(documents.len() as isize) as usize;
+            self.open_document(documents[next].clone());
         }
         if !ctx.egui_wants_keyboard_input()
             && ctx.input_mut(|input| input.consume_shortcut(&close_tab))
@@ -1778,8 +1801,6 @@ impl SnapPdfApp {
         egui::Panel::left("project-sidebar")
             .resizable(true)
             .default_size(340.0)
-            .min_size(250.0)
-            .max_size(460.0)
             .frame(
                 Frame::new()
                     .fill(theme::SIDEBAR_BG)
@@ -1790,7 +1811,7 @@ impl SnapPdfApp {
                 // The document uses the global zoom; the explorer has its own readable scale.
                 let explorer_factor = (self.state.sidebar_scale_ratio
                     / self.state.chrome_scale_ratio.max(0.1))
-                .clamp(0.7, 2.0);
+                .clamp(0.1, 4.0);
                 ui.style_mut().spacing.item_spacing *= explorer_factor;
                 ui.style_mut().spacing.button_padding *= explorer_factor;
                 ui.style_mut().spacing.interact_size *= explorer_factor;
@@ -1846,6 +1867,7 @@ impl SnapPdfApp {
                     .auto_shrink([false, false])
                     .show(ui, |ui| {
                         let mut remove_project = None;
+                        let mut remove_recent = None;
                         let mut open_after_ui = None;
                         let mut open_with_request = None;
                         let mut rename_request = None;
@@ -1860,26 +1882,146 @@ impl SnapPdfApp {
                         {
                             sidebar_section_header(ui, "PINNED", "", theme::MUTED);
                             for folder in self.state.pinned_folders.clone() {
-                                let row = nav_row(
-                                    ui,
-                                    &file_name(&folder),
-                                    false,
-                                    NavIcon::Folder,
-                                    0.0,
-                                    self.state.sidebar_file_icons,
-                                );
-                                if row.body.clicked() && !row.options.clicked() {
-                                    self.open_folder_browser(folder.clone());
-                                }
-                                if let Some(action) =
-                                    sidebar_options_popup(&row.options, false, false, false, true)
+                                if let Some(index) = self
+                                    .state
+                                    .projects
+                                    .iter()
+                                    .position(|project| project.root == folder)
                                 {
-                                    match action {
-                                        SidebarMenuAction::Unpin => unpin_folder = Some(folder),
-                                        SidebarMenuAction::OpenInFiles => {
-                                            open_in_files = Some(folder)
+                                    let project = self.state.projects[index].clone();
+                                    let files = self
+                                        .project_files
+                                        .get(&project.root)
+                                        .cloned()
+                                        .unwrap_or_default();
+                                    let matching_files: Vec<_> = files
+                                        .into_iter()
+                                        .filter(|path| {
+                                            matches_search(
+                                                path,
+                                                &project.root,
+                                                &self.sidebar_search,
+                                            ) || self
+                                                .state
+                                                .file_aliases
+                                                .get(path.as_path())
+                                                .is_some_and(|alias| {
+                                                    alias.to_lowercase().contains(
+                                                        &self.sidebar_search.trim().to_lowercase(),
+                                                    )
+                                                })
+                                        })
+                                        .collect();
+                                    let header = project_header(
+                                        ui,
+                                        &project.name,
+                                        matching_files.len(),
+                                        self.state.projects[index].expanded,
+                                    );
+                                    header
+                                        .body
+                                        .clone()
+                                        .on_hover_text(project.root.display().to_string());
+                                    if header.body.clicked() && !header.options.clicked() {
+                                        self.state.projects[index].expanded =
+                                            !self.state.projects[index].expanded;
+                                        self.persist();
+                                    }
+                                    if let Some(action) = sidebar_options_popup(
+                                        &header.options,
+                                        false,
+                                        Some("Remove from sidebar"),
+                                        false,
+                                        true,
+                                    ) {
+                                        match action {
+                                            SidebarMenuAction::Rename => {
+                                                rename_request = Some((
+                                                    RenameTarget::Project(index),
+                                                    project.name.clone(),
+                                                ));
+                                            }
+                                            SidebarMenuAction::Remove => {
+                                                remove_project = Some(index)
+                                            }
+                                            SidebarMenuAction::Unpin => {
+                                                unpin_folder = Some(folder.clone())
+                                            }
+                                            SidebarMenuAction::OpenInFiles => {
+                                                open_in_files = Some(folder.clone())
+                                            }
+                                            _ => {}
                                         }
-                                        _ => {}
+                                    }
+                                    if self.state.projects[index].expanded {
+                                        let tree = build_pdf_tree(&project.root, &matching_files);
+                                        if let Some(action) = render_pdf_tree(
+                                            ui,
+                                            &tree,
+                                            0,
+                                            self.current_path.as_deref(),
+                                            &self.state.file_aliases,
+                                            &mut self.collapsed_directories,
+                                            &self.state.pinned_files,
+                                            &self.state.pinned_folders,
+                                            self.state.sidebar_file_icons,
+                                        ) {
+                                            match action {
+                                                TreeAction::Open(path) => {
+                                                    open_after_ui = Some(path)
+                                                }
+                                                TreeAction::OpenWith(path) => {
+                                                    open_with_request = Some(path)
+                                                }
+                                                TreeAction::OpenInFiles(path) => {
+                                                    open_in_files = Some(path)
+                                                }
+                                                TreeAction::Rename(path, name) => {
+                                                    rename_request =
+                                                        Some((RenameTarget::File(path), name));
+                                                }
+                                                TreeAction::ResetName(path) => {
+                                                    clear_file_alias = Some(path)
+                                                }
+                                                TreeAction::PinFile(path) => pin_file = Some(path),
+                                                TreeAction::UnpinFile(path) => {
+                                                    unpin_file = Some(path)
+                                                }
+                                                TreeAction::PinFolder(path) => {
+                                                    pin_folder = Some(path)
+                                                }
+                                                TreeAction::UnpinFolder(path) => {
+                                                    unpin_folder = Some(path)
+                                                }
+                                            }
+                                        }
+                                    }
+                                } else {
+                                    let row = nav_row(
+                                        ui,
+                                        &file_name(&folder),
+                                        false,
+                                        NavIcon::Folder,
+                                        0.0,
+                                        self.state.sidebar_file_icons,
+                                    );
+                                    if row.body.clicked() && !row.options.clicked() {
+                                        self.open_folder_browser(folder.clone());
+                                    }
+                                    if let Some(action) = sidebar_options_popup(
+                                        &row.options,
+                                        false,
+                                        None,
+                                        false,
+                                        true,
+                                    ) {
+                                        match action {
+                                            SidebarMenuAction::Unpin => unpin_folder = Some(folder),
+                                            SidebarMenuAction::OpenInFiles => {
+                                                open_in_files = Some(folder)
+                                            }
+                                            _ => {}
+                                        }
                                     }
                                 }
                             }
@@ -1898,7 +2040,7 @@ impl SnapPdfApp {
                                 if let Some(action) = sidebar_options_popup(
                                     &row.options,
                                     self.state.file_aliases.contains_key(&path),
-                                    false,
+                                    None,
                                     true,
                                     true,
                                 ) {
@@ -1925,8 +2067,14 @@ impl SnapPdfApp {
                             }
                             ui.add_space(10.0);
                         }
-                        sidebar_section_header(ui, "PROJECTS", "", theme::MUTED);
-
+                        let has_unpinned_projects = self
+                            .state
+                            .projects
+                            .iter()
+                            .any(|project| !self.state.pinned_folders.contains(&project.root));
+                        if has_unpinned_projects || self.state.projects.is_empty() {
+                            sidebar_section_header(ui, "PROJECTS", "", theme::MUTED);
+                        }
                         if self.state.projects.is_empty() {
                             ui.add_space(6.0);
                             ui.label(
@@ -1934,12 +2082,15 @@ impl SnapPdfApp {
                                     "Add a course or research folder. Only PDFs are shown.",
                                 )
                                 .color(theme::MUTED)
-                                .size(13.0),
+                                .size(13.0 * explorer_factor),
                             );
                         }
 
                         for index in 0..self.state.projects.len() {
                             let project = self.state.projects[index].clone();
+                            if self.state.pinned_folders.contains(&project.root) {
+                                continue;
+                            }
                             let files = self
                                 .project_files
                                 .get(&project.root)
@@ -1978,7 +2129,7 @@ impl SnapPdfApp {
                             if let Some(action) = sidebar_options_popup(
                                 &header.options,
                                 false,
-                                true,
+                                Some("Remove from sidebar"),
                                 false,
                                 self.state.pinned_folders.contains(&project.root),
                             ) {
@@ -2080,7 +2231,7 @@ impl SnapPdfApp {
                                 if let Some(action) = sidebar_options_popup(
                                     &row.options,
                                     self.state.file_aliases.contains_key(&item.path),
-                                    false,
+                                    Some("Remove from recents"),
                                     true,
                                     self.state.pinned_files.contains(&item.path),
                                 ) {
@@ -2100,7 +2251,9 @@ impl SnapPdfApp {
                                         SidebarMenuAction::ResetName => {
                                             clear_file_alias = Some(item.path.clone());
                                         }
-                                        SidebarMenuAction::Remove => {}
+                                        SidebarMenuAction::Remove => {
+                                            remove_recent = Some(item.path.clone())
+                                        }
                                         SidebarMenuAction::Pin => {
                                             pin_file = Some(item.path.clone())
                                         }
@@ -2118,6 +2271,12 @@ impl SnapPdfApp {
                             self.state
                                 .pinned_folders
                                 .retain(|path| path != &project.root);
+                            self.persist();
+                        }
+                        if let Some(path) = remove_recent {
+                            self.session_recents
+                                .retain(|document| document.path != path);
+                            self.state.remove_recent(&path);
                             self.persist();
                         }
                         if let Some(path) = pin_file {
@@ -2170,12 +2329,13 @@ impl SnapPdfApp {
     }
 
     fn outline_sidebar(&mut self, ui: &mut egui::Ui) {
+        let scale = sidebar_visual_scale(ui);
         let title = self
             .current_path
             .as_deref()
             .map(|path| self.state.display_name(path))
             .unwrap_or_else(|| "No PDF open".to_owned());
-        ui.label(RichText::new(title).size(13.0).strong());
+        ui.label(RichText::new(title).size(13.0 * scale).strong());
         ui.add_space(3.0);
         if self.current_path.is_none() {
             ui.label(RichText::new("Open a PDF to view its sections.").color(theme::MUTED));
@@ -2184,7 +2344,7 @@ impl SnapPdfApp {
         if self.outline.is_empty() {
             ui.label(
                 RichText::new("This PDF does not contain a bookmark outline.")
-                    .size(12.5)
+                    .size(12.5 * scale)
                     .color(theme::MUTED),
             );
             return;
@@ -2192,7 +2352,7 @@ impl SnapPdfApp {
         ui.horizontal(|ui| {
             ui.label(
                 RichText::new(format!("{} navigable sections", self.outline.len()))
-                    .size(11.0)
+                    .size(11.0 * scale)
                     .color(theme::MUTED),
             );
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
@@ -2418,16 +2578,17 @@ impl SnapPdfApp {
     }
 
     fn search_sidebar(&mut self, ui: &mut egui::Ui) {
+        let scale = sidebar_visual_scale(ui);
         ui.horizontal(|ui| {
             ui.label(
                 RichText::new("SEARCH")
-                    .size(11.5)
+                    .size(11.5 * scale)
                     .strong()
                     .color(theme::MUTED),
             );
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 if ui
-                    .add(egui::Button::new(RichText::new("×").size(16.0)).frame(false))
+                    .add(egui::Button::new(RichText::new("×").size(16.0 * scale)).frame(false))
                     .on_hover_text("Close search")
                     .clicked()
                 {
@@ -2475,12 +2636,13 @@ impl SnapPdfApp {
     }
 
     fn search_results(&mut self, ui: &mut egui::Ui) {
+        let scale = sidebar_visual_scale(ui);
         if self.search_query.trim().is_empty() {
             ui.label(
                 RichText::new(
                     "Results update as you type: current file, open tabs, and the current project.",
                 )
-                .size(12.0)
+                .size(12.0 * scale)
                 .color(theme::MUTED),
             );
             return;
@@ -2500,7 +2662,7 @@ impl SnapPdfApp {
             if self.search_matches.is_empty() {
                 ui.label(
                     RichText::new("No matches in the open PDF.")
-                        .size(12.0)
+                        .size(12.0 * scale)
                         .color(theme::MUTED),
                 );
             } else {
@@ -2534,13 +2696,13 @@ impl SnapPdfApp {
         if self.search_tabs_expanded && self.tab_search_scan.is_some() {
             ui.label(
                 RichText::new("Searching open tabs...")
-                    .size(12.0)
+                    .size(12.0 * scale)
                     .color(theme::MUTED),
             );
         } else if self.search_tabs_expanded && self.tab_search_matches.is_empty() {
             ui.label(
                 RichText::new("No matches in open tabs.")
-                    .size(12.0)
+                    .size(12.0 * scale)
                     .color(theme::MUTED),
             );
         } else if self.search_tabs_expanded {
@@ -2588,13 +2750,13 @@ impl SnapPdfApp {
         if self.search_project_expanded && self.workspace_search_scan.is_some() {
             ui.label(
                 RichText::new("Searching project PDFs...")
-                    .size(12.0)
+                    .size(12.0 * scale)
                     .color(theme::MUTED),
             );
         } else if self.search_project_expanded && self.workspace_search_matches.is_empty() {
             ui.label(
                 RichText::new("No matches in the current project.")
-                    .size(12.0)
+                    .size(12.0 * scale)
                     .color(theme::MUTED),
             );
         } else if self.search_project_expanded {
@@ -2635,7 +2797,7 @@ impl SnapPdfApp {
                     .inner_margin(Margin::symmetric(8, 1)),
             )
             .show(root, |ui| {
-                ui.add_space(3.0);
+                ui.add_space(5.0);
                 self.document_tabs(ui);
                 ui.separator();
                 let mut breadcrumb_action = None;
@@ -2908,7 +3070,7 @@ impl SnapPdfApp {
                                 }
                                 ui.separator();
                                 ui.scope(|ui| {
-                                    ui.spacing_mut().interact_size = vec2(26.0, 26.0);
+                                    ui.spacing_mut().interact_size = vec2(22.0, 22.0);
                                     ui.color_edit_button_srgba(&mut self.annotation_color);
                                 });
                                 ui.separator();
@@ -3816,9 +3978,9 @@ impl SnapPdfApp {
                                     }
                                     let center = pos2(rect.left() + 15.0, rect.center().y);
                                     if entry.is_directory {
-                                        paint_folder_icon(ui.painter(), center, theme::MUTED);
+                                        paint_folder_icon(ui.painter(), center, theme::MUTED, 1.0);
                                     } else {
-                                        paint_file_icon(ui.painter(), center, theme::MUTED);
+                                        paint_file_icon(ui.painter(), center, theme::MUTED, 1.0);
                                     }
                                     ui.painter().text(
                                         pos2(rect.left() + 34.0, rect.center().y),
@@ -4156,6 +4318,7 @@ impl SnapPdfApp {
             self.state.chrome_scale_ratio = toolbar_ratio;
             self.state.sidebar_scale_ratio = sidebar_ratio;
             self.state.sidebar_file_icons = file_icons;
+            self.state.sidebar_file_icons_initialized = true;
             ctx.set_zoom_factor(chrome_zoom(self.state.ui_scale, toolbar_ratio));
             self.persist();
         }
@@ -4544,7 +4707,7 @@ fn rail_button(ui: &mut egui::Ui, selected: bool, icon: RailIcon) -> Response {
     };
     let center = rect.center();
     match icon {
-        RailIcon::Files => paint_folder_icon(ui.painter(), center, color),
+        RailIcon::Files => paint_folder_icon(ui.painter(), center, color, 1.0),
         RailIcon::Contents => {
             for y in [-6.0, 0.0, 6.0] {
                 ui.painter()
@@ -4665,7 +4828,7 @@ fn render_pdf_tree(
         if let Some(menu_action) = sidebar_options_popup(
             &row.options,
             false,
-            false,
+            None,
             false,
             pinned_folders.contains(&child.path),
         ) {
@@ -4715,7 +4878,7 @@ fn render_pdf_tree(
         if let Some(menu_action) = sidebar_options_popup(
             &row.options,
             aliases.contains_key(path),
-            false,
+            None,
             true,
             pinned_files.contains(path),
         ) {
@@ -4737,6 +4900,10 @@ fn pdf_tree_count(node: &PdfTreeNode) -> usize {
     node.files.len() + node.directories.values().map(pdf_tree_count).sum::<usize>()
 }
 
+fn sidebar_visual_scale(ui: &egui::Ui) -> f32 {
+    (ui.spacing().interact_size.y / 18.0).clamp(0.1, 4.0)
+}
+
 fn directory_row(
     ui: &mut egui::Ui,
     name: &str,
@@ -4744,7 +4911,9 @@ fn directory_row(
     expanded: bool,
     indent: f32,
 ) -> SidebarRowResponse {
-    let (rect, response) = ui.allocate_exact_size(vec2(ui.available_width(), 30.0), Sense::click());
+    let scale = sidebar_visual_scale(ui);
+    let (rect, response) =
+        ui.allocate_exact_size(vec2(ui.available_width(), 30.0 * scale), Sense::click());
     if response.hovered() {
         ui.painter().rect_filled(
             rect.shrink2(vec2(1.0, 0.0)),
@@ -4752,37 +4921,42 @@ fn directory_row(
             theme::PANEL_BG,
         );
     }
-    let x = rect.left() + indent;
+    let x = rect.left() + indent * scale;
     let y = rect.center().y;
     let muted = theme::MUTED;
     let chevron = if expanded {
         [
-            pos2(x, y - 2.0),
-            pos2(x + 4.0, y + 2.0),
-            pos2(x + 8.0, y - 2.0),
+            pos2(x, y - 2.0 * scale),
+            pos2(x + 4.0 * scale, y + 2.0 * scale),
+            pos2(x + 8.0 * scale, y - 2.0 * scale),
         ]
     } else {
         [
-            pos2(x + 2.0, y - 4.0),
-            pos2(x + 6.0, y),
-            pos2(x + 2.0, y + 4.0),
+            pos2(x + 2.0 * scale, y - 4.0 * scale),
+            pos2(x + 6.0 * scale, y),
+            pos2(x + 2.0 * scale, y + 4.0 * scale),
         ]
     };
-    ui.painter()
-        .add(egui::Shape::line(chevron.to_vec(), Stroke::new(1.3, muted)));
-    paint_folder_icon(ui.painter(), pos2(x + 19.0, y), muted);
+    ui.painter().add(egui::Shape::line(
+        chevron.to_vec(),
+        Stroke::new(1.3 * scale, muted),
+    ));
+    paint_folder_icon(ui.painter(), pos2(x + 19.0 * scale, y), muted, scale);
     ui.painter().text(
-        pos2(x + 32.0, y),
+        pos2(x + 32.0 * scale, y),
         Align2::LEFT_CENTER,
-        elide(name, ((rect.right() - x - 38.0) / 7.0).max(5.0) as usize),
-        FontId::proportional(13.0),
+        elide(
+            name,
+            ((rect.right() - x - 38.0 * scale) / (7.0 * scale)).max(5.0) as usize,
+        ),
+        FontId::proportional(13.0 * scale),
         Color32::from_rgb(202, 202, 202),
     );
     ui.painter().text(
-        pos2(rect.right() - 7.0, y),
+        pos2(rect.right() - 7.0 * scale, y),
         Align2::RIGHT_CENTER,
         count.to_string(),
-        FontId::proportional(10.5),
+        FontId::proportional(10.5 * scale),
         theme::MUTED,
     );
     let options = sidebar_options_button(ui, rect, &response);
@@ -4798,7 +4972,9 @@ fn project_header(
     count: usize,
     expanded: bool,
 ) -> SidebarRowResponse {
-    let (rect, response) = ui.allocate_exact_size(vec2(ui.available_width(), 38.0), Sense::click());
+    let scale = sidebar_visual_scale(ui);
+    let (rect, response) =
+        ui.allocate_exact_size(vec2(ui.available_width(), 38.0 * scale), Sense::click());
     let painter = ui.painter();
     if response.hovered() {
         painter.rect_filled(
@@ -4809,41 +4985,46 @@ fn project_header(
     }
 
     let icon_color = theme::MUTED;
-    let chevron_x = rect.left() + 8.0;
+    let chevron_x = rect.left() + 8.0 * scale;
     let center_y = rect.center().y;
     let chevron = if expanded {
         [
-            pos2(chevron_x, center_y - 2.0),
-            pos2(chevron_x + 4.0, center_y + 2.0),
-            pos2(chevron_x + 8.0, center_y - 2.0),
+            pos2(chevron_x, center_y - 2.0 * scale),
+            pos2(chevron_x + 4.0 * scale, center_y + 2.0 * scale),
+            pos2(chevron_x + 8.0 * scale, center_y - 2.0 * scale),
         ]
     } else {
         [
-            pos2(chevron_x + 2.0, center_y - 4.0),
-            pos2(chevron_x + 6.0, center_y),
-            pos2(chevron_x + 2.0, center_y + 4.0),
+            pos2(chevron_x + 2.0 * scale, center_y - 4.0 * scale),
+            pos2(chevron_x + 6.0 * scale, center_y),
+            pos2(chevron_x + 2.0 * scale, center_y + 4.0 * scale),
         ]
     };
     painter.add(egui::Shape::line(
         chevron.to_vec(),
-        Stroke::new(1.5, theme::MUTED),
+        Stroke::new(1.5 * scale, theme::MUTED),
     ));
-    paint_folder_icon(painter, pos2(rect.left() + 27.0, center_y), icon_color);
+    paint_folder_icon(
+        painter,
+        pos2(rect.left() + 27.0 * scale, center_y),
+        icon_color,
+        scale,
+    );
 
     let count_text = count.to_string();
     painter.text(
-        pos2(rect.right() - 34.0, center_y),
+        pos2(rect.right() - 34.0 * scale, center_y),
         Align2::RIGHT_CENTER,
         &count_text,
-        FontId::proportional(11.0),
+        FontId::proportional(11.0 * scale),
         theme::MUTED,
     );
-    let max_chars = ((rect.width() - 112.0) / 7.2).max(4.0) as usize;
+    let max_chars = ((rect.width() - 112.0 * scale) / (7.2 * scale)).max(4.0) as usize;
     painter.text(
-        pos2(rect.left() + 51.0, center_y),
+        pos2(rect.left() + 51.0 * scale, center_y),
         Align2::LEFT_CENTER,
         elide(name, max_chars),
-        FontId::proportional(14.0),
+        FontId::proportional(14.0 * scale),
         Color32::from_rgb(218, 220, 225),
     );
     let options = sidebar_options_button(ui, rect, &response);
@@ -4861,7 +5042,9 @@ fn nav_row(
     indent: f32,
     file_icons: SidebarFileIcons,
 ) -> SidebarRowResponse {
-    let (rect, response) = ui.allocate_exact_size(vec2(ui.available_width(), 34.0), Sense::click());
+    let scale = sidebar_visual_scale(ui);
+    let (rect, response) =
+        ui.allocate_exact_size(vec2(ui.available_width(), 34.0 * scale), Sense::click());
     let painter = ui.painter();
     if selected {
         painter.rect_filled(
@@ -4884,24 +5067,24 @@ fn nav_row(
     };
     let is_pdf = matches!(icon, NavIcon::Recent | NavIcon::File);
     let show_icon = !is_pdf || file_icons != SidebarFileIcons::None;
-    let icon_center = pos2(rect.left() + indent + 13.0, rect.center().y);
+    let icon_center = pos2(rect.left() + (indent + 13.0) * scale, rect.center().y);
     if show_icon {
         match icon {
             NavIcon::Recent | NavIcon::File if file_icons == SidebarFileIcons::VsCode => {
-                paint_vscode_pdf_icon(painter, icon_center)
+                paint_vscode_pdf_icon(painter, icon_center, scale)
             }
-            NavIcon::Recent => paint_recent_icon(painter, icon_center, icon_color),
-            NavIcon::File => paint_file_icon(painter, icon_center, icon_color),
-            NavIcon::Folder => paint_folder_icon(painter, icon_center, icon_color),
+            NavIcon::Recent => paint_recent_icon(painter, icon_center, icon_color, scale),
+            NavIcon::File => paint_file_icon(painter, icon_center, icon_color, scale),
+            NavIcon::Folder => paint_folder_icon(painter, icon_center, icon_color, scale),
         }
     }
-    let text_left = rect.left() + indent + if show_icon { 28.0 } else { 8.0 };
-    let max_chars = ((rect.right() - text_left - 32.0) / 7.0).max(4.0) as usize;
+    let text_left = rect.left() + (indent + if show_icon { 28.0 } else { 8.0 }) * scale;
+    let max_chars = ((rect.right() - text_left - 32.0 * scale) / (7.0 * scale)).max(4.0) as usize;
     painter.text(
         pos2(text_left, rect.center().y),
         Align2::LEFT_CENTER,
         elide(label, max_chars),
-        FontId::proportional(13.5),
+        FontId::proportional(13.5 * scale),
         if selected {
             Color32::WHITE
         } else {
@@ -4920,27 +5103,39 @@ fn max_sidebar_label_chars(
     indent: f32,
     file_icons: SidebarFileIcons,
 ) -> usize {
+    let scale = sidebar_visual_scale_from_response(response);
     let text_left = response.rect.left()
-        + indent
+        + indent * scale
         + if file_icons == SidebarFileIcons::None {
-            8.0
+            8.0 * scale
         } else {
-            28.0
+            28.0 * scale
         };
-    ((response.rect.right() - text_left - 32.0) / 7.0).max(4.0) as usize
+    ((response.rect.right() - text_left - 32.0 * scale) / (7.0 * scale)).max(4.0) as usize
+}
+
+fn sidebar_visual_scale_from_response(response: &Response) -> f32 {
+    (response.rect.height() / 34.0).clamp(0.1, 4.0)
 }
 
 fn sidebar_options_button(ui: &mut egui::Ui, row_rect: Rect, row: &Response) -> Response {
+    let scale = sidebar_visual_scale(ui);
     let rect = Rect::from_min_max(
-        pos2(row_rect.right() - 30.0, row_rect.top() + 3.0),
-        pos2(row_rect.right() - 3.0, row_rect.bottom() - 3.0),
+        pos2(
+            row_rect.right() - 30.0 * scale,
+            row_rect.top() + 3.0 * scale,
+        ),
+        pos2(
+            row_rect.right() - 3.0 * scale,
+            row_rect.bottom() - 3.0 * scale,
+        ),
     );
     let visible = row.hovered() || ui.rect_contains_pointer(rect);
     ui.put(
         rect,
         egui::Button::new(
             RichText::new(if visible { "..." } else { "" })
-                .size(14.0)
+                .size(14.0 * scale)
                 .color(Color32::from_rgb(205, 208, 219)),
         )
         .frame(false)
@@ -4952,7 +5147,7 @@ fn sidebar_options_button(ui: &mut egui::Ui, row_rect: Rect, row: &Response) -> 
 fn sidebar_options_popup(
     response: &Response,
     can_reset_name: bool,
-    can_remove: bool,
+    remove_label: Option<&str>,
     include_file_actions: bool,
     pinned: bool,
 ) -> Option<SidebarMenuAction> {
@@ -5001,11 +5196,11 @@ fn sidebar_options_popup(
                 action = Some(SidebarMenuAction::ResetName);
                 ui.close();
             }
-            if can_remove {
+            if let Some(remove_label) = remove_label {
                 ui.add_space(3.0);
                 ui.separator();
                 ui.add_space(3.0);
-                if popup_menu_row(ui, "Remove from sidebar", Color32::from_rgb(238, 126, 132)) {
+                if popup_menu_row(ui, remove_label, Color32::from_rgb(238, 126, 132)) {
                     action = Some(SidebarMenuAction::Remove);
                     ui.close();
                 }
@@ -5030,28 +5225,33 @@ fn popup_menu_row(ui: &mut egui::Ui, text: &str, color: Color32) -> bool {
     response.clicked()
 }
 
-fn paint_file_icon(painter: &egui::Painter, center: egui::Pos2, color: Color32) {
-    let rect = Rect::from_center_size(center, vec2(8.0, 11.0));
-    painter.rect_stroke(rect, 1.0, Stroke::new(1.2, color), StrokeKind::Inside);
-    painter.line_segment(
-        [
-            pos2(rect.left() + 2.0, center.y - 2.0),
-            pos2(rect.right() - 2.0, center.y - 2.0),
-        ],
-        Stroke::new(1.0, color.gamma_multiply(0.8)),
+fn paint_file_icon(painter: &egui::Painter, center: egui::Pos2, color: Color32, scale: f32) {
+    let rect = Rect::from_center_size(center, vec2(8.0, 11.0) * scale);
+    painter.rect_stroke(
+        rect,
+        1.0 * scale,
+        Stroke::new(1.2 * scale, color),
+        StrokeKind::Inside,
     );
     painter.line_segment(
         [
-            pos2(rect.left() + 2.0, center.y + 2.0),
-            pos2(rect.right() - 2.0, center.y + 2.0),
+            pos2(rect.left() + 2.0 * scale, center.y - 2.0 * scale),
+            pos2(rect.right() - 2.0 * scale, center.y - 2.0 * scale),
         ],
-        Stroke::new(1.0, color.gamma_multiply(0.8)),
+        Stroke::new(1.0 * scale, color.gamma_multiply(0.8)),
+    );
+    painter.line_segment(
+        [
+            pos2(rect.left() + 2.0 * scale, center.y + 2.0 * scale),
+            pos2(rect.right() - 2.0 * scale, center.y + 2.0 * scale),
+        ],
+        Stroke::new(1.0 * scale, color.gamma_multiply(0.8)),
     );
 }
 
 /// Compact red PDF glyph inspired by the file association used in VS Code.
-fn paint_vscode_pdf_icon(painter: &egui::Painter, center: egui::Pos2) {
-    let page = Rect::from_center_size(center, vec2(12.0, 15.0));
+fn paint_vscode_pdf_icon(painter: &egui::Painter, center: egui::Pos2, scale: f32) {
+    let page = Rect::from_center_size(center, vec2(12.0, 15.0) * scale);
     painter.rect_filled(
         page,
         CornerRadius::same(1),
@@ -5060,86 +5260,88 @@ fn paint_vscode_pdf_icon(painter: &egui::Painter, center: egui::Pos2) {
     painter.rect_stroke(
         page,
         CornerRadius::same(1),
-        Stroke::new(0.8, Color32::from_rgb(172, 172, 172)),
+        Stroke::new(0.8 * scale, Color32::from_rgb(172, 172, 172)),
         StrokeKind::Inside,
     );
     let band = Rect::from_min_max(
-        pos2(page.left(), page.center().y - 3.0),
-        pos2(page.right(), page.center().y + 3.0),
+        pos2(page.left(), page.center().y - 3.0 * scale),
+        pos2(page.right(), page.center().y + 3.0 * scale),
     );
     painter.rect_filled(band, 0.0, Color32::from_rgb(220, 63, 54));
     painter.text(
         band.center(),
         Align2::CENTER_CENTER,
         "PDF",
-        FontId::proportional(5.0),
+        FontId::proportional(5.0 * scale),
         Color32::WHITE,
     );
 }
 
-fn paint_recent_icon(painter: &egui::Painter, center: egui::Pos2, color: Color32) {
-    let tile = Rect::from_center_size(center, vec2(12.0, 12.0));
+fn paint_recent_icon(painter: &egui::Painter, center: egui::Pos2, color: Color32, scale: f32) {
+    let tile = Rect::from_center_size(center, vec2(12.0, 12.0) * scale);
     painter.rect_stroke(
         tile,
         CornerRadius::same(4),
-        Stroke::new(1.0, color.gamma_multiply(0.78)),
+        Stroke::new(1.0 * scale, color.gamma_multiply(0.78)),
         StrokeKind::Inside,
     );
     painter.rect_filled(
         Rect::from_min_max(
-            pos2(tile.left() + 3.0, tile.top() + 3.0),
-            pos2(tile.right() - 3.0, tile.top() + 5.0),
+            pos2(tile.left() + 3.0 * scale, tile.top() + 3.0 * scale),
+            pos2(tile.right() - 3.0 * scale, tile.top() + 5.0 * scale),
         ),
-        1.0,
+        1.0 * scale,
         color,
     );
     painter.rect_filled(
         Rect::from_min_max(
-            pos2(tile.left() + 3.0, tile.top() + 7.0),
-            pos2(tile.right() - 5.0, tile.top() + 9.0),
+            pos2(tile.left() + 3.0 * scale, tile.top() + 7.0 * scale),
+            pos2(tile.right() - 5.0 * scale, tile.top() + 9.0 * scale),
         ),
-        1.0,
+        1.0 * scale,
         color.gamma_multiply(0.72),
     );
 }
 
-fn paint_folder_icon(painter: &egui::Painter, center: egui::Pos2, color: Color32) {
+fn paint_folder_icon(painter: &egui::Painter, center: egui::Pos2, color: Color32, scale: f32) {
     let body = Rect::from_min_max(
-        pos2(center.x - 8.0, center.y - 3.0),
-        pos2(center.x + 8.0, center.y + 6.0),
+        pos2(center.x - 8.0 * scale, center.y - 3.0 * scale),
+        pos2(center.x + 8.0 * scale, center.y + 6.0 * scale),
     );
     painter.rect_filled(body, CornerRadius::same(3), color.gamma_multiply(0.9));
     painter.rect_filled(
         Rect::from_min_max(
-            pos2(center.x - 7.0, center.y - 6.0),
-            pos2(center.x + 1.0, center.y),
+            pos2(center.x - 7.0 * scale, center.y - 6.0 * scale),
+            pos2(center.x + 1.0 * scale, center.y),
         ),
         CornerRadius::same(2),
         color,
     );
     painter.line_segment(
         [
-            pos2(body.left() + 2.0, body.top() + 2.0),
-            pos2(body.right() - 2.0, body.top() + 2.0),
+            pos2(body.left() + 2.0 * scale, body.top() + 2.0 * scale),
+            pos2(body.right() - 2.0 * scale, body.top() + 2.0 * scale),
         ],
-        Stroke::new(1.0, Color32::from_white_alpha(70)),
+        Stroke::new(1.0 * scale, Color32::from_white_alpha(70)),
     );
 }
 
 fn sidebar_section_header(ui: &mut egui::Ui, title: &str, subtitle: &str, accent: Color32) {
-    let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), 28.0), Sense::hover());
+    let scale = sidebar_visual_scale(ui);
+    let (rect, _) =
+        ui.allocate_exact_size(vec2(ui.available_width(), 28.0 * scale), Sense::hover());
     ui.painter().text(
         pos2(rect.left(), rect.center().y),
         Align2::LEFT_CENTER,
         title,
-        FontId::proportional(11.5),
+        FontId::proportional(11.5 * scale),
         accent,
     );
     ui.painter().text(
         pos2(rect.right(), rect.center().y),
         Align2::RIGHT_CENTER,
         subtitle,
-        FontId::proportional(10.5),
+        FontId::proportional(10.5 * scale),
         theme::MUTED,
     );
     ui.painter().line_segment(
@@ -5153,7 +5355,9 @@ fn sidebar_section_header(ui: &mut egui::Ui, title: &str, subtitle: &str, accent
 }
 
 fn search_result_row(ui: &mut egui::Ui, title: &str, excerpt: &str, selected: bool) -> Response {
-    let (rect, response) = ui.allocate_exact_size(vec2(ui.available_width(), 50.0), Sense::click());
+    let scale = sidebar_visual_scale(ui);
+    let (rect, response) =
+        ui.allocate_exact_size(vec2(ui.available_width(), 50.0 * scale), Sense::click());
     if selected || response.hovered() {
         ui.painter().rect_filled(
             rect,
@@ -5166,17 +5370,17 @@ fn search_result_row(ui: &mut egui::Ui, title: &str, excerpt: &str, selected: bo
         );
     }
     ui.painter().text(
-        pos2(rect.left() + 8.0, rect.top() + 8.0),
+        pos2(rect.left() + 8.0 * scale, rect.top() + 8.0 * scale),
         Align2::LEFT_TOP,
         title,
-        FontId::proportional(11.0),
+        FontId::proportional(11.0 * scale),
         theme::MUTED,
     );
     ui.painter().text(
-        pos2(rect.left() + 8.0, rect.top() + 25.0),
+        pos2(rect.left() + 8.0 * scale, rect.top() + 25.0 * scale),
         Align2::LEFT_TOP,
         elide(excerpt, 42),
-        FontId::proportional(12.5),
+        FontId::proportional(12.5 * scale),
         Color32::from_rgb(216, 216, 216),
     );
     response
@@ -5188,7 +5392,9 @@ fn collapsible_section_header(
     count: usize,
     expanded: bool,
 ) -> Response {
-    let (rect, response) = ui.allocate_exact_size(vec2(ui.available_width(), 30.0), Sense::click());
+    let scale = sidebar_visual_scale(ui);
+    let (rect, response) =
+        ui.allocate_exact_size(vec2(ui.available_width(), 30.0 * scale), Sense::click());
     if response.hovered() {
         ui.painter()
             .rect_filled(rect, CornerRadius::same(5), Color32::from_rgb(40, 40, 40));
@@ -5216,14 +5422,14 @@ fn collapsible_section_header(
         pos2(x + 16.0, center),
         Align2::LEFT_CENTER,
         title,
-        FontId::proportional(11.5),
+        FontId::proportional(11.5 * scale),
         theme::MUTED,
     );
     ui.painter().text(
         pos2(rect.right() - 6.0, center),
         Align2::RIGHT_CENTER,
         count.to_string(),
-        FontId::proportional(10.5),
+        FontId::proportional(10.5 * scale),
         theme::MUTED,
     );
     response.on_hover_text(if expanded {
@@ -5891,15 +6097,12 @@ fn paint_toolbar_icon(
             painter.circle_filled(center, 1.5, color);
         }
         ToolbarIcon::CollapseToolbar => {
-            painter.line_segment(
-                [center + vec2(-7.0, -5.0), center + vec2(7.0, -5.0)],
-                stroke,
-            );
+            painter.line_segment([center + vec2(-7.0, 5.0), center + vec2(7.0, 5.0)], stroke);
             painter.add(egui::Shape::convex_polygon(
                 vec![
                     center + vec2(-4.0, 0.0),
                     center + vec2(4.0, 0.0),
-                    center + vec2(0.0, 4.5),
+                    center + vec2(0.0, -4.5),
                 ],
                 color,
                 Stroke::NONE,

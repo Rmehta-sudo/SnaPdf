@@ -39,6 +39,9 @@ pub struct AppState {
     /// Visual treatment for PDF entries in the sidebar.
     #[serde(default)]
     pub sidebar_file_icons: SidebarFileIcons,
+    /// One-time migration marker for the icon preference introduced after 0.1.0.
+    #[serde(default)]
+    pub sidebar_file_icons_initialized: bool,
     /// PDF entries pinned into the workspace's dedicated Pinned section.
     #[serde(default)]
     pub pinned_files: Vec<PathBuf>,
@@ -51,9 +54,9 @@ pub struct AppState {
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub enum SidebarFileIcons {
-    #[default]
     Standard,
     VsCode,
+    #[default]
     None,
 }
 
@@ -226,6 +229,16 @@ impl AppState {
         self.closed_documents.truncate(10);
     }
 
+    pub fn remove_recent(&mut self, path: &Path) {
+        self.recent_documents
+            .retain(|document| document.path != path);
+        for project in &mut self.projects {
+            project
+                .recent_documents
+                .retain(|document| document.path != path);
+        }
+    }
+
     pub fn take_most_recent_closed(&mut self) -> Option<PathBuf> {
         while let Some(path) = self.closed_documents.first().cloned() {
             self.closed_documents.remove(0);
@@ -327,6 +340,10 @@ impl AppState {
         } else {
             self.sidebar_scale_ratio.clamp(0.5, 1.25)
         };
+        if !self.sidebar_file_icons_initialized {
+            self.sidebar_file_icons = SidebarFileIcons::None;
+            self.sidebar_file_icons_initialized = true;
+        }
         if self
             .last_document
             .as_ref()
@@ -402,6 +419,29 @@ mod tests {
     fn legacy_state_uses_sixty_percent_chrome_ratio() {
         let state: AppState = serde_json::from_str("{}").expect("legacy state should deserialize");
         assert!((state.chrome_scale_ratio - 0.6).abs() < f32::EPSILON);
+        assert_eq!(state.sidebar_file_icons, SidebarFileIcons::None);
+    }
+
+    #[test]
+    fn removing_a_recent_clears_global_and_project_history() {
+        let path = PathBuf::from("/course/paper.pdf");
+        let recent = RecentDocument {
+            path: path.clone(),
+            opened_at: 1,
+        };
+        let mut state = AppState {
+            recent_documents: vec![recent.clone()],
+            projects: vec![Project {
+                name: "Course".to_owned(),
+                root: PathBuf::from("/course"),
+                expanded: true,
+                recent_documents: vec![recent],
+            }],
+            ..Default::default()
+        };
+        state.remove_recent(&path);
+        assert!(state.recent_documents.is_empty());
+        assert!(state.projects[0].recent_documents.is_empty());
     }
 
     #[test]
