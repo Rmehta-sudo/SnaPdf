@@ -1,0 +1,28 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>io.snappdf.SnapPDF</id>
+  <name>SnapPDF</name>
+  <summary>A project-based PDF reading workspace</summary>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>MIT</project_license>
+  <developer id="io.snappdf">
+    <name>SnapPDF contributors</name>
+  </developer>
+  <url type="homepage">https://github.com/Rmehta-sudo/Snapdf</url>
+  <description>
+    <p>
+      SnapPDF organizes PDFs from unrelated folders into one local workspace
+      with nested projects, tabs, recents, search, annotations, offline OCR,
+      Reader mode, and Presentation mode.
+    </p>
+    <p>
+      Documents remain in their original filesystem locations. SnapPDF does
+      not require imports, duplicate files, cloud storage, or an account.
+    </p>
+  </description>
+  <launchable type="desktop-id">io.snappdf.SnapPDF.desktop</launchable>
+  <provides>
+    <mediatype>application/pdf</mediatype>
+  </provides>
+  <content_rating type="oars-1.1"/>
+</component>

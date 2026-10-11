@@ -62,9 +62,11 @@ pub fn listen(creation: &eframe::CreationContext<'_>) -> Option<NativePinch> {
                 match event {
                     Event::XinputGesturePinchBegin(_) => {
                         previous_scale = 1.0;
-                        if sender.send(NativePinchEvent::Begin).is_err() { break; }
+                        if sender.send(NativePinchEvent::Begin).is_err() {
+                            break;
+                        }
                         repaint.request_repaint();
-                    },
+                    }
                     Event::XinputGesturePinchUpdate(event) => {
                         let scale = event.scale as f32 / 65_536.0;
                         if scale.is_finite() && scale > 0.0 {
@@ -80,9 +82,11 @@ pub fn listen(creation: &eframe::CreationContext<'_>) -> Option<NativePinch> {
                     }
                     Event::XinputGesturePinchEnd(_) => {
                         previous_scale = 1.0;
-                        if sender.send(NativePinchEvent::End).is_err() { break; }
+                        if sender.send(NativePinchEvent::End).is_err() {
+                            break;
+                        }
                         repaint.request_repaint();
-                    },
+                    }
                     _ => {}
                 }
             }

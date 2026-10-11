@@ -17,53 +17,50 @@ Normal PDF viewers are excellent for one document at a time. Managing dozens of 
 
 In short, SnapPDF is not just another PDF viewer. It is a fast, filesystem-first workspace for managing and reading PDFs across multiple projects.
 
-## Install on a new Linux machine
+## Install SnapPDF
 
-The installer is intended to be the one command you run after cloning the repository. On systems with `apt`, it installs the needed Linux build packages, Rust, and the local OCR runtime; it then builds an optimized SnapPDF binary, registers the application, and makes it the default PDF handler.
-
-1. Clone the repository and enter it:
-
-   ```bash
-   git clone https://github.com/Rmehta-sudo/Snapdf.git
-   cd Snapdf
-   ```
-
-2. Run the installer:
-
-   ```bash
-   ./scripts/install.sh
-   ```
-
-   Your system may ask for your password once to install required packages. The first build and first OCR model download can take a few minutes; later launches are normal desktop-app launches.
-
-5. Open **SnapPDF** from the Applications menu, pin it to your dock if desired, or run:
-
-   ```bash
-   snappdf
-   ```
-
-To open a document directly:
+Download the latest `SnapPDF-…-x86_64.AppImage` from the [SnapPDF releases page](https://github.com/Rmehta-sudo/Snapdf/releases/latest), then make it executable and open it:
 
 ```bash
-snappdf /absolute/path/to/document.pdf
+chmod +x SnapPDF-*.AppImage
+./SnapPDF-*.AppImage
 ```
+
+That is the complete installation for the PDF workspace. You do **not** need Rust, Cargo, a compiler, `apt`, administrator access, or a cloned repository. On first launch SnapPDF registers its application entry and icon for your user account, so you can find it in the application menu and pin it to your dock. If you move the AppImage later, launch it once from the new location to refresh that entry.
+
+To open a document directly, pass its path to the same file:
+
+```bash
+./SnapPDF-*.AppImage /absolute/path/to/document.pdf
+```
+
+### Optional offline OCR setup
+
+The PDF viewer and annotation workspace work immediately. Offline OCR uses larger local machine-learning libraries and models, so they are not added to every SnapPDF download. Install them once through the AppImage when you want OCR:
+
+```bash
+./SnapPDF-*.AppImage --install-ocr
+```
+
+This downloads the OCR runtime into `~/.local/share/snappdf/ocr`; the OCR models download on their first use. It does not require Rust or system-wide packages.
 
 ### Updating or removing SnapPDF
 
-To update a cloned checkout:
+To update, download the newer AppImage and replace the old one. To remove SnapPDF, delete its AppImage. Your PDFs are never moved or modified by installation.
+
+SnapPDF’s workspace state is stored at `~/.config/snappdf/state.json`; its optional OCR runtime and models are stored under `~/.local/share/snappdf/ocr`. Remove those directories too only if you also want to erase SnapPDF’s saved workspace and OCR data.
+
+### Build and install from source
+
+Developers who want a native local build can clone the repository and run the source installer:
 
 ```bash
-git pull
+git clone https://github.com/Rmehta-sudo/Snapdf.git
+cd Snapdf
 ./scripts/install.sh
 ```
 
-To remove the desktop integration and installed executable:
-
-```bash
-./scripts/uninstall.sh
-```
-
-Your PDFs are never moved or modified by installation. SnapPDF’s local workspace state is stored at `~/.config/snappdf/state.json`; the OCR runtime and models are stored under `~/.local/share/snappdf/ocr`.
+The source installer installs compilation dependencies on systems with `apt`, installs Rust when needed, builds SnapPDF, registers the desktop entry, and sets up OCR. Those build dependencies are needed only for compiling from source—not for the AppImage.
 
 ## Getting started
 
@@ -123,6 +120,8 @@ The controls beside the annotation tools provide three focused views:
 | `Ctrl+P` | Print |
 | `Ctrl+W` | Close the current tab |
 | `Ctrl+Shift+T` | Restore the most recently closed tab |
+| `Ctrl+Tab` | Move to the next open PDF tab |
+| `Ctrl+Shift+Tab` | Move to the previous open PDF tab |
 | `Ctrl++` / `Ctrl+-` | Scale the document and application chrome |
 | `Up` / `Down` | Scroll the document |
 | `Left` / `Right` | Previous / next page |
@@ -134,16 +133,17 @@ The controls beside the annotation tools provide three focused views:
 
 ```text
 Snapdf/
+├── packaging/    # AppImage launcher and packaging files
 ├── src/          # Application, PDF rendering, storage, gestures, and OCR integration
 ├── resources/    # Desktop launcher, application icon, and local OCR worker
-├── scripts/      # Install, OCR setup, and uninstall scripts
+├── scripts/      # AppImage build, source install, OCR setup, and uninstall scripts
 ├── Cargo.toml    # Rust package definition
 └── README.md     # User guide
 ```
 
 ## Build from source manually
 
-The installer is recommended. If Rust is already installed and you only want a development run:
+For normal use, the AppImage is recommended. If Rust is already installed and you only want a development run:
 
 ```bash
 cargo run --release

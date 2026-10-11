@@ -4117,12 +4117,13 @@ impl SnapPdfApp {
             .anchor(Align2::CENTER_CENTER, vec2(0.0, -80.0))
             .collapsible(false)
             .resizable(false)
+            .default_width(292.0)
+            .min_width(292.0)
+            .max_width(292.0)
             .show(ctx, |ui| {
-                ui.label("This changes only the name shown in SnapPDF.");
-                ui.add_space(6.0);
                 let response = ui.add_sized(
-                    [360.0, 30.0],
-                    egui::TextEdit::singleline(&mut self.rename_buffer),
+                    [ui.available_width(), 28.0],
+                    egui::TextEdit::singleline(&mut self.rename_buffer).hint_text("Display name"),
                 );
                 if self.rename_focus_requested {
                     response.request_focus();
@@ -4130,7 +4131,7 @@ impl SnapPdfApp {
                 }
                 let enter =
                     response.lost_focus() && ui.input(|input| input.key_pressed(Key::Enter));
-                ui.add_space(8.0);
+                ui.add_space(5.0);
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                     if ui
                         .add_enabled(
@@ -4612,29 +4613,39 @@ impl SnapPdfApp {
         }
     }
 
-    fn empty_state(&self, ui: &mut egui::Ui) {
+    fn empty_state(&mut self, ui: &mut egui::Ui) {
         ui.centered_and_justified(|ui| {
             ui.vertical_centered(|ui| {
-                ui.label(RichText::new("SnapPDF").size(34.0).strong());
-                ui.add_space(6.0);
-                ui.label(
-                    RichText::new("Your PDFs, organized by project.")
-                        .size(17.0)
-                        .color(theme::MUTED),
-                );
-                ui.add_space(18.0);
-                ui.label("Open a PDF, add a project folder, or drag a PDF into this window.");
-                ui.add_space(8.0);
-                ui.label(
-                    RichText::new(
-                        "Ctrl+O  |  Ctrl++ / Ctrl+-  |  arrows navigate  |  drag text, Ctrl+C",
-                    )
-                    .color(theme::MUTED),
-                );
+                ui.set_max_width(238.0);
+                let action_frame = |ui: &mut egui::Ui, label: &str, shortcut: &str| {
+                    let response = Frame::new()
+                        .stroke(Stroke::new(1.0, Color32::from_rgb(58, 58, 58)))
+                        .corner_radius(CornerRadius::same(18))
+                        .inner_margin(Margin::symmetric(14, 8))
+                        .show(ui, |ui| {
+                            ui.set_width(208.0);
+                            ui.horizontal(|ui| {
+                                ui.label(RichText::new(label).size(14.0));
+                                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                    ui.label(
+                                        RichText::new(shortcut).size(11.5).color(theme::MUTED),
+                                    );
+                                });
+                            });
+                        });
+                    response.response.interact(Sense::click())
+                };
+
+                if action_frame(ui, "Open PDF", "Ctrl+O").clicked() {
+                    self.open_file_dialog();
+                }
+                ui.add_space(7.0);
+                if action_frame(ui, "Add project", "Ctrl+K  Ctrl+O").clicked() {
+                    self.add_project_dialog();
+                }
                 if !self.renderer_ready {
-                    ui.add_space(16.0);
+                    ui.add_space(12.0);
                     ui.spinner();
-                    ui.label(&self.status);
                 }
             });
         });
