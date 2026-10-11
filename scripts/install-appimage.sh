@@ -51,13 +51,15 @@ install -m 0755 "$temporary/$asset" "$INSTALL_ROOT/.SnapPDF.AppImage.new"
 mv -f "$INSTALL_ROOT/.SnapPDF.AppImage.new" "$INSTALL_ROOT/SnapPDF.AppImage"
 
 wrapper="$BIN_DIR/snappdf"
-cat > "$wrapper" <<EOF
+wrapper_new="$BIN_DIR/.snappdf.new"
+cat > "$wrapper_new" <<EOF
 #!/bin/sh
 export APPIMAGE_EXTRACT_AND_RUN=1
 export SNAPPDF_EXECUTABLE="$wrapper"
 exec "$INSTALL_ROOT/SnapPDF.AppImage" "\$@"
 EOF
-chmod 0755 "$wrapper"
+chmod 0755 "$wrapper_new"
+mv -f "$wrapper_new" "$wrapper"
 
 "$wrapper" --register-only
 

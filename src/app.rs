@@ -1975,6 +1975,8 @@ impl SnapPdfApp {
         egui::Panel::left("project-sidebar")
             .resizable(true)
             .default_size(340.0)
+            .min_size(0.0)
+            .max_size(f32::INFINITY)
             .frame(
                 Frame::new()
                     .fill(theme::SIDEBAR_BG)
@@ -4697,9 +4699,7 @@ impl SnapPdfApp {
             .anchor(Align2::CENTER_CENTER, vec2(0.0, -80.0))
             .collapsible(false)
             .resizable(false)
-            .default_width(292.0)
-            .min_width(292.0)
-            .max_width(292.0)
+            .fixed_size(vec2(292.0, 108.0))
             .show(ctx, |ui| {
                 let response = ui.add_sized(
                     [ui.available_width(), 28.0],
@@ -5273,9 +5273,16 @@ impl SnapPdfApp {
     }
 
     fn empty_state(&mut self, ui: &mut egui::Ui) {
-        ui.centered_and_justified(|ui| {
-            ui.vertical_centered(|ui| {
-                ui.set_max_width(238.0);
+        let content_height = if self.renderer_ready { 89.0 } else { 117.0 };
+        let content_rect = Rect::from_center_size(
+            ui.available_rect_before_wrap().center(),
+            vec2(238.0, content_height),
+        );
+        ui.scope_builder(
+            egui::UiBuilder::new()
+                .max_rect(content_rect)
+                .layout(Layout::top_down(Align::Center)),
+            |ui| {
                 let action_frame = |ui: &mut egui::Ui, label: &str, shortcut: &str| {
                     let response = Frame::new()
                         .stroke(Stroke::new(1.0, Color32::from_rgb(58, 58, 58)))
@@ -5306,8 +5313,8 @@ impl SnapPdfApp {
                     ui.add_space(12.0);
                     ui.spinner();
                 }
-            });
-        });
+            },
+        );
     }
 }
 
