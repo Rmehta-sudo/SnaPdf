@@ -1,0 +1,37 @@
+# Maintainer: Rachit Mehta <Rmehta-sudo@users.noreply.github.com>
+
+pkgname=snapdf
+pkgver=0.3.0
+pkgrel=1
+pkgdesc="Project-based PDF reading workspace with annotations, offline OCR, and study chat"
+arch=('x86_64')
+url="https://github.com/Rmehta-sudo/SnaPdf"
+license=('MIT')
+depends=('bash' 'glibc' 'gcc-libs' 'hicolor-icon-theme' 'xdg-utils')
+optdepends=('cups: printing support')
+options=('!strip' '!debug')
+_appimage="SnaPdf-${pkgver}-${CARCH}.AppImage"
+source=('snapdf' 'LICENSE')
+source_x86_64=("${_appimage}::${url}/releases/download/v${pkgver}/${_appimage}")
+sha256sums=('460b68ea27d4e8a714713f75f99fed6ab62d4d3cf70216d9e4f4eb03cb55774b' 'e5ab173cb99250daa845451a83855279820b7a57f678d8ec0e3dc985043704a0')
+sha256sums_x86_64=('646f49920bc5893a177ff7f6f6ef7c8fffd2a5f9d0eedc21995a7e196cf5ad33')
+
+prepare() {
+  chmod +x "${_appimage}"
+  "./${_appimage}" --appimage-extract >/dev/null
+}
+
+package() {
+  install -Dm755 "${_appimage}" \
+    "${pkgdir}/usr/lib/snapdf/SnaPdf.AppImage"
+  install -Dm755 snapdf "${pkgdir}/usr/bin/snapdf"
+  install -Dm644 LICENSE "${pkgdir}/usr/share/licenses/${pkgname}/LICENSE"
+  install -Dm644 squashfs-root/io.snapdf.SnaPdf.desktop \
+    "${pkgdir}/usr/share/applications/io.snapdf.SnaPdf.desktop"
+  sed -i 's|^Exec=.*|Exec=snapdf %F|' \
+    "${pkgdir}/usr/share/applications/io.snapdf.SnaPdf.desktop"
+  install -Dm644 squashfs-root/io.snapdf.SnaPdf.svg \
+    "${pkgdir}/usr/share/icons/hicolor/scalable/apps/io.snapdf.SnaPdf.svg"
+  install -Dm644 squashfs-root/usr/share/metainfo/io.snapdf.SnaPdf.appdata.xml \
+    "${pkgdir}/usr/share/metainfo/io.snapdf.SnaPdf.appdata.xml"
+}

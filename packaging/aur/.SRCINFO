@@ -1,0 +1,23 @@
+pkgbase = snapdf
+	pkgdesc = Project-based PDF reading workspace with annotations, offline OCR, and study chat
+	pkgver = 0.3.0
+	pkgrel = 1
+	url = https://github.com/Rmehta-sudo/SnaPdf
+	arch = x86_64
+	license = MIT
+	depends = bash
+	depends = glibc
+	depends = gcc-libs
+	depends = hicolor-icon-theme
+	depends = xdg-utils
+	optdepends = cups: printing support
+	options = !strip
+	options = !debug
+	source = snapdf
+	source = LICENSE
+	sha256sums = 460b68ea27d4e8a714713f75f99fed6ab62d4d3cf70216d9e4f4eb03cb55774b
+	sha256sums = e5ab173cb99250daa845451a83855279820b7a57f678d8ec0e3dc985043704a0
+	source_x86_64 = SnaPdf-0.3.0-x86_64.AppImage::https://github.com/Rmehta-sudo/SnaPdf/releases/download/v0.3.0/SnaPdf-0.3.0-x86_64.AppImage
+	sha256sums_x86_64 = 646f49920bc5893a177ff7f6f6ef7c8fffd2a5f9d0eedc21995a7e196cf5ad33
+
+pkgname = snapdf

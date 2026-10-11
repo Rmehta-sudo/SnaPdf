@@ -1,0 +1,4 @@
+#!/usr/bin/bash
+export APPIMAGE_EXTRACT_AND_RUN=1
+export SNAPDF_NO_REGISTER=1
+exec /usr/lib/snapdf/SnaPdf.AppImage "$@"
