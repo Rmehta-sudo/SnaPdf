@@ -150,7 +150,7 @@ Draw a rectangle with **Snip OCR** to recognize text locally. SnaPdf first uses 
 Click the chat-bubble button in the document toolbar to open the resizable panel on the right. Choose a provider and model, then use it as a focused companion while reading—ordinary chat, not an autonomous agent.
 
 - **ChatGPT:** click **Continue with ChatGPT**. Sign-in happens in your normal browser through OpenAI's [official open-source account flow](https://developers.openai.com/siwc/token-sharing-open-source); SnaPdf never sees your password. Available models are loaded from your eligible account after sign-in.
-- **Gemini:** click **Connect Gemini** and paste a key created in [Google AI Studio](https://aistudio.google.com/app/apikey). Available Gemini models are loaded after the key is validated. A direct Google-account sign-in requires SnaPdf to have a registered Google OAuth client, so the portable open-source build deliberately uses the official user-owned API-key route instead of pretending to provide OAuth.
+- **Gemini:** click **Continue with Google**. SnaPdf opens Google's sign-in page in your normal browser, receives the result through a temporary loopback connection on your computer, and never sees your Google password. Official release builds use SnaPdf's registered desktop OAuth client; available Gemini models are loaded after authorization. **Use API key instead** remains available for people who prefer a key from [Google AI Studio](https://aistudio.google.com/app/apikey), and for locally compiled builds without registered OAuth configuration.
 
 Use the paperclip button in the composer to attach a PDF, image, or text file. **Attach current PDF** sends the document you are reading. The capture button beside it changes the cursor into a crosshair; drag around a diagram, equation, map, or paragraph and the exact rendered region is added as an image—without sending it through Math OCR.
 
@@ -236,3 +236,16 @@ Or pass a PDF path:
 ```bash
 cargo run --release -- /absolute/path/to/document.pdf
 ```
+
+### Register Google sign-in in a development build
+
+The API-key fallback works without additional build configuration. To enable **Continue with Google** in a locally compiled build, create a Google Cloud OAuth client whose application type is **Desktop app**, enable the Generative Language API, and provide its values only while compiling:
+
+```bash
+SNAPDF_GOOGLE_CLIENT_ID='…apps.googleusercontent.com' \
+SNAPDF_GOOGLE_CLIENT_SECRET='…' \
+SNAPDF_GOOGLE_PROJECT_ID='your-google-cloud-project-id' \
+cargo build --release
+```
+
+Do not commit the downloaded client JSON or put these values in source files. A desktop OAuth client is a public client—its client secret cannot be kept confidential once an application is distributed—so it must never be reused as a server-side secret. SnaPdf adds PKCE and a random state value to every authorization request, opens the system browser rather than an embedded login page, accepts the callback only on loopback, and stores each user's access and refresh tokens in the owner-only credentials file.

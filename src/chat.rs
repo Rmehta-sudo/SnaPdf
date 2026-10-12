@@ -21,6 +21,10 @@ const OPENAI_TOKEN: &str = "https://auth.openai.com/api/accounts/oauth/token";
 const OPENAI_DISCOVERY: &str = "https://auth.openai.com/.well-known/openid-configuration";
 const OPENAI_API: &str = "https://api.openai.com/v1";
 const GEMINI_API: &str = "https://generativelanguage.googleapis.com/v1beta";
+const GOOGLE_AUTHORIZE: &str = "https://accounts.google.com/o/oauth2/v2/auth";
+const GOOGLE_TOKEN: &str = "https://oauth2.googleapis.com/token";
+const GOOGLE_USERINFO: &str = "https://openidconnect.googleapis.com/v1/userinfo";
+const GOOGLE_GEMINI_SCOPE: &str = "https://www.googleapis.com/auth/generative-language.retriever";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -85,7 +89,8 @@ pub struct ChatMessage {
 #[derive(Debug)]
 pub enum ChatCommand {
     SignInChatGpt,
-    ConnectGemini {
+    SignInGemini,
+    ConnectGeminiApiKey {
         api_key: String,
     },
     SignOut(ChatProvider),
@@ -159,10 +164,29 @@ struct OpenAiCredential {
     id_token: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct GeminiOAuthCredential {
+    client_id: String,
+    client_secret: String,
+    project_id: String,
+    access_token: String,
+    refresh_token: Option<String>,
+    expires_at: u64,
+    account: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct GoogleOAuthClient {
+    client_id: String,
+    client_secret: String,
+    project_id: String,
+}
+
 #[derive(Debug, Default, Serialize, Deserialize)]
 struct Credentials {
     host_id: Option<String>,
     openai: Option<OpenAiCredential>,
+    gemini_oauth: Option<GeminiOAuthCredential>,
     gemini_api_key: Option<String>,
 }
 
@@ -183,7 +207,9 @@ fn worker_loop(
     while let Ok(command) = commands.recv() {
         let error_target = match &command {
             ChatCommand::SignInChatGpt => (Some(ChatProvider::ChatGpt), None),
-            ChatCommand::ConnectGemini { .. } => (Some(ChatProvider::Gemini), None),
+            ChatCommand::SignInGemini | ChatCommand::ConnectGeminiApiKey { .. } => {
+                (Some(ChatProvider::Gemini), None)
+            }
             ChatCommand::SignOut(provider) | ChatCommand::RefreshModels(provider) => {
                 (Some(*provider), None)
             }
@@ -199,13 +225,20 @@ fn worker_loop(
                 .and_then(|_| {
                     refresh_models(&client, &events, &mut credentials, ChatProvider::ChatGpt)
                 }),
-            ChatCommand::ConnectGemini { api_key } => {
-                connect_gemini(&client, &events, &mut credentials, api_key)
+            ChatCommand::SignInGemini => sign_in_gemini(&client, &events, &mut credentials)
+                .and_then(|_| {
+                    refresh_models(&client, &events, &mut credentials, ChatProvider::Gemini)
+                }),
+            ChatCommand::ConnectGeminiApiKey { api_key } => {
+                connect_gemini_api_key(&client, &events, &mut credentials, api_key)
             }
             ChatCommand::SignOut(provider) => {
                 match provider {
                     ChatProvider::ChatGpt => credentials.openai = None,
-                    ChatProvider::Gemini => credentials.gemini_api_key = None,
+                    ChatProvider::Gemini => {
+                        credentials.gemini_oauth = None;
+                        credentials.gemini_api_key = None;
+                    }
                 }
                 save_credentials(&credentials).map(|_| {
                     let _ = events.send(ChatEvent::AccountState {
@@ -235,7 +268,7 @@ fn worker_loop(
                 ChatProvider::Gemini => send_gemini(
                     &client,
                     &events,
-                    &credentials,
+                    &mut credentials,
                     request_id,
                     &model,
                     &messages,
@@ -266,11 +299,17 @@ fn emit_account_state(events: &Sender<ChatEvent>, credentials: &Credentials) {
     });
     let _ = events.send(ChatEvent::AccountState {
         provider: ChatProvider::Gemini,
-        connected: credentials.gemini_api_key.is_some(),
+        connected: credentials.gemini_oauth.is_some() || credentials.gemini_api_key.is_some(),
         account: credentials
-            .gemini_api_key
+            .gemini_oauth
             .as_ref()
-            .map(|_| "Google AI Studio key".to_owned()),
+            .and_then(|value| value.account.clone())
+            .or_else(|| {
+                credentials
+                    .gemini_api_key
+                    .as_ref()
+                    .map(|_| "Google AI Studio key".to_owned())
+            }),
     });
 }
 
@@ -306,6 +345,51 @@ fn now_seconds() -> u64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs()
+}
+
+fn google_oauth_client() -> Option<GoogleOAuthClient> {
+    let client_id = option_env!("SNAPDF_GOOGLE_CLIENT_ID")?.trim();
+    let project_id = option_env!("SNAPDF_GOOGLE_PROJECT_ID")?.trim();
+    if client_id.is_empty() || project_id.is_empty() {
+        return None;
+    }
+    Some(GoogleOAuthClient {
+        client_id: client_id.to_owned(),
+        client_secret: option_env!("SNAPDF_GOOGLE_CLIENT_SECRET")
+            .unwrap_or_default()
+            .trim()
+            .to_owned(),
+        project_id: project_id.to_owned(),
+    })
+}
+
+pub fn gemini_oauth_available() -> bool {
+    google_oauth_client().is_some()
+}
+
+fn google_authorize_url(
+    oauth: &GoogleOAuthClient,
+    redirect_uri: &str,
+    state: &str,
+    challenge: &str,
+) -> Result<Url> {
+    let mut authorize = Url::parse(GOOGLE_AUTHORIZE)?;
+    authorize
+        .query_pairs_mut()
+        .append_pair("response_type", "code")
+        .append_pair("client_id", &oauth.client_id)
+        .append_pair("redirect_uri", redirect_uri)
+        .append_pair(
+            "scope",
+            &format!("openid email profile {GOOGLE_GEMINI_SCOPE}"),
+        )
+        .append_pair("code_challenge", challenge)
+        .append_pair("code_challenge_method", "S256")
+        .append_pair("state", state)
+        .append_pair("access_type", "offline")
+        .append_pair("prompt", "consent")
+        .append_pair("include_granted_scopes", "true");
+    Ok(authorize)
 }
 
 fn sign_in_chatgpt(
@@ -564,7 +648,122 @@ fn ensure_openai_token(client: &Client, credentials: &mut Credentials) -> Result
     Ok(access)
 }
 
-fn connect_gemini(
+fn sign_in_gemini(
+    client: &Client,
+    events: &Sender<ChatEvent>,
+    credentials: &mut Credentials,
+) -> Result<()> {
+    let oauth = google_oauth_client().context(
+        "This SnaPdf build is not registered for Google sign-in; use an API key instead",
+    )?;
+    let listener =
+        TcpListener::bind(("127.0.0.1", 0)).context("could not start local Google callback")?;
+    listener.set_nonblocking(false)?;
+    let port = listener.local_addr()?.port();
+    let redirect_uri = format!("http://127.0.0.1:{port}");
+    let state = Uuid::new_v4().to_string();
+    let verifier = format!("{}{}", Uuid::new_v4().simple(), Uuid::new_v4().simple());
+    let challenge = general_purpose::URL_SAFE_NO_PAD.encode(Sha256::digest(verifier.as_bytes()));
+
+    let authorize = google_authorize_url(&oauth, &redirect_uri, &state, &challenge)?;
+
+    let _ = events.send(ChatEvent::AuthProgress {
+        provider: ChatProvider::Gemini,
+        message: "Finish signing in with Google in your browser…".to_owned(),
+    });
+    webbrowser::open(authorize.as_str()).context("could not open Google sign-in in the browser")?;
+
+    listener.set_nonblocking(true)?;
+    let deadline = Instant::now() + Duration::from_secs(300);
+    let (mut stream, _) = loop {
+        match listener.accept() {
+            Ok(connection) => break connection,
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                if Instant::now() >= deadline {
+                    bail!("Google sign-in timed out; try again when you are ready");
+                }
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            Err(error) => return Err(error).context("Google sign-in callback failed"),
+        }
+    };
+    stream.set_read_timeout(Some(Duration::from_secs(20)))?;
+    let mut request = String::new();
+    BufReader::new(stream.try_clone()?)
+        .read_line(&mut request)
+        .context("could not read Google sign-in callback")?;
+    let target = request
+        .split_whitespace()
+        .nth(1)
+        .context("invalid Google sign-in callback")?;
+    let callback = Url::parse(&format!("http://127.0.0.1{target}"))?;
+    let params = callback
+        .query_pairs()
+        .collect::<std::collections::HashMap<_, _>>();
+    if let Some(error) = params.get("error") {
+        reply_to_browser(&mut stream, false)?;
+        bail!("Google sign-in was cancelled or rejected: {error}");
+    }
+    if params.get("state").map(|value| value.as_ref()) != Some(state.as_str()) {
+        reply_to_browser(&mut stream, false)?;
+        bail!("Google sign-in state did not match");
+    }
+    let code = params
+        .get("code")
+        .context("Google sign-in callback did not include a code")?;
+    let mut token_form = vec![
+        ("grant_type", "authorization_code"),
+        ("code", code.as_ref()),
+        ("redirect_uri", redirect_uri.as_str()),
+        ("client_id", oauth.client_id.as_str()),
+        ("code_verifier", verifier.as_str()),
+    ];
+    if !oauth.client_secret.is_empty() {
+        token_form.push(("client_secret", oauth.client_secret.as_str()));
+    }
+    let token = checked_json(
+        client.post(GOOGLE_TOKEN).form(&token_form).send()?,
+        "Google token exchange",
+    )?;
+    let access_token = token["access_token"]
+        .as_str()
+        .context("Google did not return an access token")?
+        .to_owned();
+    let account = checked_json(
+        client
+            .get(GOOGLE_USERINFO)
+            .bearer_auth(&access_token)
+            .send()?,
+        "Google account profile",
+    )?["email"]
+        .as_str()
+        .unwrap_or("Google account")
+        .to_owned();
+    credentials.gemini_oauth = Some(GeminiOAuthCredential {
+        client_id: oauth.client_id,
+        client_secret: oauth.client_secret,
+        project_id: oauth.project_id,
+        access_token,
+        refresh_token: token["refresh_token"].as_str().map(str::to_owned),
+        expires_at: now_seconds()
+            + token["expires_in"]
+                .as_u64()
+                .unwrap_or(3600)
+                .saturating_sub(30),
+        account: Some(account.clone()),
+    });
+    credentials.gemini_api_key = None;
+    save_credentials(credentials)?;
+    reply_to_browser(&mut stream, true)?;
+    let _ = events.send(ChatEvent::AccountState {
+        provider: ChatProvider::Gemini,
+        connected: true,
+        account: Some(account),
+    });
+    Ok(())
+}
+
+fn connect_gemini_api_key(
     client: &Client,
     events: &Sender<ChatEvent>,
     credentials: &mut Credentials,
@@ -573,7 +772,8 @@ fn connect_gemini(
     if api_key.trim().is_empty() {
         bail!("Enter a Gemini API key from Google AI Studio");
     }
-    let models = list_gemini_models(client, api_key.trim())?;
+    let models = list_gemini_models_api_key(client, api_key.trim())?;
+    credentials.gemini_oauth = None;
     credentials.gemini_api_key = Some(api_key.trim().to_owned());
     save_credentials(credentials)?;
     let _ = events.send(ChatEvent::AccountState {
@@ -586,6 +786,62 @@ fn connect_gemini(
         models,
     });
     Ok(())
+}
+
+#[derive(Debug, Clone)]
+enum GeminiAuth {
+    OAuth { token: String, project_id: String },
+    ApiKey(String),
+}
+
+fn ensure_gemini_auth(client: &Client, credentials: &mut Credentials) -> Result<GeminiAuth> {
+    if let Some(credential) = credentials.gemini_oauth.as_mut() {
+        if credential.expires_at <= now_seconds() + 30 {
+            let refresh_token = credential
+                .refresh_token
+                .clone()
+                .context("Google session expired; sign in again")?;
+            let mut token_form = vec![
+                ("grant_type", "refresh_token"),
+                ("refresh_token", refresh_token.as_str()),
+                ("client_id", credential.client_id.as_str()),
+            ];
+            if !credential.client_secret.is_empty() {
+                token_form.push(("client_secret", credential.client_secret.as_str()));
+            }
+            let token = checked_json(
+                client.post(GOOGLE_TOKEN).form(&token_form).send()?,
+                "Google token refresh",
+            )?;
+            credential.access_token = token["access_token"]
+                .as_str()
+                .context("Google refresh did not return an access token")?
+                .to_owned();
+            credential.refresh_token = token["refresh_token"]
+                .as_str()
+                .map(str::to_owned)
+                .or(Some(refresh_token));
+            credential.expires_at = now_seconds()
+                + token["expires_in"]
+                    .as_u64()
+                    .unwrap_or(3600)
+                    .saturating_sub(30);
+            save_credentials(credentials)?;
+        }
+        let credential = credentials
+            .gemini_oauth
+            .as_ref()
+            .expect("Gemini OAuth credential disappeared");
+        return Ok(GeminiAuth::OAuth {
+            token: credential.access_token.clone(),
+            project_id: credential.project_id.clone(),
+        });
+    }
+    credentials
+        .gemini_api_key
+        .clone()
+        .map(GeminiAuth::ApiKey)
+        .context("Connect Gemini first")
 }
 
 fn refresh_models(
@@ -620,22 +876,27 @@ fn refresh_models(
             models
         }
         ChatProvider::Gemini => {
-            let key = credentials
-                .gemini_api_key
-                .as_deref()
-                .context("Connect Gemini first")?;
-            list_gemini_models(client, key)?
+            let auth = ensure_gemini_auth(client, credentials)?;
+            list_gemini_models(client, &auth)?
         }
     };
     let _ = events.send(ChatEvent::Models { provider, models });
     Ok(())
 }
 
-fn list_gemini_models(client: &Client, key: &str) -> Result<Vec<String>> {
-    let response = client
-        .get(format!("{GEMINI_API}/models"))
-        .header("x-goog-api-key", key)
-        .send()?;
+fn list_gemini_models_api_key(client: &Client, key: &str) -> Result<Vec<String>> {
+    list_gemini_models(client, &GeminiAuth::ApiKey(key.to_owned()))
+}
+
+fn list_gemini_models(client: &Client, auth: &GeminiAuth) -> Result<Vec<String>> {
+    let request = client.get(format!("{GEMINI_API}/models"));
+    let request = match auth {
+        GeminiAuth::OAuth { token, project_id } => request
+            .bearer_auth(token)
+            .header("x-goog-user-project", project_id),
+        GeminiAuth::ApiKey(key) => request.header("x-goog-api-key", key),
+    };
+    let response = request.send()?;
     let value = checked_json(response, "Gemini model list")?;
     let mut models = value["models"]
         .as_array()
@@ -734,23 +995,23 @@ fn openai_message(message: &ChatMessage) -> Result<Value> {
 fn send_gemini(
     client: &Client,
     events: &Sender<ChatEvent>,
-    credentials: &Credentials,
+    credentials: &mut Credentials,
     request_id: u64,
     model: &str,
     messages: &[ChatMessage],
 ) -> Result<()> {
-    let key = credentials
-        .gemini_api_key
-        .as_deref()
-        .context("Connect Gemini first")?;
+    let auth = ensure_gemini_auth(client, credentials)?;
     let contents = messages.iter().map(gemini_message).collect::<Vec<_>>();
-    let response = client
-        .post(format!(
-            "{GEMINI_API}/models/{model}:streamGenerateContent?alt=sse"
-        ))
-        .header("x-goog-api-key", key)
-        .json(&json!({"contents": contents}))
-        .send()?;
+    let request = client.post(format!(
+        "{GEMINI_API}/models/{model}:streamGenerateContent?alt=sse"
+    ));
+    let request = match &auth {
+        GeminiAuth::OAuth { token, project_id } => request
+            .bearer_auth(token)
+            .header("x-goog-user-project", project_id),
+        GeminiAuth::ApiKey(key) => request.header("x-goog-api-key", key),
+    };
+    let response = request.json(&json!({"contents": contents})).send()?;
     stream_sse(
         response,
         |value| {
@@ -939,5 +1200,27 @@ mod tests {
         let restored: ChatMessage = serde_json::from_str(&encoded).unwrap();
         assert_eq!(restored.text, "Explain the figure");
         assert!(restored.attachments.is_empty());
+    }
+
+    #[test]
+    fn google_desktop_oauth_uses_pkce_state_and_offline_access() {
+        let url = google_authorize_url(
+            &GoogleOAuthClient {
+                client_id: "desktop.apps.googleusercontent.com".to_owned(),
+                client_secret: String::new(),
+                project_id: "snapdf-test".to_owned(),
+            },
+            "http://127.0.0.1:4242",
+            "random-state",
+            "pkce-challenge",
+        )
+        .unwrap();
+        let query = url
+            .query_pairs()
+            .collect::<std::collections::HashMap<_, _>>();
+        assert_eq!(query.get("code_challenge_method").unwrap(), "S256");
+        assert_eq!(query.get("state").unwrap(), "random-state");
+        assert_eq!(query.get("access_type").unwrap(), "offline");
+        assert!(query.get("scope").unwrap().contains(GOOGLE_GEMINI_SCOPE));
     }
 }
