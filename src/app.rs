@@ -3642,283 +3642,384 @@ impl SnaPdfApp {
         }
         egui::Panel::right("study-chat")
             .resizable(true)
-            .default_size(380.0)
+            .default_size(430.0)
             .min_size(0.0)
             .max_size(f32::INFINITY)
             .frame(
                 Frame::new()
-                    .fill(Color32::from_rgb(28, 28, 28))
-                    .stroke(Stroke::new(1.0, Color32::from_rgb(53, 53, 53)))
-                    .inner_margin(Margin::same(12)),
+                    .fill(Color32::from_rgb(33, 33, 33))
+                    .stroke(Stroke::new(1.0, Color32::from_rgb(57, 57, 57)))
+                    .inner_margin(Margin::ZERO),
             )
             .show(root, |ui| {
                 bounded_panel_content(ui, "study-chat-content", |ui| {
-                let provider = self.study_chat.provider;
-                ui.horizontal(|ui| {
-                    ui.label(RichText::new("Study").size(17.0).strong());
-                    let active_title = self.study_chat.active_session().title.clone();
-                    let mut switch_to = None;
-                    egui::ComboBox::from_id_salt("study-chat-history")
-                        .width(132.0)
-                        .selected_text(elide(&active_title, 22))
-                        .show_ui(ui, |ui| {
-                            for chat in &self.study_chat.sessions {
-                                if ui
-                                    .selectable_label(
-                                        chat.id == self.study_chat.active_session_id,
-                                        elide(&chat.title, 28),
-                                    )
-                                    .clicked()
-                                {
-                                    switch_to = Some(chat.id);
-                                }
-                            }
-                        });
-                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        if chat_icon_button(ui, ToolbarIcon::Close, true, "Close study chat").clicked() {
-                            self.study_chat.visible = false;
-                            self.persist();
-                        }
-                        if chat_icon_button(
-                            ui,
-                            ToolbarIcon::DeleteChat,
-                            !self.study_chat.busy,
-                            "Delete this chat",
-                        )
-                        .clicked()
-                        {
-                            self.delete_active_study_chat();
-                        }
-                        if chat_icon_button(ui, ToolbarIcon::NewChat, !self.study_chat.busy, "New study chat")
-                            .clicked()
-                        {
-                            self.request_new_study_chat();
-                        }
-                    });
-                    if let Some(id) = switch_to {
-                        self.activate_study_chat(id);
-                    }
-                });
-                ui.add_space(7.0);
-                ui.horizontal(|ui| {
-                    for candidate in [ChatProvider::ChatGpt, ChatProvider::Gemini] {
-                        let selected = self.study_chat.provider == candidate;
-                        if ui
-                            .selectable_label(selected, candidate.label())
-                            .clicked()
-                        {
-                            self.study_chat.provider = candidate;
-                        }
-                    }
-                });
-                ui.add_space(5.0);
+                    let provider = self.study_chat.provider;
 
-                let connected = self
-                    .study_chat
-                    .connected
-                    .get(&provider)
-                    .copied()
-                    .unwrap_or(false);
-                if connected {
-                    ui.horizontal(|ui| {
-                        let account = self
-                            .study_chat
-                            .accounts
-                            .get(&provider)
-                            .cloned()
-                            .unwrap_or_else(|| format!("{} connected", provider.label()));
-                        ui.label(RichText::new("●").size(10.0).color(Color32::from_rgb(94, 196, 126)));
-                        ui.label(RichText::new(account).size(11.5).color(theme::MUTED));
-                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                            if ui.small_button("Sign out").clicked() {
-                                let _ = self.chat_worker.commands.send(ChatCommand::SignOut(provider));
-                            }
-                        });
-                    });
-                    let models = self.study_chat.models.get(&provider).cloned().unwrap_or_default();
-                    let selected = self
-                        .study_chat
-                        .selected_models
-                        .entry(provider)
-                        .or_insert_with(|| models.first().cloned().unwrap_or_default());
-                    egui::ComboBox::from_id_salt(("study-model", provider))
-                        .width(ui.available_width())
-                        .selected_text(if selected.is_empty() {
-                            "Loading models…"
-                        } else {
-                            selected.as_str()
-                        })
-                        .show_ui(ui, |ui| {
-                            for model in &models {
-                                ui.selectable_value(selected, model.clone(), model);
-                            }
-                        });
-                } else {
-                    match provider {
-                        ChatProvider::ChatGpt => {
-                            if ui.add_sized([ui.available_width(), 30.0], egui::Button::new("Continue with ChatGPT")).clicked() {
-                                self.study_chat.status = "Opening secure ChatGPT sign-in…".to_owned();
-                                let _ = self.chat_worker.commands.send(ChatCommand::SignInChatGpt);
-                            }
-                            ui.label(RichText::new("Official browser sign-in. SnaPdf never sees your password.").size(10.5).color(theme::MUTED));
-                        }
-                        ChatProvider::Gemini => {
-                            if ui.add_sized([ui.available_width(), 30.0], egui::Button::new("Connect Gemini")).clicked() {
-                                self.study_chat.show_gemini_key = true;
-                            }
-                            ui.label(RichText::new("Uses your Google AI Studio API key. Google account OAuth requires a registered SnaPdf client.").size(10.5).color(theme::MUTED));
-                        }
-                    }
-                }
-                ui.separator();
-
-                let composer_height = 154.0 + if self.study_chat.attachments.is_empty() { 0.0 } else { 30.0 };
-                ScrollArea::vertical()
-                    .id_salt("study-chat-messages")
-                    .stick_to_bottom(true)
-                    .auto_shrink([false, false])
-                    .max_height((ui.available_height() - composer_height).max(100.0))
-                    .show(ui, |ui| {
-                        let messages = self
-                            .study_chat
-                            .active_session()
-                            .messages
-                            .get(&provider)
-                            .map(Vec::as_slice)
-                            .unwrap_or_default();
-                        if messages.is_empty() {
-                            ui.add_space(24.0);
-                            ui.vertical_centered(|ui| {
-                                ui.label(RichText::new("A quiet place for questions").size(15.0).strong());
-                                ui.add_space(4.0);
-                                ui.label(
-                                    RichText::new("Attach the current PDF, capture a figure, or send an OCR text snip.")
-                                        .size(12.0)
-                                        .color(theme::MUTED),
-                                );
-                            });
-                        }
-                        for (index, message) in messages.iter().enumerate() {
-                            let user = message.role == ChatRole::User;
-                            ui.with_layout(
-                                if user { Layout::right_to_left(Align::Min) } else { Layout::left_to_right(Align::Min) },
-                                |ui| {
-                                    Frame::new()
-                                        .fill(if user { Color32::from_rgb(53, 53, 53) } else { Color32::TRANSPARENT })
-                                        .stroke(if user { Stroke::NONE } else { Stroke::new(1.0, Color32::from_rgb(48, 48, 48)) })
-                                        .corner_radius(CornerRadius::same(9))
-                                        .inner_margin(Margin::symmetric(10, 8))
-                                        .show(ui, |ui| {
-                                            ui.set_max_width(300.0);
-                                            if !message.attachments.is_empty() {
-                                                ui.horizontal_wrapped(|ui| {
-                                                    for attachment in &message.attachments {
-                                                        ui.label(
-                                                            RichText::new(format!("{} · {}", attachment.kind_label(), attachment.name))
-                                                                .size(10.5)
-                                                                .color(theme::MUTED),
-                                                        );
-                                                    }
-                                                });
-                                            }
-                                            if message.text.is_empty()
-                                                && index + 1 == messages.len()
-                                                && self.study_chat.busy
-                                                && self.study_chat.active_provider == Some(provider)
-                                            {
-                                                ui.spinner();
-                                            } else {
-                                                ui.label(RichText::new(&message.text).size(13.0));
-                                            }
-                                        });
-                                },
-                            );
-                            ui.add_space(6.0);
-                        }
-                    });
-
-                ui.separator();
-                if !self.study_chat.attachments.is_empty() {
-                    let mut remove = None;
-                    ScrollArea::horizontal()
-                        .id_salt("study-chat-attachments")
-                        .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden)
+                    Frame::new()
+                        .fill(Color32::from_rgb(24, 24, 24))
+                        .inner_margin(Margin::symmetric(14, 10))
                         .show(ui, |ui| {
                             ui.horizontal(|ui| {
-                                for (index, attachment) in self.study_chat.attachments.iter().enumerate() {
-                                    Frame::new()
-                                        .fill(Color32::from_rgb(42, 42, 42))
-                                        .corner_radius(CornerRadius::same(6))
-                                        .inner_margin(Margin::symmetric(7, 4))
-                                        .show(ui, |ui| {
-                                            ui.horizontal(|ui| {
-                                                ui.label(RichText::new(format!("{} · {}", attachment.kind_label(), elide(&attachment.name, 18))).size(10.5));
-                                                if ui.add(egui::Button::new("×").frame(false)).clicked() {
-                                                    remove = Some(index);
-                                                }
-                                            });
+                                ui.label(
+                                    RichText::new("Study chat")
+                                        .size(16.0)
+                                        .strong()
+                                        .color(Color32::from_rgb(242, 242, 242)),
+                                );
+                                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                    if chat_icon_button(ui, ToolbarIcon::Close, true, "Close study chat").clicked() {
+                                        self.study_chat.visible = false;
+                                        self.persist();
+                                    }
+                                    if chat_icon_button(
+                                        ui,
+                                        ToolbarIcon::DeleteChat,
+                                        !self.study_chat.busy,
+                                        "Delete this chat",
+                                    )
+                                    .clicked()
+                                    {
+                                        self.delete_active_study_chat();
+                                    }
+                                    if chat_icon_button(
+                                        ui,
+                                        ToolbarIcon::NewChat,
+                                        !self.study_chat.busy,
+                                        "New study chat",
+                                    )
+                                    .clicked()
+                                    {
+                                        self.request_new_study_chat();
+                                    }
+                                });
+                            });
+                            ui.add_space(4.0);
+                            let active_title = self.study_chat.active_session().title.clone();
+                            let mut switch_to = None;
+                            egui::ComboBox::from_id_salt("study-chat-history")
+                                .width(ui.available_width().max(1.0))
+                                .selected_text(elide(&active_title, 42))
+                                .show_ui(ui, |ui| {
+                                    for chat in &self.study_chat.sessions {
+                                        if ui
+                                            .selectable_label(
+                                                chat.id == self.study_chat.active_session_id,
+                                                elide(&chat.title, 48),
+                                            )
+                                            .clicked()
+                                        {
+                                            switch_to = Some(chat.id);
+                                        }
+                                    }
+                                });
+                            if let Some(id) = switch_to {
+                                self.activate_study_chat(id);
+                            }
+                        });
+
+                    let connected = self
+                        .study_chat
+                        .connected
+                        .get(&provider)
+                        .copied()
+                        .unwrap_or(false);
+                    let footer_height = if connected { 188.0 } else { 208.0 }
+                        + if self.study_chat.attachments.is_empty() { 0.0 } else { 32.0 };
+                    let messages = self
+                        .study_chat
+                        .active_session()
+                        .messages
+                        .get(&provider)
+                        .cloned()
+                        .unwrap_or_default();
+                    let latest_prompt = messages.iter().rposition(|message| message.role == ChatRole::User);
+                    let status = self.study_chat.status.clone();
+                    let busy = self.study_chat.busy;
+                    let active_provider = self.study_chat.active_provider;
+                    let mut copied_notice = None;
+
+                    ScrollArea::vertical()
+                        .id_salt("study-chat-messages")
+                        .stick_to_bottom(true)
+                        .auto_shrink([false, false])
+                        .max_height((ui.available_height() - footer_height).max(80.0))
+                        .show(ui, |ui| {
+                            ui.set_min_width(ui.available_width());
+                            ui.add_space(16.0);
+                            if messages.is_empty() {
+                                chat_empty_state(ui);
+                                if !status.is_empty() {
+                                    ui.add_space(12.0);
+                                    chat_status(ui, &status, busy);
+                                }
+                            }
+                            for (index, message) in messages.iter().enumerate() {
+                                let streaming = message.role == ChatRole::Assistant
+                                    && message.text.is_empty()
+                                    && index + 1 == messages.len()
+                                    && busy
+                                    && active_provider == Some(provider);
+                                if chat_message(ui, message, streaming) {
+                                    copied_notice = Some(if message.role == ChatRole::User {
+                                        "Prompt copied."
+                                    } else {
+                                        "Reply copied."
+                                    });
+                                }
+                                if latest_prompt == Some(index) && !status.is_empty() {
+                                    ui.add_space(3.0);
+                                    chat_status(ui, &status, busy);
+                                }
+                                ui.add_space(14.0);
+                            }
+                            ui.add_space(6.0);
+                        });
+                    if let Some(notice) = copied_notice {
+                        self.study_chat.status = notice.to_owned();
+                    }
+
+                    Frame::new()
+                        .fill(Color32::from_rgb(24, 24, 24))
+                        .stroke(Stroke::new(1.0, Color32::from_rgb(54, 54, 54)))
+                        .inner_margin(Margin::symmetric(12, 10))
+                        .show(ui, |ui| {
+                            let mut remove = None;
+                            if !self.study_chat.attachments.is_empty() {
+                                ScrollArea::horizontal()
+                                    .id_salt("study-chat-attachments")
+                                    .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden)
+                                    .show(ui, |ui| {
+                                        ui.horizontal(|ui| {
+                                            for (index, attachment) in self.study_chat.attachments.iter().enumerate() {
+                                                Frame::new()
+                                                    .fill(Color32::from_rgb(48, 48, 48))
+                                                    .stroke(Stroke::new(1.0, Color32::from_rgb(66, 66, 66)))
+                                                    .corner_radius(CornerRadius::same(9))
+                                                    .inner_margin(Margin::symmetric(8, 5))
+                                                    .show(ui, |ui| {
+                                                        ui.horizontal(|ui| {
+                                                            ui.label(
+                                                                RichText::new(format!(
+                                                                    "{}  {}",
+                                                                    attachment.kind_label(),
+                                                                    elide(&attachment.name, 20)
+                                                                ))
+                                                                .size(10.5)
+                                                                .color(Color32::from_rgb(218, 218, 218)),
+                                                            );
+                                                            if ui.add(egui::Button::new("×").frame(false)).clicked() {
+                                                                remove = Some(index);
+                                                            }
+                                                        });
+                                                    });
+                                            }
                                         });
+                                    });
+                                ui.add_space(6.0);
+                            }
+                            if let Some(index) = remove {
+                                self.study_chat.attachments.remove(index);
+                            }
+
+                            let mut send_with_enter = false;
+                            Frame::new()
+                                .fill(Color32::from_rgb(47, 47, 47))
+                                .stroke(Stroke::new(1.0, Color32::from_rgb(70, 70, 70)))
+                                .corner_radius(CornerRadius::same(18))
+                                .inner_margin(Margin::symmetric(11, 8))
+                                .show(ui, |ui| {
+                                    let input_width = ui.available_width().max(1.0);
+                                    let prompt_response = ui.add_sized(
+                                        [input_width, 68.0],
+                                        egui::TextEdit::multiline(&mut self.study_chat.prompt)
+                                            .hint_text("Message your study assistant…")
+                                            .desired_width(input_width)
+                                            .desired_rows(3)
+                                            .frame(Frame::NONE)
+                                            .margin(Margin::ZERO),
+                                    );
+                                    send_with_enter = prompt_response.has_focus()
+                                        && ui.input(|input| {
+                                            input.key_pressed(Key::Enter) && !input.modifiers.shift
+                                        });
+                                    ui.horizontal(|ui| {
+                                        let attach = chat_icon_button(
+                                            ui,
+                                            ToolbarIcon::Attach,
+                                            true,
+                                            "Attach a file or the current PDF",
+                                        );
+                                        egui::Popup::menu(&attach).show(|ui| {
+                                            if ui.button("Choose PDF, image, or text…").clicked() {
+                                                ui.close();
+                                                self.choose_chat_attachment();
+                                            }
+                                            if ui
+                                                .add_enabled(
+                                                    self.current_path.is_some(),
+                                                    egui::Button::new("Attach current PDF"),
+                                                )
+                                                .clicked()
+                                                && let Some(path) = self.current_path.clone()
+                                            {
+                                                ui.close();
+                                                self.add_chat_attachment(path);
+                                            }
+                                        });
+                                        if chat_icon_button(
+                                            ui,
+                                            ToolbarIcon::Capture,
+                                            self.current_path.is_some(),
+                                            "Capture a PDF region for chat",
+                                        )
+                                        .clicked()
+                                            && self.current_path.is_some()
+                                        {
+                                            self.tool_mode = ToolMode::ChatCapture;
+                                            self.study_chat.status =
+                                                "Drag over a figure or equation in the PDF.".to_owned();
+                                        }
+                                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                            if chat_send_button(ui, !self.study_chat.busy).clicked()
+                                                && !self.study_chat.busy
+                                            {
+                                                self.send_chat_message();
+                                            }
+                                        });
+                                    });
+                                });
+
+                            if send_with_enter {
+                                while self.study_chat.prompt.ends_with('\n') {
+                                    self.study_chat.prompt.pop();
+                                }
+                                self.send_chat_message();
+                            }
+
+                            ui.add_space(8.0);
+                            ui.horizontal(|ui| {
+                                ui.label(
+                                    RichText::new("Provider")
+                                        .size(10.5)
+                                        .color(Color32::from_rgb(145, 145, 145)),
+                                );
+                                for candidate in [ChatProvider::ChatGpt, ChatProvider::Gemini] {
+                                    if chat_provider_pill(
+                                        ui,
+                                        candidate.label(),
+                                        self.study_chat.provider == candidate,
+                                    )
+                                    .clicked()
+                                    {
+                                        self.study_chat.provider = candidate;
+                                    }
                                 }
                             });
+                            ui.add_space(4.0);
+
+                            if connected {
+                                ui.horizontal(|ui| {
+                                    let account = self
+                                        .study_chat
+                                        .accounts
+                                        .get(&provider)
+                                        .cloned()
+                                        .unwrap_or_else(|| format!("{} connected", provider.label()));
+                                    ui.label(
+                                        RichText::new("●")
+                                            .size(9.0)
+                                            .color(Color32::from_rgb(44, 193, 142)),
+                                    );
+                                    ui.add(
+                                        egui::Label::new(
+                                            RichText::new(account)
+                                                .size(10.5)
+                                                .color(Color32::from_rgb(174, 174, 174)),
+                                        )
+                                        .truncate(),
+                                    );
+                                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                        if ui.small_button("Sign out").clicked() {
+                                            let _ = self
+                                                .chat_worker
+                                                .commands
+                                                .send(ChatCommand::SignOut(provider));
+                                        }
+                                    });
+                                });
+                                let models = self
+                                    .study_chat
+                                    .models
+                                    .get(&provider)
+                                    .cloned()
+                                    .unwrap_or_default();
+                                let selected = self
+                                    .study_chat
+                                    .selected_models
+                                    .entry(provider)
+                                    .or_insert_with(|| models.first().cloned().unwrap_or_default());
+                                egui::ComboBox::from_id_salt(("study-model", provider))
+                                    .width(ui.available_width().max(1.0))
+                                    .selected_text(if selected.is_empty() {
+                                        "Loading models…"
+                                    } else {
+                                        selected.as_str()
+                                    })
+                                    .show_ui(ui, |ui| {
+                                        for model in &models {
+                                            ui.selectable_value(selected, model.clone(), model);
+                                        }
+                                    });
+                            } else {
+                                match provider {
+                                    ChatProvider::ChatGpt => {
+                                        if ui
+                                            .add_sized(
+                                                [ui.available_width().max(1.0), 30.0],
+                                                egui::Button::new("Continue with ChatGPT"),
+                                            )
+                                            .clicked()
+                                        {
+                                            self.study_chat.status =
+                                                "Opening secure ChatGPT sign-in…".to_owned();
+                                            let _ = self
+                                                .chat_worker
+                                                .commands
+                                                .send(ChatCommand::SignInChatGpt);
+                                        }
+                                        ui.add(
+                                            egui::Label::new(
+                                                RichText::new(
+                                                    "Official browser sign-in. SnaPdf never sees your password.",
+                                                )
+                                                .size(10.0)
+                                                .color(Color32::from_rgb(145, 145, 145)),
+                                            )
+                                            .wrap(),
+                                        );
+                                    }
+                                    ChatProvider::Gemini => {
+                                        if ui
+                                            .add_sized(
+                                                [ui.available_width().max(1.0), 30.0],
+                                                egui::Button::new("Connect Gemini"),
+                                            )
+                                            .clicked()
+                                        {
+                                            self.study_chat.show_gemini_key = true;
+                                        }
+                                        ui.add(
+                                            egui::Label::new(
+                                                RichText::new("Connect with a Google AI Studio API key.")
+                                                    .size(10.0)
+                                                    .color(Color32::from_rgb(145, 145, 145)),
+                                            )
+                                            .wrap(),
+                                        );
+                                    }
+                                }
+                            }
                         });
-                    if let Some(index) = remove {
-                        self.study_chat.attachments.remove(index);
-                    }
-                }
-                let prompt_response = ui.add_sized(
-                    [ui.available_width(), 66.0],
-                    egui::TextEdit::multiline(&mut self.study_chat.prompt)
-                        .hint_text("Ask about this document…")
-                        .desired_rows(3),
-                );
-                let send_with_enter = prompt_response.has_focus()
-                    && ui.input(|input| input.key_pressed(Key::Enter) && !input.modifiers.shift);
-                ui.horizontal(|ui| {
-                    let attach = chat_icon_button(ui, ToolbarIcon::Attach, true, "Attach a file or the current PDF");
-                    egui::Popup::menu(&attach).show(|ui| {
-                        if ui.button("Choose PDF, image, or text…").clicked() {
-                            ui.close();
-                            self.choose_chat_attachment();
-                        }
-                        if ui
-                            .add_enabled(self.current_path.is_some(), egui::Button::new("Attach current PDF"))
-                            .clicked()
-                            && let Some(path) = self.current_path.clone()
-                        {
-                            ui.close();
-                            self.add_chat_attachment(path);
-                        }
-                    });
-                    if chat_icon_button(
-                        ui,
-                        ToolbarIcon::Capture,
-                        self.current_path.is_some(),
-                        "Capture a region of the PDF for chat",
-                    )
-                    .clicked()
-                        && self.current_path.is_some()
-                    {
-                        self.tool_mode = ToolMode::ChatCapture;
-                        self.study_chat.status = "Drag over a figure or equation in the PDF.".to_owned();
-                    }
-                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        if chat_icon_button(ui, ToolbarIcon::Send, !self.study_chat.busy, "Send message (Enter)").clicked()
-                            && !self.study_chat.busy
-                        {
-                            self.send_chat_message();
-                        }
-                    });
-                });
-                if !self.study_chat.status.is_empty() {
-                    ui.label(RichText::new(&self.study_chat.status).size(10.0).color(theme::MUTED));
-                }
-                if send_with_enter {
-                    // TextEdit inserts the newline before this frame. Remove it so Enter behaves like chat.
-                    while self.study_chat.prompt.ends_with('\n') {
-                        self.study_chat.prompt.pop();
-                    }
-                    self.send_chat_message();
-                }
                 });
             });
     }
@@ -6826,6 +6927,7 @@ enum ToolbarIcon {
     Send,
     NewChat,
     DeleteChat,
+    Copy,
     Close,
 }
 
@@ -6960,6 +7062,590 @@ fn bounded_panel_content<R>(
     );
     content.set_clip_rect(rect);
     add_contents(&mut content)
+}
+
+const CHAT_ACCENT: Color32 = Color32::from_rgb(16, 163, 127);
+const CHAT_TEXT: Color32 = Color32::from_rgb(236, 236, 236);
+const CHAT_MUTED: Color32 = Color32::from_rgb(166, 166, 166);
+
+fn chat_empty_state(ui: &mut egui::Ui) {
+    ui.add_space(22.0);
+    ui.vertical_centered(|ui| {
+        let (rect, _) = ui.allocate_exact_size(vec2(42.0, 42.0), Sense::hover());
+        ui.painter().circle_filled(rect.center(), 20.0, CHAT_ACCENT);
+        ui.painter().text(
+            rect.center(),
+            Align2::CENTER_CENTER,
+            "S",
+            FontId::proportional(18.0),
+            Color32::WHITE,
+        );
+        ui.add_space(10.0);
+        ui.label(
+            RichText::new("What are you studying?")
+                .size(17.0)
+                .strong()
+                .color(CHAT_TEXT),
+        );
+        ui.add_space(4.0);
+        ui.add(
+            egui::Label::new(
+                RichText::new(
+                    "Ask a question, attach a PDF, or capture a figure without leaving the page.",
+                )
+                .size(12.5)
+                .color(CHAT_MUTED),
+            )
+            .wrap()
+            .halign(Align::Center),
+        );
+    });
+}
+
+fn chat_status(ui: &mut egui::Ui, status: &str, busy: bool) {
+    ui.horizontal(|ui| {
+        ui.add_space(34.0);
+        if busy {
+            ui.add(egui::Spinner::new().size(11.0).color(CHAT_ACCENT));
+        } else {
+            let (rect, _) = ui.allocate_exact_size(vec2(11.0, 11.0), Sense::hover());
+            ui.painter().circle_filled(rect.center(), 3.0, CHAT_ACCENT);
+        }
+        ui.add(egui::Label::new(RichText::new(status).size(10.5).color(CHAT_MUTED)).wrap());
+    });
+}
+
+fn chat_message(ui: &mut egui::Ui, message: &ChatMessage, streaming: bool) -> bool {
+    let mut copied = false;
+    let available = ui.available_width().max(1.0);
+    match message.role {
+        ChatRole::User => {
+            let bubble_width = chat_user_bubble_width(available);
+            ui.with_layout(Layout::right_to_left(Align::Min), |ui| {
+                Frame::new()
+                    .fill(Color32::from_rgb(47, 47, 47))
+                    .stroke(Stroke::new(1.0, Color32::from_rgb(63, 63, 63)))
+                    .corner_radius(CornerRadius::same(16))
+                    .inner_margin(Margin::symmetric(12, 9))
+                    .show(ui, |ui| {
+                        ui.set_width(bubble_width);
+                        chat_message_attachments(ui, message);
+                        render_chat_markdown(ui, &message.text);
+                        ui.add_space(4.0);
+                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                            if chat_copy_button(ui, "Copy prompt").clicked() {
+                                ui.ctx().copy_text(message.text.clone());
+                                copied = true;
+                            }
+                        });
+                    });
+            });
+        }
+        ChatRole::Assistant => {
+            ui.horizontal(|ui| {
+                let (avatar, _) = ui.allocate_exact_size(vec2(26.0, 26.0), Sense::hover());
+                ui.painter()
+                    .circle_filled(avatar.center(), 13.0, CHAT_ACCENT);
+                ui.painter().text(
+                    avatar.center(),
+                    Align2::CENTER_CENTER,
+                    "S",
+                    FontId::proportional(11.5),
+                    Color32::WHITE,
+                );
+                ui.vertical(|ui| {
+                    ui.set_width(ui.available_width().max(1.0));
+                    if streaming {
+                        ui.horizontal(|ui| {
+                            ui.add(egui::Spinner::new().size(13.0).color(CHAT_ACCENT));
+                            ui.label(RichText::new("Generating…").size(12.0).color(CHAT_MUTED));
+                        });
+                    } else {
+                        chat_message_attachments(ui, message);
+                        render_chat_markdown(ui, &message.text);
+                        ui.add_space(4.0);
+                        if chat_copy_button(ui, "Copy reply").clicked() {
+                            ui.ctx().copy_text(message.text.clone());
+                            copied = true;
+                        }
+                    }
+                });
+            });
+        }
+    }
+    copied
+}
+
+fn chat_user_bubble_width(available: f32) -> f32 {
+    (available.max(1.0) * 0.86)
+        .clamp(1.0, 680.0)
+        .min(available.max(1.0))
+}
+
+fn chat_message_attachments(ui: &mut egui::Ui, message: &ChatMessage) {
+    if message.attachments.is_empty() {
+        return;
+    }
+    ui.horizontal_wrapped(|ui| {
+        for attachment in &message.attachments {
+            Frame::new()
+                .fill(Color32::from_rgb(57, 57, 57))
+                .corner_radius(CornerRadius::same(7))
+                .inner_margin(Margin::symmetric(7, 4))
+                .show(ui, |ui| {
+                    ui.label(
+                        RichText::new(format!(
+                            "{}  {}",
+                            attachment.kind_label(),
+                            elide(&attachment.name, 26)
+                        ))
+                        .size(10.0)
+                        .color(Color32::from_rgb(207, 207, 207)),
+                    );
+                });
+        }
+    });
+    ui.add_space(5.0);
+}
+
+fn chat_copy_button(ui: &mut egui::Ui, help: &str) -> Response {
+    let (rect, response) = ui.allocate_exact_size(vec2(56.0, 23.0), Sense::click());
+    if response.hovered() {
+        ui.painter()
+            .rect_filled(rect, CornerRadius::same(6), Color32::from_rgb(58, 58, 58));
+    }
+    paint_toolbar_icon(
+        ui.painter(),
+        pos2(rect.left() + 11.0, rect.center().y),
+        ToolbarIcon::Copy,
+        CHAT_MUTED,
+    );
+    ui.painter().text(
+        pos2(rect.left() + 22.0, rect.center().y),
+        Align2::LEFT_CENTER,
+        "Copy",
+        FontId::proportional(10.5),
+        CHAT_MUTED,
+    );
+    response.on_hover_text(help)
+}
+
+fn chat_send_button(ui: &mut egui::Ui, enabled: bool) -> Response {
+    let sense = if enabled {
+        Sense::click()
+    } else {
+        Sense::hover()
+    };
+    let (rect, response) = ui.allocate_exact_size(vec2(31.0, 31.0), sense);
+    let fill = if enabled {
+        if response.hovered() {
+            Color32::from_rgb(25, 181, 139)
+        } else {
+            CHAT_ACCENT
+        }
+    } else {
+        Color32::from_rgb(73, 73, 73)
+    };
+    ui.painter().circle_filled(rect.center(), 14.0, fill);
+    paint_toolbar_icon(
+        ui.painter(),
+        rect.center(),
+        ToolbarIcon::Send,
+        if enabled { Color32::WHITE } else { CHAT_MUTED },
+    );
+    response.on_hover_text("Send message (Enter)")
+}
+
+fn chat_provider_pill(ui: &mut egui::Ui, label: &str, selected: bool) -> Response {
+    let text =
+        RichText::new(label)
+            .size(10.5)
+            .color(if selected { Color32::WHITE } else { CHAT_MUTED });
+    ui.add(
+        egui::Button::new(text)
+            .fill(if selected {
+                CHAT_ACCENT
+            } else {
+                Color32::from_rgb(42, 42, 42)
+            })
+            .stroke(Stroke::new(
+                1.0,
+                if selected {
+                    CHAT_ACCENT
+                } else {
+                    Color32::from_rgb(62, 62, 62)
+                },
+            ))
+            .corner_radius(CornerRadius::same(10)),
+    )
+}
+
+fn render_chat_markdown(ui: &mut egui::Ui, markdown: &str) {
+    if markdown.is_empty() {
+        return;
+    }
+    let lines = markdown.lines().collect::<Vec<_>>();
+    let mut index = 0;
+    while index < lines.len() {
+        let line = lines[index];
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            ui.add_space(5.0);
+            index += 1;
+            continue;
+        }
+        if trimmed.starts_with("```") {
+            index += 1;
+            let mut code = String::new();
+            while index < lines.len() && !lines[index].trim().starts_with("```") {
+                if !code.is_empty() {
+                    code.push('\n');
+                }
+                code.push_str(lines[index]);
+                index += 1;
+            }
+            if index < lines.len() {
+                index += 1;
+            }
+            Frame::new()
+                .fill(Color32::from_rgb(24, 24, 24))
+                .stroke(Stroke::new(1.0, Color32::from_rgb(60, 60, 60)))
+                .corner_radius(CornerRadius::same(8))
+                .inner_margin(Margin::same(9))
+                .show(ui, |ui| {
+                    ui.set_width(ui.available_width().max(1.0));
+                    ui.add(
+                        egui::Label::new(
+                            RichText::new(code)
+                                .monospace()
+                                .size(11.5)
+                                .color(Color32::from_rgb(220, 220, 220)),
+                        )
+                        .wrap()
+                        .selectable(true),
+                    );
+                });
+            ui.add_space(5.0);
+            continue;
+        }
+        if matches!(trimmed, "---" | "***" | "___") {
+            ui.separator();
+            index += 1;
+            continue;
+        }
+        if let Some((level, heading)) = markdown_heading(trimmed) {
+            markdown_label(
+                ui,
+                heading,
+                match level {
+                    1 => 19.0,
+                    2 => 17.0,
+                    _ => 15.0,
+                },
+                Color32::from_rgb(248, 248, 248),
+                true,
+            );
+            ui.add_space(3.0);
+            index += 1;
+            continue;
+        }
+        if trimmed.starts_with('>') {
+            let mut quote = Vec::new();
+            while index < lines.len() && lines[index].trim_start().starts_with('>') {
+                quote.push(
+                    lines[index]
+                        .trim_start()
+                        .trim_start_matches('>')
+                        .trim_start(),
+                );
+                index += 1;
+            }
+            Frame::new()
+                .fill(Color32::from_rgb(39, 47, 45))
+                .stroke(Stroke::new(1.0, Color32::from_rgb(49, 102, 88)))
+                .corner_radius(CornerRadius::same(6))
+                .inner_margin(Margin::symmetric(10, 7))
+                .show(ui, |ui| {
+                    ui.set_width(ui.available_width().max(1.0));
+                    markdown_label(
+                        ui,
+                        &quote.join(" "),
+                        12.5,
+                        Color32::from_rgb(216, 229, 225),
+                        false,
+                    );
+                });
+            ui.add_space(4.0);
+            continue;
+        }
+        if let Some(item) = markdown_bullet(trimmed) {
+            ui.horizontal(|ui| {
+                ui.label(RichText::new("•").size(15.0).color(CHAT_ACCENT));
+                ui.vertical(|ui| {
+                    ui.set_width(ui.available_width().max(1.0));
+                    markdown_label(ui, item, 13.0, CHAT_TEXT, false);
+                });
+            });
+            index += 1;
+            continue;
+        }
+        if let Some((number, item)) = markdown_ordered_item(trimmed) {
+            ui.horizontal(|ui| {
+                ui.label(
+                    RichText::new(format!("{number}."))
+                        .size(12.5)
+                        .color(CHAT_ACCENT),
+                );
+                ui.vertical(|ui| {
+                    ui.set_width(ui.available_width().max(1.0));
+                    markdown_label(ui, item, 13.0, CHAT_TEXT, false);
+                });
+            });
+            index += 1;
+            continue;
+        }
+
+        let mut paragraph = vec![trimmed];
+        index += 1;
+        while index < lines.len()
+            && !lines[index].trim().is_empty()
+            && !markdown_block_start(lines[index].trim())
+        {
+            paragraph.push(lines[index].trim());
+            index += 1;
+        }
+        markdown_label(ui, &paragraph.join(" "), 13.0, CHAT_TEXT, false);
+    }
+}
+
+fn markdown_heading(line: &str) -> Option<(usize, &str)> {
+    let hashes = line
+        .chars()
+        .take_while(|character| *character == '#')
+        .count();
+    if (1..=6).contains(&hashes) && line.as_bytes().get(hashes) == Some(&b' ') {
+        Some((hashes, line[hashes + 1..].trim()))
+    } else {
+        None
+    }
+}
+
+fn markdown_bullet(line: &str) -> Option<&str> {
+    ["- ", "* ", "+ "]
+        .into_iter()
+        .find_map(|prefix| line.strip_prefix(prefix))
+}
+
+fn markdown_ordered_item(line: &str) -> Option<(&str, &str)> {
+    let (number, body) = line.split_once(". ")?;
+    (!number.is_empty() && number.chars().all(|character| character.is_ascii_digit()))
+        .then_some((number, body))
+}
+
+fn markdown_block_start(line: &str) -> bool {
+    line.starts_with("```")
+        || matches!(line, "---" | "***" | "___")
+        || markdown_heading(line).is_some()
+        || line.starts_with('>')
+        || markdown_bullet(line).is_some()
+        || markdown_ordered_item(line).is_some()
+}
+
+fn markdown_label(ui: &mut egui::Ui, text: &str, size: f32, color: Color32, strong: bool) {
+    let mut job = markdown_inline_job(ui, text, size, color, strong);
+    job.wrap.max_width = ui.available_width().max(1.0);
+    ui.add(egui::Label::new(job).wrap().selectable(true));
+}
+
+fn markdown_inline_job(
+    ui: &egui::Ui,
+    text: &str,
+    size: f32,
+    color: Color32,
+    base_strong: bool,
+) -> egui::text::LayoutJob {
+    let mut job = egui::text::LayoutJob::default();
+    let mut rest = text;
+    while !rest.is_empty() {
+        if let Some(body) = rest.strip_prefix("**")
+            && let Some(end) = body.find("**")
+        {
+            append_markdown_span(
+                ui,
+                &mut job,
+                &body[..end],
+                size,
+                color,
+                true,
+                false,
+                false,
+                false,
+            );
+            rest = &body[end + 2..];
+            continue;
+        }
+        if let Some(body) = rest.strip_prefix("__")
+            && let Some(end) = body.find("__")
+        {
+            append_markdown_span(
+                ui,
+                &mut job,
+                &body[..end],
+                size,
+                color,
+                true,
+                false,
+                false,
+                false,
+            );
+            rest = &body[end + 2..];
+            continue;
+        }
+        if let Some(body) = rest.strip_prefix('`')
+            && let Some(end) = body.find('`')
+        {
+            append_markdown_span(
+                ui,
+                &mut job,
+                &body[..end],
+                size - 0.5,
+                color,
+                false,
+                false,
+                true,
+                false,
+            );
+            rest = &body[end + 1..];
+            continue;
+        }
+        if let Some(body) = rest.strip_prefix("~~")
+            && let Some(end) = body.find("~~")
+        {
+            append_markdown_span(
+                ui,
+                &mut job,
+                &body[..end],
+                size,
+                color,
+                false,
+                false,
+                false,
+                true,
+            );
+            rest = &body[end + 2..];
+            continue;
+        }
+        if let Some(body) = rest.strip_prefix('*')
+            && let Some(end) = body.find('*')
+        {
+            append_markdown_span(
+                ui,
+                &mut job,
+                &body[..end],
+                size,
+                color,
+                false,
+                true,
+                false,
+                false,
+            );
+            rest = &body[end + 1..];
+            continue;
+        }
+        if let Some(body) = rest.strip_prefix('_')
+            && let Some(end) = body.find('_')
+        {
+            append_markdown_span(
+                ui,
+                &mut job,
+                &body[..end],
+                size,
+                color,
+                false,
+                true,
+                false,
+                false,
+            );
+            rest = &body[end + 1..];
+            continue;
+        }
+        if let Some(body) = rest.strip_prefix('[')
+            && let Some(label_end) = body.find("](")
+            && let Some(url_end) = body[label_end + 2..].find(')')
+        {
+            let label = &body[..label_end];
+            append_markdown_span(
+                ui,
+                &mut job,
+                label,
+                size,
+                CHAT_ACCENT,
+                true,
+                false,
+                false,
+                false,
+            );
+            rest = &body[label_end + 2 + url_end + 1..];
+            continue;
+        }
+
+        let marker = rest
+            .char_indices()
+            .find(|(_, character)| matches!(character, '*' | '_' | '`' | '~' | '['))
+            .map(|(index, _)| index)
+            .unwrap_or(rest.len());
+        let end = if marker == 0 {
+            rest.chars()
+                .next()
+                .map(char::len_utf8)
+                .unwrap_or(rest.len())
+        } else {
+            marker
+        };
+        append_markdown_span(
+            ui,
+            &mut job,
+            &rest[..end],
+            size,
+            color,
+            base_strong,
+            false,
+            false,
+            false,
+        );
+        rest = &rest[end..];
+    }
+    job
+}
+
+#[allow(clippy::too_many_arguments)]
+fn append_markdown_span(
+    ui: &egui::Ui,
+    job: &mut egui::text::LayoutJob,
+    text: &str,
+    size: f32,
+    color: Color32,
+    strong: bool,
+    italics: bool,
+    code: bool,
+    strikethrough: bool,
+) {
+    let mut rich = RichText::new(text).size(size).color(color);
+    if strong {
+        rich = rich.strong();
+    }
+    if italics {
+        rich = rich.italics();
+    }
+    if code {
+        rich = rich
+            .monospace()
+            .background_color(Color32::from_rgb(55, 55, 55));
+    }
+    if strikethrough {
+        rich = rich.strikethrough();
+    }
+    rich.append_to(job, ui.style(), egui::FontSelection::Default, Align::Center);
 }
 
 fn paint_toolbar_icon(
@@ -7313,6 +7999,22 @@ fn paint_toolbar_icon(
             painter.line_segment(
                 [center + vec2(2.0, -1.0), center + vec2(2.0, 5.0)],
                 Stroke::new(1.0, color),
+            );
+        }
+        ToolbarIcon::Copy => {
+            painter.rect_stroke(
+                Rect::from_center_size(center + vec2(2.0, 1.5), vec2(9.0, 10.0)),
+                1.5,
+                Stroke::new(1.2, color),
+                StrokeKind::Inside,
+            );
+            painter.line_segment(
+                [center + vec2(-4.5, -5.5), center + vec2(2.5, -5.5)],
+                Stroke::new(1.2, color),
+            );
+            painter.line_segment(
+                [center + vec2(-4.5, -5.5), center + vec2(-4.5, 3.5)],
+                Stroke::new(1.2, color),
             );
         }
         ToolbarIcon::Close => {
@@ -8170,6 +8872,52 @@ mod tests {
                 "panel expanded to {} despite its 42px requested width",
                 response.response.rect.width()
             );
+        });
+    }
+
+    #[test]
+    fn chat_messages_stay_inside_a_narrow_panel() {
+        egui::__run_test_ui(|ui| {
+            ui.set_width(180.0);
+            let message = ChatMessage {
+                role: ChatRole::Assistant,
+                text: "A deliberately long response that must wrap instead of disappearing beyond either edge of the study-chat panel.".to_owned(),
+                attachments: Vec::new(),
+            };
+            let response = ui.scope(|ui| {
+                ui.set_width(180.0);
+                chat_message(ui, &message, false);
+            });
+            assert!(
+                response.response.rect.width() <= 180.0,
+                "chat message expanded to {} points",
+                response.response.rect.width()
+            );
+        });
+    }
+
+    #[test]
+    fn user_chat_bubbles_are_responsive_and_bounded() {
+        for available in [1.0, 80.0, 430.0, 1_200.0] {
+            let width = chat_user_bubble_width(available);
+            assert!(width >= 1.0);
+            assert!(width <= available.max(1.0));
+            assert!(width <= 680.0);
+        }
+    }
+
+    #[test]
+    fn chat_markdown_removes_control_markers_but_keeps_content() {
+        egui::__run_test_ui(|ui| {
+            let job = markdown_inline_job(
+                ui,
+                "**Bold** and *italic* with `code` and [a link](https://example.com)",
+                13.0,
+                CHAT_TEXT,
+                false,
+            );
+            assert_eq!(job.text, "Bold and italic with code and a link");
+            assert!(job.sections.len() >= 4);
         });
     }
 
