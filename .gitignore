@@ -22,8 +22,6 @@ __pycache__/
 /dist/
 *.AppImage
 *.deb
-client_secret*.json
-google-oauth*.json
 
 # Editor and local runtime state
 /.idea/

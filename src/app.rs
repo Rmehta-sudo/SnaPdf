@@ -1,6 +1,6 @@
 use crate::chat::{
     ChatAttachment, ChatCommand, ChatEvent, ChatMessage, ChatProvider, ChatRole, ChatWorker,
-    gemini_oauth_available, mime_for_path,
+    mime_for_path,
 };
 use crate::model::{
     Annotation, AnnotationKind, AppState, RecentDocument, SidebarFileIcons, StudyChatSession,
@@ -4091,48 +4091,23 @@ impl SnaPdfApp {
                                         );
                                     }
                                     ChatProvider::Gemini => {
-                                        let google_sign_in = ui
-                                            .add_enabled_ui(gemini_oauth_available(), |ui| {
-                                                ui.add_sized(
-                                                    [ui.available_width().max(1.0), 30.0],
-                                                    egui::Button::new("Continue with Google"),
-                                                )
-                                            })
-                                            .inner
-                                            .on_disabled_hover_text(
-                                                "This developer build has no registered Google OAuth client",
-                                            );
-                                        if google_sign_in.clicked() {
-                                            self.study_chat.status =
-                                                "Opening secure Google sign-in…".to_owned();
-                                            let _ = self
-                                                .chat_worker
-                                                .commands
-                                                .send(ChatCommand::SignInGemini);
+                                        if ui
+                                            .add_sized(
+                                                [ui.available_width().max(1.0), 30.0],
+                                                egui::Button::new("Connect Gemini"),
+                                            )
+                                            .clicked()
+                                        {
+                                            self.study_chat.show_gemini_key = true;
                                         }
-                                        ui.horizontal(|ui| {
-                                            ui.add(
-                                                egui::Label::new(
-                                                    RichText::new(if gemini_oauth_available() {
-                                                        "Secure browser sign-in."
-                                                    } else {
-                                                        "Google sign-in is unavailable in this developer build."
-                                                    })
+                                        ui.add(
+                                            egui::Label::new(
+                                                RichText::new("Connect with a Google AI Studio API key.")
                                                     .size(10.0)
                                                     .color(Color32::from_rgb(145, 145, 145)),
-                                                )
-                                                .wrap(),
-                                            );
-                                            ui.with_layout(
-                                                Layout::right_to_left(Align::Center),
-                                                |ui| {
-                                                    if ui.small_button("Use API key instead").clicked()
-                                                    {
-                                                        self.study_chat.show_gemini_key = true;
-                                                    }
-                                                },
-                                            );
-                                        });
+                                            )
+                                            .wrap(),
+                                        );
                                     }
                                 }
                             }
@@ -5646,7 +5621,7 @@ impl SnaPdfApp {
         }
         let mut open = true;
         let mut connect = false;
-        egui::Window::new("Connect Gemini with an API key")
+        egui::Window::new("Connect Gemini")
             .open(&mut open)
             .collapsible(false)
             .resizable(false)
@@ -5692,7 +5667,7 @@ impl SnaPdfApp {
             let _ = self
                 .chat_worker
                 .commands
-                .send(ChatCommand::ConnectGeminiApiKey { api_key: key });
+                .send(ChatCommand::ConnectGemini { api_key: key });
             self.study_chat.show_gemini_key = false;
         } else if !open {
             self.study_chat.show_gemini_key = false;

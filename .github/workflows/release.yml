@@ -31,10 +31,6 @@ jobs:
         uses: Swatinem/rust-cache@v2
 
       - name: Build AppImage
-        env:
-          SNAPDF_GOOGLE_CLIENT_ID: ${{ secrets.SNAPDF_GOOGLE_CLIENT_ID }}
-          SNAPDF_GOOGLE_CLIENT_SECRET: ${{ secrets.SNAPDF_GOOGLE_CLIENT_SECRET }}
-          SNAPDF_GOOGLE_PROJECT_ID: ${{ secrets.SNAPDF_GOOGLE_PROJECT_ID }}
         run: ./scripts/build-appimage.sh
 
       - name: Create checksum
