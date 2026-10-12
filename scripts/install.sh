@@ -44,6 +44,7 @@ rm -f "${ICON_DIR}/io.crisppdf.CrispPDF.svg"
 rm -f "${APP_DIR}/io.snappdf.SnapPDF.desktop"
 rm -f "${ICON_DIR}/io.snappdf.SnapPDF.svg"
 install -m 0755 "${PROJECT_ROOT}/target/release/snapdf" "${BIN_DIR}/snapdf"
+install -m 0755 "${PROJECT_ROOT}/scripts/uninstall.sh" "${BIN_DIR}/snapdf-uninstall"
 install -m 0644 "${PROJECT_ROOT}/resources/io.snapdf.SnaPdf.svg" \
   "${ICON_DIR}/io.snapdf.SnaPdf.svg"
 sed "s|@EXEC@|${BIN_DIR}/snapdf|g" \
@@ -53,7 +54,6 @@ chmod 0644 "${APP_DIR}/io.snapdf.SnaPdf.desktop"
 
 command -v update-desktop-database >/dev/null && update-desktop-database "${APP_DIR}" || true
 command -v gtk-update-icon-cache >/dev/null && gtk-update-icon-cache -f -t "${HOME}/.local/share/icons/hicolor" >/dev/null 2>&1 || true
-xdg-mime default io.snapdf.SnaPdf.desktop application/pdf
 
 if [[ ! -e "${HOME}/.local/share/snapdf" && -d "${HOME}/.local/share/snappdf" ]]; then
   mv "${HOME}/.local/share/snappdf" "${HOME}/.local/share/snapdf"
@@ -75,5 +75,5 @@ else
     "${HOME}/.local/share/snapdf/ocr/ocr_worker.py"
 fi
 
-echo "SnaPdf installed and set as the default PDF viewer."
+echo "SnaPdf installed. Your existing default PDF viewer was not changed."
 echo "Launch it from the application menu or run: snapdf"

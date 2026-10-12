@@ -22,16 +22,19 @@ In short, SnaPdf is not just another PDF viewer. It is a fast, filesystem-first 
 
 ### Arch Linux (AUR)
 
-The validated AUR recipe is included in [`packaging/aur`](packaging/aur). Once the `snapdf` package
-is published on the AUR, install the lowercase package name with any AUR helper:
+> **AUR publication is still pending.** There is currently no official `snapdf` package to install
+> from the AUR, so `yay -S snapdf` is not an available installation method yet. Use the verified
+> AppImage installer below. This section will be changed when the official package is published.
+
+The repository already contains the validated recipe in [`packaging/aur`](packaging/aur). After its
+initial publication, the lowercase package name will be installed with:
 
 ```bash
 yay -S snapdf
 ```
 
-The package installs the visible **SnaPdf** application and the `snapdf` command. Package names in
-the AUR and pacman are lowercase even though the application name is styled **SnaPdf**. Until the
-initial AUR submission is visible, use the checksum-verified installer below.
+The future package will install the visible **SnaPdf** application and the `snapdf` command. Package
+names in the AUR and pacman are lowercase even though the application name is styled **SnaPdf**.
 
 ### Install SnaPdf — no Git or development tools
 
@@ -48,7 +51,7 @@ less install-snapdf.sh
 sh install-snapdf.sh
 ```
 
-The installer discovers the latest release, downloads the AppImage and its published `SHA256SUMS`, refuses to continue unless the checksum matches, and places SnaPdf under your home directory. It also creates the application-menu entry and icon. It never uses `sudo` and does not modify system directories.
+The installer discovers the latest release, downloads the AppImage and its published `SHA256SUMS`, refuses to continue unless the checksum matches, and places SnaPdf under your home directory. It also creates the application-menu entry and icon. It never uses `sudo`, does not modify system directories, and does not replace your current default PDF viewer.
 
 Afterward, open **SnaPdf** from the application menu and pin it to your dock, or run `snapdf` from a terminal. You can delete the downloaded `install-snapdf.sh` once installation finishes.
 
@@ -65,7 +68,7 @@ chmod +x SnaPdf-*.AppImage
 
 For a manual integrity check, download `SHA256SUMS` from the same release into the same directory and run `sha256sum --check --ignore-missing SHA256SUMS` before opening the AppImage.
 
-That is the complete installation for the PDF workspace. On first launch SnaPdf registers its application entry, icon, and `~/.local/bin/snapdf` terminal command for your user account, so you can find it in the application menu, pin it to your dock, or run `snapdf`. If you move the AppImage later, launch it once from the new location to refresh those entries. If `~/.local/bin` is not already in your shell's `PATH`, log out and back in or add it to `PATH` once.
+That is the complete installation for the PDF workspace. On first launch SnaPdf registers itself as an available PDF application, plus its icon and `~/.local/bin/snapdf` terminal command, but it never makes itself the default. You can find it in the application menu, pin it to your dock, or run `snapdf`. If you move the AppImage later, launch it once from the new location to refresh those entries. If `~/.local/bin` is not already in your shell's `PATH`, log out and back in or add it to `PATH` once.
 
 To open a document directly, pass its path to the same file:
 
@@ -83,9 +86,29 @@ The PDF viewer and annotation workspace work immediately. Offline OCR uses large
 
 This downloads the OCR runtime into `~/.local/share/snapdf/ocr`; the OCR models download on their first use. It does not require Rust or system-wide packages.
 
-### Updating or removing SnaPdf
+### Updating or uninstalling SnaPdf
 
-To update, download the newer AppImage and replace the old one. To remove SnaPdf, delete its AppImage. Your PDFs are never moved or modified by installation.
+Run the installer again to update to the latest release. Every supported user-level installation
+also installs a dedicated removal command:
+
+```bash
+snapdf-uninstall
+```
+
+This removes the application, terminal launcher, menu entry, and icon, but deliberately keeps your
+projects, reading positions, annotations, study chats, credentials, settings, and downloaded OCR
+data so that a reinstall can resume where you stopped. Your PDFs are never moved or deleted.
+
+To remove both the application and all SnaPdf-owned user data, use the explicit purge mode and
+confirm the warning:
+
+```bash
+snapdf-uninstall --purge
+```
+
+If you are running a downloaded AppImage directly, launching it once creates the same
+`snapdf-uninstall` command. You can also run `./SnaPdf-*.AppImage --uninstall`. The future AUR
+package, once published, should instead be removed through pacman with `yay -Rns snapdf`.
 
 SnaPdf’s workspace state is stored at `~/.config/snapdf/state.json`; connected study-chat credentials are stored separately at `~/.config/snapdf/chat-credentials.json` with owner-only permissions; its optional OCR runtime and models are stored under `~/.local/share/snapdf/ocr`. Remove those paths too only if you also want to erase saved workspace data, provider connections, and OCR data. Upgrading from the former SnapPDF name migrates `~/.config/snappdf` and `~/.local/share/snappdf` without overwriting newer SnaPdf data, so projects, annotations, chats, settings, credentials, and OCR models remain available.
 
@@ -99,7 +122,7 @@ cd SnaPdf
 ./scripts/install.sh
 ```
 
-The source installer installs compilation dependencies on systems with `apt`, installs Rust when needed, builds SnaPdf, registers the desktop entry, and sets up OCR. Those build dependencies are needed only for compiling from source—not for the AppImage.
+The source installer installs compilation dependencies on systems with `apt`, installs Rust when needed, builds SnaPdf, registers the desktop entry without changing the default PDF viewer, and sets up OCR. Those build dependencies are needed only for compiling from source—not for the AppImage.
 
 ## 3. Usage
 

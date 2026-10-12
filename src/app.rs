@@ -32,8 +32,10 @@ const MAX_PENDING_PAGES: usize = 6;
 const PAGE_GAP: f32 = 18.0;
 const KEYBOARD_TAP_SCROLL: f32 = 150.0;
 const WHEEL_SCROLL_MULTIPLIER: f32 = 1.65;
+const DOCUMENT_TOOLBAR_HEIGHT: f32 = 20.8;
+const DOCUMENT_TOOLBAR_OPTICAL_Y: f32 = -2.0;
 
-#[derive(Clone)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 enum RenameTarget {
     Project(usize),
     File(PathBuf),
@@ -311,7 +313,7 @@ enum TreeAction {
     Open(PathBuf),
     OpenWith(PathBuf),
     OpenInFiles(PathBuf),
-    Rename(PathBuf, String),
+    Rename(PathBuf, String, Rect),
     ResetName(PathBuf),
     PinFile(PathBuf),
     UnpinFile(PathBuf),
@@ -375,6 +377,8 @@ pub struct SnaPdfApp {
     pending_text: HashSet<(usize, u64)>,
     text_selection: Option<TextSelection>,
     text_selection_dragging: bool,
+    pending_select_all_text: bool,
+    pending_selection_copy: bool,
     pending_selection_highlight: bool,
     generation: u64,
     frame_number: u64,
@@ -393,6 +397,7 @@ pub struct SnaPdfApp {
     project_shortcut_armed_until: Option<f64>,
     jump_to_page: Option<usize>,
     rename_target: Option<RenameTarget>,
+    rename_anchor: Option<Rect>,
     rename_buffer: String,
     rename_focus_requested: bool,
     tool_mode: ToolMode,
@@ -503,6 +508,8 @@ impl SnaPdfApp {
             pending_text: HashSet::new(),
             text_selection: None,
             text_selection_dragging: false,
+            pending_select_all_text: false,
+            pending_selection_copy: false,
             pending_selection_highlight: false,
             generation: 0,
             frame_number: 0,
@@ -521,6 +528,7 @@ impl SnaPdfApp {
             project_shortcut_armed_until: None,
             jump_to_page: None,
             rename_target: None,
+            rename_anchor: None,
             rename_buffer: String::new(),
             rename_focus_requested: false,
             tool_mode: ToolMode::Select,
@@ -623,6 +631,8 @@ impl SnaPdfApp {
         self.pending_text.clear();
         self.text_selection = None;
         self.text_selection_dragging = false;
+        self.pending_select_all_text = false;
+        self.pending_selection_copy = false;
         self.pending_selection_highlight = false;
         self.search_matches.clear();
         self.search_index = 0;
@@ -1101,6 +1111,8 @@ impl SnaPdfApp {
                     links.extend(infer_text_links(&glyphs, &self.outline, &links));
                     self.text_layers.insert(page_index, glyphs);
                     self.link_layers.insert(page_index, links);
+                    self.finish_select_all_text();
+                    self.finish_pending_selection_copy(ctx);
                 }
                 RenderEvent::SearchCompleted {
                     generation,
@@ -1672,6 +1684,7 @@ impl SnaPdfApp {
         let zoom_in = KeyboardShortcut::new(Modifiers::CTRL, Key::Plus);
         let zoom_out = KeyboardShortcut::new(Modifiers::CTRL, Key::Minus);
         let copy = KeyboardShortcut::new(Modifiers::CTRL, Key::C);
+        let select_all = KeyboardShortcut::new(Modifiers::CTRL, Key::A);
         let find = KeyboardShortcut::new(Modifiers::CTRL, Key::F);
         let print = KeyboardShortcut::new(Modifiers::CTRL, Key::P);
         let close_tab = KeyboardShortcut::new(Modifiers::CTRL, Key::W);
@@ -1778,11 +1791,17 @@ impl SnaPdfApp {
                 self.persist();
             }
         }
-        if ctx.input_mut(|input| input.consume_shortcut(&copy))
-            && let Some(text) = self.selected_text()
+        if !ctx.egui_wants_keyboard_input()
+            && self.text_selection.is_some()
+            && ctx.input_mut(|input| input.consume_shortcut(&copy))
         {
-            ctx.copy_text(text);
-            self.status = "Selected text copied.".to_owned();
+            self.copy_text_selection(ctx);
+        }
+        if !ctx.egui_wants_keyboard_input()
+            && self.current_path.is_some()
+            && ctx.input_mut(|input| input.consume_shortcut(&select_all))
+        {
+            self.select_all_document_text();
         }
         if ctx.input_mut(|input| input.consume_shortcut(&find)) {
             self.show_search = true;
@@ -2243,6 +2262,11 @@ impl SnaPdfApp {
                                             matching_files.len(),
                                             self.state.projects[index].expanded,
                                         );
+                                        register_rename_row(
+                                            ui,
+                                            &RenameTarget::Project(index),
+                                            header.rename_rect,
+                                        );
                                         header
                                             .body
                                             .clone()
@@ -2254,6 +2278,7 @@ impl SnaPdfApp {
                                         }
                                         if let Some(action) = sidebar_options_popup(
                                             &header.options,
+                                            &header.body,
                                             false,
                                             Some("Remove from sidebar"),
                                             false,
@@ -2264,6 +2289,7 @@ impl SnaPdfApp {
                                                     rename_request = Some((
                                                         RenameTarget::Project(index),
                                                         project.name.clone(),
+                                                        header.rename_rect,
                                                     ));
                                                 }
                                                 SidebarMenuAction::Remove => {
@@ -2302,9 +2328,12 @@ impl SnaPdfApp {
                                                     TreeAction::OpenInFiles(path) => {
                                                         open_in_files = Some(path)
                                                     }
-                                                    TreeAction::Rename(path, name) => {
-                                                        rename_request =
-                                                            Some((RenameTarget::File(path), name));
+                                                    TreeAction::Rename(path, name, rect) => {
+                                                        rename_request = Some((
+                                                            RenameTarget::File(path),
+                                                            name,
+                                                            rect,
+                                                        ));
                                                     }
                                                     TreeAction::ResetName(path) => {
                                                         clear_file_alias = Some(path)
@@ -2338,6 +2367,7 @@ impl SnaPdfApp {
                                         }
                                         if let Some(action) = sidebar_options_popup(
                                             &row.options,
+                                            &row.body,
                                             false,
                                             None,
                                             false,
@@ -2364,11 +2394,17 @@ impl SnaPdfApp {
                                         0.0,
                                         self.state.sidebar_file_icons,
                                     );
+                                    register_rename_row(
+                                        ui,
+                                        &RenameTarget::File(path.clone()),
+                                        row.rename_rect,
+                                    );
                                     if row.body.clicked() && !row.options.clicked() {
                                         open_after_ui = Some(path.clone());
                                     }
                                     if let Some(action) = sidebar_options_popup(
                                         &row.options,
+                                        &row.body,
                                         self.state.file_aliases.contains_key(&path),
                                         None,
                                         true,
@@ -2386,6 +2422,7 @@ impl SnaPdfApp {
                                                 rename_request = Some((
                                                     RenameTarget::File(path.clone()),
                                                     self.state.display_name(&path),
+                                                    row.rename_rect,
                                                 ))
                                             }
                                             SidebarMenuAction::ResetName => {
@@ -2448,6 +2485,11 @@ impl SnaPdfApp {
                                     matching_files.len(),
                                     self.state.projects[index].expanded,
                                 );
+                                register_rename_row(
+                                    ui,
+                                    &RenameTarget::Project(index),
+                                    header.rename_rect,
+                                );
                                 header
                                     .body
                                     .clone()
@@ -2459,6 +2501,7 @@ impl SnaPdfApp {
                                 }
                                 if let Some(action) = sidebar_options_popup(
                                     &header.options,
+                                    &header.body,
                                     false,
                                     Some("Remove from sidebar"),
                                     false,
@@ -2470,6 +2513,7 @@ impl SnaPdfApp {
                                             rename_request = Some((
                                                 RenameTarget::Project(index),
                                                 project.name.clone(),
+                                                header.rename_rect,
                                             ));
                                         }
                                         SidebarMenuAction::Remove => remove_project = Some(index),
@@ -2507,9 +2551,9 @@ impl SnaPdfApp {
                                             TreeAction::OpenInFiles(path) => {
                                                 open_in_files = Some(path)
                                             }
-                                            TreeAction::Rename(path, name) => {
+                                            TreeAction::Rename(path, name, rect) => {
                                                 rename_request =
-                                                    Some((RenameTarget::File(path), name));
+                                                    Some((RenameTarget::File(path), name, rect));
                                             }
                                             TreeAction::ResetName(path) => {
                                                 clear_file_alias = Some(path)
@@ -2550,6 +2594,11 @@ impl SnaPdfApp {
                                         0.0,
                                         self.state.sidebar_file_icons,
                                     );
+                                    register_rename_row(
+                                        ui,
+                                        &RenameTarget::File(item.path.clone()),
+                                        row.rename_rect,
+                                    );
                                     if self.state.display_name(&item.path).chars().count()
                                         > max_sidebar_label_chars(
                                             &row.body,
@@ -2566,6 +2615,7 @@ impl SnaPdfApp {
                                     }
                                     if let Some(action) = sidebar_options_popup(
                                         &row.options,
+                                        &row.body,
                                         self.state.file_aliases.contains_key(&item.path),
                                         Some("Remove from recents"),
                                         true,
@@ -2582,6 +2632,7 @@ impl SnaPdfApp {
                                                 rename_request = Some((
                                                     RenameTarget::File(item.path.clone()),
                                                     self.state.display_name(&item.path),
+                                                    row.rename_rect,
                                                 ));
                                             }
                                             SidebarMenuAction::ResetName => {
@@ -2646,8 +2697,9 @@ impl SnaPdfApp {
                                 self.state.clear_file_alias(&path);
                                 self.persist();
                             }
-                            if let Some((target, current_name)) = rename_request {
+                            if let Some((target, current_name, anchor)) = rename_request {
                                 self.rename_target = Some(target);
+                                self.rename_anchor = Some(anchor);
                                 self.rename_buffer = current_name;
                                 self.rename_focus_requested = true;
                             }
@@ -3236,22 +3288,31 @@ impl SnaPdfApp {
                 if self.current_path.is_some() {
                     ui.separator();
                     ui.scope(|ui| {
-                        let row =
-                            Rect::from_min_size(ui.cursor().min, vec2(ui.available_width(), 26.0));
-                        ui.allocate_rect(row, Sense::hover());
-                        let third = row.width() / 3.0;
-                        let left =
-                            Rect::from_min_max(row.min, pos2(row.left() + third, row.bottom()));
-                        let center = Rect::from_min_max(
-                            pos2(row.left() + third, row.top()),
-                            pos2(row.right() - third, row.bottom()),
+                        let row = Rect::from_min_size(
+                            ui.cursor().min,
+                            vec2(ui.available_width(), DOCUMENT_TOOLBAR_HEIGHT),
                         );
-                        let right =
-                            Rect::from_min_max(pos2(row.right() - third, row.top()), row.max);
+                        ui.allocate_rect(row, Sense::hover());
+                        // A small optical correction keeps both vector icons and text labels
+                        // centered between the separators instead of sitting on the baseline.
+                        let content_row = row.translate(vec2(0.0, DOCUMENT_TOOLBAR_OPTICAL_Y));
+                        let third = row.width() / 3.0;
+                        let left = Rect::from_min_max(
+                            content_row.min,
+                            pos2(content_row.left() + third, content_row.bottom()),
+                        );
+                        let center = Rect::from_min_max(
+                            pos2(content_row.left() + third, content_row.top()),
+                            pos2(content_row.right() - third, content_row.bottom()),
+                        );
+                        let right = Rect::from_min_max(
+                            pos2(content_row.right() - third, content_row.top()),
+                            content_row.max,
+                        );
                         ui.scope_builder(
-                            egui::UiBuilder::new()
-                                .max_rect(center)
-                                .layout(Layout::top_down(Align::Center)),
+                            egui::UiBuilder::new().max_rect(center).layout(
+                                Layout::left_to_right(Align::Center).with_main_align(Align::Center),
+                            ),
                             |ui| {
                                 ui.horizontal(|ui| {
                                     // Zoom group: document zoom is primary; surrounding chrome follows the configured ratio.
@@ -3442,7 +3503,7 @@ impl SnaPdfApp {
                                             }
                                             ui.separator();
                                             ui.scope(|ui| {
-                                                ui.spacing_mut().interact_size = vec2(22.0, 22.0);
+                                                ui.spacing_mut().interact_size = vec2(18.0, 18.0);
                                                 ui.color_edit_button_srgba(
                                                     &mut self.annotation_color,
                                                 );
@@ -3723,7 +3784,16 @@ impl SnaPdfApp {
                         .get(&provider)
                         .copied()
                         .unwrap_or(false);
-                    let footer_height = if connected { 188.0 } else { 208.0 }
+                    let composer_content_rows = chat_prompt_visual_rows(
+                        &self.study_chat.prompt,
+                        (ui.available_width() - 46.0).max(1.0),
+                    );
+                    let composer_rows = chat_prompt_rows(
+                        &self.study_chat.prompt,
+                        (ui.available_width() - 46.0).max(1.0),
+                    );
+                    let footer_height = if connected { 200.0 } else { 176.0 }
+                        + (composer_rows.saturating_sub(1) as f32 * 18.0)
                         + if self.study_chat.attachments.is_empty() { 0.0 } else { 32.0 };
                     let messages = self
                         .study_chat
@@ -3748,7 +3818,7 @@ impl SnaPdfApp {
                             ui.add_space(16.0);
                             if messages.is_empty() {
                                 chat_empty_state(ui);
-                                if !status.is_empty() {
+                                if chat_status_visible(&status, busy) {
                                     ui.add_space(12.0);
                                     chat_status(ui, &status, busy);
                                 }
@@ -3759,14 +3829,16 @@ impl SnaPdfApp {
                                     && index + 1 == messages.len()
                                     && busy
                                     && active_provider == Some(provider);
-                                if chat_message(ui, message, streaming) {
+                                if !streaming && chat_message(ui, message, false) {
                                     copied_notice = Some(if message.role == ChatRole::User {
                                         "Prompt copied."
                                     } else {
                                         "Reply copied."
                                     });
                                 }
-                                if latest_prompt == Some(index) && !status.is_empty() {
+                                if latest_prompt == Some(index)
+                                    && chat_status_visible(&status, busy)
+                                {
                                     ui.add_space(3.0);
                                     chat_status(ui, &status, busy);
                                 }
@@ -3828,20 +3900,39 @@ impl SnaPdfApp {
                                 .corner_radius(CornerRadius::same(18))
                                 .inner_margin(Margin::symmetric(11, 8))
                                 .show(ui, |ui| {
+                                    let input_height = chat_prompt_viewport_height(composer_rows);
+                                    let content_height =
+                                        chat_prompt_content_height(composer_content_rows);
                                     let input_width = ui.available_width().max(1.0);
-                                    let prompt_response = ui.add_sized(
-                                        [input_width, 68.0],
-                                        egui::TextEdit::multiline(&mut self.study_chat.prompt)
-                                            .hint_text("Message your study assistant…")
-                                            .desired_width(input_width)
-                                            .desired_rows(3)
-                                            .frame(Frame::NONE)
-                                            .margin(Margin::ZERO),
-                                    );
+                                    let prompt_response = ScrollArea::vertical()
+                                        .id_salt("study-chat-prompt-scroll")
+                                        .auto_shrink([false, false])
+                                        .stick_to_bottom(true)
+                                        .max_height(input_height)
+                                        .min_scrolled_height(input_height)
+                                        .scroll_bar_visibility(
+                                            egui::scroll_area::ScrollBarVisibility::VisibleWhenNeeded,
+                                        )
+                                        .show(ui, |ui| {
+                                            ui.add_sized(
+                                                [ui.available_width().max(1.0), content_height],
+                                                egui::TextEdit::multiline(
+                                                    &mut self.study_chat.prompt,
+                                                )
+                                                .id(egui::Id::new("study-chat-prompt"))
+                                                .hint_text("Message your study assistant…")
+                                                .desired_width(input_width)
+                                                .desired_rows(composer_content_rows)
+                                                .frame(Frame::NONE)
+                                                .margin(Margin::ZERO),
+                                            )
+                                        })
+                                        .inner;
                                     send_with_enter = prompt_response.has_focus()
                                         && ui.input(|input| {
                                             input.key_pressed(Key::Enter) && !input.modifiers.shift
                                         });
+                                    ui.add_space(3.0);
                                     ui.horizontal(|ui| {
                                         let attach = chat_icon_button(
                                             ui,
@@ -3885,6 +3976,19 @@ impl SnaPdfApp {
                                             {
                                                 self.send_chat_message();
                                             }
+                                            for candidate in
+                                                [ChatProvider::Gemini, ChatProvider::ChatGpt]
+                                            {
+                                                if chat_provider_pill(
+                                                    ui,
+                                                    candidate.label(),
+                                                    self.study_chat.provider == candidate,
+                                                )
+                                                .clicked()
+                                                {
+                                                    self.study_chat.provider = candidate;
+                                                }
+                                            }
                                         });
                                     });
                                 });
@@ -3896,26 +4000,7 @@ impl SnaPdfApp {
                                 self.send_chat_message();
                             }
 
-                            ui.add_space(8.0);
-                            ui.horizontal(|ui| {
-                                ui.label(
-                                    RichText::new("Provider")
-                                        .size(10.5)
-                                        .color(Color32::from_rgb(145, 145, 145)),
-                                );
-                                for candidate in [ChatProvider::ChatGpt, ChatProvider::Gemini] {
-                                    if chat_provider_pill(
-                                        ui,
-                                        candidate.label(),
-                                        self.study_chat.provider == candidate,
-                                    )
-                                    .clicked()
-                                    {
-                                        self.study_chat.provider = candidate;
-                                    }
-                                }
-                            });
-                            ui.add_space(4.0);
+                            ui.add_space(7.0);
 
                             if connected {
                                 ui.horizontal(|ui| {
@@ -3958,18 +4043,25 @@ impl SnaPdfApp {
                                     .selected_models
                                     .entry(provider)
                                     .or_insert_with(|| models.first().cloned().unwrap_or_default());
-                                egui::ComboBox::from_id_salt(("study-model", provider))
-                                    .width(ui.available_width().max(1.0))
-                                    .selected_text(if selected.is_empty() {
-                                        "Loading models…"
-                                    } else {
-                                        selected.as_str()
-                                    })
-                                    .show_ui(ui, |ui| {
-                                        for model in &models {
-                                            ui.selectable_value(selected, model.clone(), model);
-                                        }
-                                    });
+                                ui.horizontal(|ui| {
+                                    ui.label(
+                                        RichText::new("Model")
+                                            .size(10.5)
+                                            .color(Color32::from_rgb(145, 145, 145)),
+                                    );
+                                    egui::ComboBox::from_id_salt(("study-model", provider))
+                                        .width((ui.available_width() - 2.0).max(1.0))
+                                        .selected_text(if selected.is_empty() {
+                                            "Loading models…"
+                                        } else {
+                                            selected.as_str()
+                                        })
+                                        .show_ui(ui, |ui| {
+                                            for model in &models {
+                                                ui.selectable_value(selected, model.clone(), model);
+                                            }
+                                        });
+                                });
                             } else {
                                 match provider {
                                     ChatProvider::ChatGpt => {
@@ -4572,9 +4664,12 @@ impl SnaPdfApp {
                                             {
                                                 if response.drag_started() || response.clicked() {
                                                     if let Some(glyph) = nearest_glyph(glyphs, page_rect, source_size, pointer) {
+                                                        ctx.memory_mut(|memory| memory.stop_text_input());
                                                         let position = TextPosition { page: index, glyph };
                                                         self.text_selection = Some(TextSelection { anchor: position, focus: position });
                                                         self.text_selection_dragging = response.drag_started();
+                                                        self.pending_select_all_text = false;
+                                                        self.pending_selection_copy = false;
                                                         self.pending_selection_highlight = false;
                                                     }
                                                 } else if response.dragged()
@@ -4754,10 +4849,7 @@ impl SnaPdfApp {
                         {
                             match action {
                                 SelectionAction::Copy => {
-                                    if let Some(text) = self.selected_text() {
-                                        ctx.copy_text(text);
-                                        self.status = "Selected text copied.".to_owned();
-                                    }
+                                    self.copy_text_selection(&ctx);
                                 }
                                 SelectionAction::Highlight => self.highlight_text_selection(),
                                 SelectionAction::Chat => {
@@ -5013,6 +5105,69 @@ impl SnaPdfApp {
         (!parts.is_empty()).then(|| parts.join("\n"))
     }
 
+    fn copy_text_selection(&mut self, ctx: &egui::Context) {
+        if self.text_selection.is_none() {
+            return;
+        }
+        if self.selection_text_ready() {
+            if let Some(text) = self.selected_text() {
+                ctx.copy_text(text);
+                self.pending_selection_copy = false;
+                self.status = "Selected text copied.".to_owned();
+            }
+            return;
+        }
+
+        self.pending_selection_copy = true;
+        if let Some(selection) = self.text_selection {
+            let (first, last) = selection.ordered();
+            for page in first.page..=last.page {
+                self.request_text(page, self.generation);
+            }
+        }
+        self.status = "Finishing text extraction before copying…".to_owned();
+    }
+
+    fn finish_pending_selection_copy(&mut self, ctx: &egui::Context) {
+        if self.pending_selection_copy && self.selection_text_ready() {
+            self.copy_text_selection(ctx);
+        }
+    }
+
+    fn select_all_document_text(&mut self) {
+        if self.page_sizes.is_empty() {
+            return;
+        }
+        self.pending_select_all_text = true;
+        self.pending_selection_copy = false;
+        self.text_selection_dragging = false;
+        self.pending_selection_highlight = false;
+        for page in 0..self.page_sizes.len() {
+            self.request_text(page, self.generation);
+        }
+        self.status = "Selecting all text in this PDF…".to_owned();
+        self.finish_select_all_text();
+    }
+
+    fn finish_select_all_text(&mut self) {
+        if !self.pending_select_all_text
+            || (0..self.page_sizes.len()).any(|page| !self.text_layers.contains_key(&page))
+        {
+            return;
+        }
+
+        self.pending_select_all_text = false;
+        if let Some(selection) =
+            full_document_text_selection(&self.text_layers, self.page_sizes.len())
+        {
+            self.text_selection = Some(selection);
+            self.status = "Selected all PDF text. Press Ctrl+C to copy.".to_owned();
+        } else {
+            self.text_selection = None;
+            self.status = "This PDF has no extractable text.".to_owned();
+        }
+    }
+
     fn selection_text_ready(&self) -> bool {
         let Some(selection) = self.text_selection else {
             return false;
@@ -5074,46 +5229,38 @@ impl SnaPdfApp {
         let Some(target) = self.rename_target.clone() else {
             return;
         };
-        let title = match target {
-            RenameTarget::Project(_) => "Rename project",
-            RenameTarget::File(_) => "Rename PDF display name",
+        let Some(rect) = self
+            .rename_anchor
+            .or_else(|| ctx.data(|data| data.get_temp::<Rect>(rename_row_id(&target))))
+        else {
+            return;
         };
         let mut save = false;
-        let mut open = true;
-        egui::Window::new(title)
-            .open(&mut open)
-            .anchor(Align2::CENTER_CENTER, vec2(0.0, -80.0))
-            .collapsible(false)
-            .resizable(false)
-            .fixed_size(vec2(292.0, 108.0))
+        let mut cancel = false;
+        egui::Area::new(egui::Id::new("sidebar-inline-rename"))
+            .order(egui::Order::Foreground)
+            .fixed_pos(rect.min)
             .show(ctx, |ui| {
                 let response = ui.add_sized(
-                    [ui.available_width(), 28.0],
-                    egui::TextEdit::singleline(&mut self.rename_buffer).hint_text("Display name"),
+                    rect.size(),
+                    egui::TextEdit::singleline(&mut self.rename_buffer)
+                        .hint_text("Display name")
+                        .margin(Margin::symmetric(5, 2)),
                 );
                 if self.rename_focus_requested {
                     response.request_focus();
                     self.rename_focus_requested = false;
                 }
-                let enter =
-                    response.lost_focus() && ui.input(|input| input.key_pressed(Key::Enter));
-                ui.add_space(5.0);
-                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    if ui
-                        .add_enabled(
-                            !self.rename_buffer.trim().is_empty(),
-                            egui::Button::new("Save"),
-                        )
-                        .clicked()
-                        || enter
-                    {
-                        save = !self.rename_buffer.trim().is_empty();
-                    }
-                });
+                let enter = ui.input(|input| input.key_pressed(Key::Enter));
+                cancel = ui.input(|input| input.key_pressed(Key::Escape));
+                save = !cancel
+                    && !self.rename_buffer.trim().is_empty()
+                    && (enter || response.lost_focus());
             });
 
-        if !open {
+        if cancel {
             self.rename_target = None;
+            self.rename_anchor = None;
         } else if save {
             match target {
                 RenameTarget::Project(index) => {
@@ -5126,6 +5273,7 @@ impl SnaPdfApp {
                 }
             }
             self.rename_target = None;
+            self.rename_anchor = None;
             self.persist();
         }
     }
@@ -5889,6 +6037,16 @@ fn rail_button(ui: &mut egui::Ui, selected: bool, icon: RailIcon) -> Response {
 struct SidebarRowResponse {
     body: Response,
     options: Response,
+    rename_rect: Rect,
+}
+
+fn rename_row_id(target: &RenameTarget) -> egui::Id {
+    egui::Id::new(("sidebar-rename-row", target))
+}
+
+fn register_rename_row(ui: &egui::Ui, target: &RenameTarget, rect: Rect) {
+    ui.ctx()
+        .data_mut(|data| data.insert_temp(rename_row_id(target), rect));
 }
 
 #[derive(Clone, Copy)]
@@ -5971,6 +6129,7 @@ fn render_pdf_tree(
         }
         if let Some(menu_action) = sidebar_options_popup(
             &row.options,
+            &row.body,
             false,
             None,
             false,
@@ -6011,6 +6170,7 @@ fn render_pdf_tree(
             24.0 + depth as f32 * 14.0,
             file_icons,
         );
+        register_rename_row(ui, &RenameTarget::File(path.clone()), row.rename_rect);
         if label.chars().count()
             > max_sidebar_label_chars(&row.body, 24.0 + depth as f32 * 14.0, file_icons)
         {
@@ -6021,6 +6181,7 @@ fn render_pdf_tree(
         }
         if let Some(menu_action) = sidebar_options_popup(
             &row.options,
+            &row.body,
             aliases.contains_key(path),
             None,
             true,
@@ -6029,7 +6190,9 @@ fn render_pdf_tree(
             action = match menu_action {
                 SidebarMenuAction::OpenWith => Some(TreeAction::OpenWith(path.clone())),
                 SidebarMenuAction::OpenInFiles => Some(TreeAction::OpenInFiles(path.clone())),
-                SidebarMenuAction::Rename => Some(TreeAction::Rename(path.clone(), label)),
+                SidebarMenuAction::Rename => {
+                    Some(TreeAction::Rename(path.clone(), label, row.rename_rect))
+                }
                 SidebarMenuAction::ResetName => Some(TreeAction::ResetName(path.clone())),
                 SidebarMenuAction::Pin => Some(TreeAction::PinFile(path.clone())),
                 SidebarMenuAction::Unpin => Some(TreeAction::UnpinFile(path.clone())),
@@ -6107,6 +6270,10 @@ fn directory_row(
     SidebarRowResponse {
         body: response,
         options,
+        rename_rect: Rect::from_min_max(
+            pos2(x + 31.0 * scale, rect.top() + 2.0 * scale),
+            pos2(rect.right() - 35.0 * scale, rect.bottom() - 2.0 * scale),
+        ),
     }
 }
 
@@ -6175,6 +6342,10 @@ fn project_header(
     SidebarRowResponse {
         body: response,
         options,
+        rename_rect: Rect::from_min_max(
+            pos2(rect.left() + 48.0 * scale, rect.top() + 4.0 * scale),
+            pos2(rect.right() - 52.0 * scale, rect.bottom() - 4.0 * scale),
+        ),
     }
 }
 
@@ -6239,6 +6410,10 @@ fn nav_row(
     SidebarRowResponse {
         body: response,
         options,
+        rename_rect: Rect::from_min_max(
+            pos2(text_left, rect.top() + 3.0 * scale),
+            pos2(rect.right() - 33.0 * scale, rect.bottom() - 3.0 * scale),
+        ),
     }
 }
 
@@ -6264,15 +6439,9 @@ fn sidebar_visual_scale_from_response(response: &Response) -> f32 {
 
 fn sidebar_options_button(ui: &mut egui::Ui, row_rect: Rect, row: &Response) -> Response {
     let scale = sidebar_visual_scale(ui);
-    let rect = Rect::from_min_max(
-        pos2(
-            row_rect.right() - 30.0 * scale,
-            row_rect.top() + 3.0 * scale,
-        ),
-        pos2(
-            row_rect.right() - 3.0 * scale,
-            row_rect.bottom() - 3.0 * scale,
-        ),
+    let rect = Rect::from_center_size(
+        pos2(row_rect.right() - 16.5 * scale, row_rect.center().y),
+        vec2(27.0 * scale, (row_rect.height() - 6.0 * scale).max(1.0)),
     );
     let visible = row.hovered() || ui.rect_contains_pointer(rect);
     ui.put(
@@ -6290,6 +6459,7 @@ fn sidebar_options_button(ui: &mut egui::Ui, row_rect: Rect, row: &Response) -> 
 
 fn sidebar_options_popup(
     response: &Response,
+    context_response: &Response,
     can_reset_name: bool,
     remove_label: Option<&str>,
     include_file_actions: bool,
@@ -6306,50 +6476,80 @@ fn sidebar_options_popup(
                 .inner_margin(Margin::same(5)),
         )
         .show(|ui| {
-            if include_file_actions
-                && popup_menu_row(ui, "Open with...", Color32::from_rgb(225, 227, 234))
-            {
-                action = Some(SidebarMenuAction::OpenWith);
-                ui.close();
-            }
-            if include_file_actions
-                && popup_menu_row(ui, "Open in Files", Color32::from_rgb(225, 227, 234))
-            {
-                action = Some(SidebarMenuAction::OpenInFiles);
-                ui.close();
-            }
-            if popup_menu_row(
+            action = sidebar_options_contents(
                 ui,
-                if pinned { "Unpin" } else { "Pin to top" },
-                Color32::from_rgb(225, 227, 234),
-            ) {
-                action = Some(if pinned {
-                    SidebarMenuAction::Unpin
-                } else {
-                    SidebarMenuAction::Pin
-                });
-                ui.close();
-            }
-            if popup_menu_row(ui, "Rename display name", Color32::from_rgb(225, 227, 234)) {
-                action = Some(SidebarMenuAction::Rename);
-                ui.close();
-            }
-            if can_reset_name
-                && popup_menu_row(ui, "Reset display name", Color32::from_rgb(225, 227, 234))
-            {
-                action = Some(SidebarMenuAction::ResetName);
-                ui.close();
-            }
-            if let Some(remove_label) = remove_label {
-                ui.add_space(3.0);
-                ui.separator();
-                ui.add_space(3.0);
-                if popup_menu_row(ui, remove_label, Color32::from_rgb(238, 126, 132)) {
-                    action = Some(SidebarMenuAction::Remove);
-                    ui.close();
-                }
+                can_reset_name,
+                remove_label,
+                include_file_actions,
+                pinned,
+            );
+        });
+    egui::Popup::context_menu(context_response)
+        .width(172.0)
+        .frame(
+            Frame::new()
+                .fill(Color32::from_rgb(29, 31, 37))
+                .stroke(Stroke::new(1.0, Color32::from_rgb(61, 64, 75)))
+                .corner_radius(CornerRadius::same(8))
+                .inner_margin(Margin::same(5)),
+        )
+        .show(|ui| {
+            if action.is_none() {
+                action = sidebar_options_contents(
+                    ui,
+                    can_reset_name,
+                    remove_label,
+                    include_file_actions,
+                    pinned,
+                );
             }
         });
+    action
+}
+
+fn sidebar_options_contents(
+    ui: &mut egui::Ui,
+    can_reset_name: bool,
+    remove_label: Option<&str>,
+    include_file_actions: bool,
+    pinned: bool,
+) -> Option<SidebarMenuAction> {
+    let action = if include_file_actions
+        && popup_menu_row(ui, "Open with...", Color32::from_rgb(225, 227, 234))
+    {
+        Some(SidebarMenuAction::OpenWith)
+    } else if include_file_actions
+        && popup_menu_row(ui, "Open in Files", Color32::from_rgb(225, 227, 234))
+    {
+        Some(SidebarMenuAction::OpenInFiles)
+    } else if popup_menu_row(
+        ui,
+        if pinned { "Unpin" } else { "Pin to top" },
+        Color32::from_rgb(225, 227, 234),
+    ) {
+        Some(if pinned {
+            SidebarMenuAction::Unpin
+        } else {
+            SidebarMenuAction::Pin
+        })
+    } else if popup_menu_row(ui, "Rename display name", Color32::from_rgb(225, 227, 234)) {
+        Some(SidebarMenuAction::Rename)
+    } else if can_reset_name
+        && popup_menu_row(ui, "Reset display name", Color32::from_rgb(225, 227, 234))
+    {
+        Some(SidebarMenuAction::ResetName)
+    } else if let Some(remove_label) = remove_label {
+        ui.add_space(3.0);
+        ui.separator();
+        ui.add_space(3.0);
+        popup_menu_row(ui, remove_label, Color32::from_rgb(238, 126, 132))
+            .then_some(SidebarMenuAction::Remove)
+    } else {
+        None
+    };
+    if action.is_some() {
+        ui.close();
+    }
     action
 }
 
@@ -6645,6 +6845,30 @@ fn selected_glyph_text(glyphs: &[TextGlyph], anchor: usize, focus: usize) -> Opt
         .map(|glyph| glyph.text.as_str())
         .collect::<String>();
     (!text.is_empty()).then_some(text)
+}
+
+fn full_document_text_selection(
+    text_layers: &HashMap<usize, Vec<TextGlyph>>,
+    page_count: usize,
+) -> Option<TextSelection> {
+    let first = (0..page_count).find_map(|page| {
+        (!text_layers.get(&page)?.is_empty()).then_some(TextPosition { page, glyph: 0 })
+    })?;
+    let last = (0..page_count).rev().find_map(|page| {
+        let glyphs = text_layers.get(&page)?;
+        if glyphs.is_empty() {
+            None
+        } else {
+            Some(TextPosition {
+                page,
+                glyph: glyphs.len() - 1,
+            })
+        }
+    })?;
+    Some(TextSelection {
+        anchor: first,
+        focus: last,
+    })
 }
 
 fn nearest_glyph(
@@ -7071,15 +7295,7 @@ const CHAT_MUTED: Color32 = Color32::from_rgb(166, 166, 166);
 fn chat_empty_state(ui: &mut egui::Ui) {
     ui.add_space(22.0);
     ui.vertical_centered(|ui| {
-        let (rect, _) = ui.allocate_exact_size(vec2(42.0, 42.0), Sense::hover());
-        ui.painter().circle_filled(rect.center(), 20.0, CHAT_ACCENT);
-        ui.painter().text(
-            rect.center(),
-            Align2::CENTER_CENTER,
-            "S",
-            FontId::proportional(18.0),
-            Color32::WHITE,
-        );
+        chat_assistant_mark(ui, 42.0);
         ui.add_space(10.0);
         ui.label(
             RichText::new("What are you studying?")
@@ -7102,6 +7318,15 @@ fn chat_empty_state(ui: &mut egui::Ui) {
     });
 }
 
+fn chat_status_visible(status: &str, busy: bool) -> bool {
+    let normalized = status.trim();
+    if normalized.is_empty() {
+        return false;
+    }
+    busy || !(normalized.eq_ignore_ascii_case("ready")
+        || normalized.to_ascii_lowercase().ends_with(" is ready."))
+}
+
 fn chat_status(ui: &mut egui::Ui, status: &str, busy: bool) {
     ui.horizontal(|ui| {
         ui.add_space(34.0);
@@ -7121,38 +7346,36 @@ fn chat_message(ui: &mut egui::Ui, message: &ChatMessage, streaming: bool) -> bo
     match message.role {
         ChatRole::User => {
             let bubble_width = chat_user_bubble_width(available);
-            ui.with_layout(Layout::right_to_left(Align::Min), |ui| {
-                Frame::new()
-                    .fill(Color32::from_rgb(47, 47, 47))
-                    .stroke(Stroke::new(1.0, Color32::from_rgb(63, 63, 63)))
-                    .corner_radius(CornerRadius::same(16))
-                    .inner_margin(Margin::symmetric(12, 9))
-                    .show(ui, |ui| {
-                        ui.set_width(bubble_width);
-                        chat_message_attachments(ui, message);
-                        render_chat_markdown(ui, &message.text);
-                        ui.add_space(4.0);
-                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+            ui.horizontal(|ui| {
+                ui.add_space((available - bubble_width).max(0.0));
+                ui.vertical(|ui| {
+                    ui.set_width(bubble_width);
+                    Frame::new()
+                        .fill(Color32::from_rgb(47, 47, 47))
+                        .stroke(Stroke::new(1.0, Color32::from_rgb(63, 63, 63)))
+                        .corner_radius(CornerRadius::same(16))
+                        .inner_margin(Margin::symmetric(12, 9))
+                        .show(ui, |ui| {
+                            ui.set_width((bubble_width - 24.0).max(1.0));
+                            chat_message_attachments(ui, message);
+                            render_chat_markdown(ui, &message.text);
+                        });
+                    ui.allocate_ui_with_layout(
+                        vec2(bubble_width, 23.0),
+                        Layout::right_to_left(Align::Center),
+                        |ui| {
                             if chat_copy_button(ui, "Copy prompt").clicked() {
                                 ui.ctx().copy_text(message.text.clone());
                                 copied = true;
                             }
-                        });
-                    });
+                        },
+                    );
+                });
             });
         }
         ChatRole::Assistant => {
             ui.horizontal(|ui| {
-                let (avatar, _) = ui.allocate_exact_size(vec2(26.0, 26.0), Sense::hover());
-                ui.painter()
-                    .circle_filled(avatar.center(), 13.0, CHAT_ACCENT);
-                ui.painter().text(
-                    avatar.center(),
-                    Align2::CENTER_CENTER,
-                    "S",
-                    FontId::proportional(11.5),
-                    Color32::WHITE,
-                );
+                chat_assistant_mark(ui, 26.0);
                 ui.vertical(|ui| {
                     ui.set_width(ui.available_width().max(1.0));
                     if streaming {
@@ -7174,6 +7397,57 @@ fn chat_message(ui: &mut egui::Ui, message: &ChatMessage, streaming: bool) -> bo
         }
     }
     copied
+}
+
+fn chat_assistant_mark(ui: &mut egui::Ui, size: f32) {
+    let (rect, _) = ui.allocate_exact_size(vec2(size, size), Sense::hover());
+    let radius = size * 0.48;
+    ui.painter()
+        .circle_filled(rect.center(), radius, CHAT_ACCENT);
+    let center = rect.center();
+    let long = size * 0.22;
+    let short = size * 0.08;
+    let color = Color32::WHITE;
+    ui.painter().line_segment(
+        [center - vec2(0.0, long), center + vec2(0.0, long)],
+        Stroke::new((size * 0.065).max(1.2), color),
+    );
+    ui.painter().line_segment(
+        [center - vec2(long, 0.0), center + vec2(long, 0.0)],
+        Stroke::new((size * 0.065).max(1.2), color),
+    );
+    ui.painter().line_segment(
+        [center - vec2(short, short), center + vec2(short, short)],
+        Stroke::new((size * 0.045).max(1.0), color.gamma_multiply(0.9)),
+    );
+    ui.painter().line_segment(
+        [center + vec2(-short, short), center + vec2(short, -short)],
+        Stroke::new((size * 0.045).max(1.0), color.gamma_multiply(0.9)),
+    );
+}
+
+fn chat_prompt_rows(prompt: &str, width: f32) -> usize {
+    chat_prompt_visual_rows(prompt, width).min(4)
+}
+
+fn chat_prompt_visual_rows(prompt: &str, width: f32) -> usize {
+    if prompt.is_empty() {
+        return 1;
+    }
+    let characters_per_line = ((width.max(1.0) - 18.0) / 7.2).floor().max(12.0) as usize;
+    prompt
+        .split('\n')
+        .map(|line| line.chars().count().max(1).div_ceil(characters_per_line))
+        .sum::<usize>()
+        .clamp(1, 512)
+}
+
+fn chat_prompt_viewport_height(rows: usize) -> f32 {
+    chat_prompt_content_height(rows.clamp(1, 4))
+}
+
+fn chat_prompt_content_height(rows: usize) -> f32 {
+    22.0 + rows.max(1).saturating_sub(1) as f32 * 18.0
 }
 
 fn chat_user_bubble_width(available: f32) -> f32 {
@@ -8907,6 +9181,47 @@ mod tests {
     }
 
     #[test]
+    fn short_user_chat_message_does_not_fill_the_scroll_height() {
+        egui::__run_test_ui(|ui| {
+            ui.set_width(360.0);
+            let message = ChatMessage {
+                role: ChatRole::User,
+                text: "A short prompt".to_owned(),
+                attachments: Vec::new(),
+            };
+            let response = ui.scope(|ui| {
+                ui.set_width(360.0);
+                chat_message(ui, &message, false);
+            });
+            assert!(
+                response.response.rect.height() < 120.0,
+                "short prompt unexpectedly occupied {} points",
+                response.response.rect.height()
+            );
+        });
+    }
+
+    #[test]
+    fn chat_composer_grows_from_one_to_four_rows() {
+        assert_eq!(chat_prompt_rows("", 320.0), 1);
+        assert_eq!(chat_prompt_rows("one line", 320.0), 1);
+        assert_eq!(chat_prompt_rows("one\ntwo\nthree", 320.0), 3);
+        assert_eq!(chat_prompt_rows(&"long ".repeat(300), 120.0), 4);
+        assert!(chat_prompt_visual_rows(&"long ".repeat(300), 120.0) > 4);
+        assert_eq!(chat_prompt_viewport_height(1), 22.0);
+        assert_eq!(chat_prompt_viewport_height(4), 76.0);
+        assert_eq!(chat_prompt_viewport_height(400), 76.0);
+        assert!(chat_prompt_content_height(8) > chat_prompt_viewport_height(4));
+    }
+
+    #[test]
+    fn completed_ready_state_is_not_rendered_as_message_status() {
+        assert!(!chat_status_visible("Ready", false));
+        assert!(!chat_status_visible("ChatGPT is ready.", false));
+        assert!(chat_status_visible("ChatGPT is thinking…", true));
+    }
+
+    #[test]
     fn chat_markdown_removes_control_markers_but_keeps_content() {
         egui::__run_test_ui(|ui| {
             let job = markdown_inline_job(
@@ -8950,6 +9265,41 @@ mod tests {
         assert_eq!(
             selected_glyph_text(&glyphs, 8, 0).as_deref(),
             Some("Crisp PDF")
+        );
+    }
+
+    #[test]
+    fn select_all_spans_every_nonempty_pdf_page() {
+        let mut layers = HashMap::new();
+        layers.insert(0, Vec::new());
+        layers.insert(
+            1,
+            vec![TextGlyph {
+                text: "A".to_owned(),
+                bounds: None,
+            }],
+        );
+        layers.insert(
+            2,
+            vec![
+                TextGlyph {
+                    text: "B".to_owned(),
+                    bounds: None,
+                },
+                TextGlyph {
+                    text: "C".to_owned(),
+                    bounds: None,
+                },
+            ],
+        );
+        layers.insert(3, Vec::new());
+
+        assert_eq!(
+            full_document_text_selection(&layers, 4),
+            Some(TextSelection {
+                anchor: TextPosition { page: 1, glyph: 0 },
+                focus: TextPosition { page: 2, glyph: 1 },
+            })
         );
     }
 

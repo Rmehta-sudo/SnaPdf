@@ -45,6 +45,8 @@ install -m 0755 "${PROJECT_ROOT}/target/release/snapdf" "${APPDIR}/usr/bin/snapd
 install -m 0755 "${PROJECT_ROOT}/packaging/appimage/AppRun" "${APPDIR}/AppRun"
 install -m 0755 "${PROJECT_ROOT}/scripts/install-ocr.sh" \
   "${APPDIR}/usr/lib/snapdf/install-ocr.sh"
+install -m 0755 "${PROJECT_ROOT}/scripts/uninstall.sh" \
+  "${APPDIR}/usr/lib/snapdf/uninstall.sh"
 install -m 0644 "${PROJECT_ROOT}/resources/ocr_worker.py" \
   "${APPDIR}/usr/share/snapdf/ocr_worker.py"
 install -m 0644 "${PROJECT_ROOT}/resources/${APP_ID}.desktop" \
