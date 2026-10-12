@@ -28,6 +28,12 @@
   </provides>
   <content_rating type="oars-1.1"/>
   <releases>
+    <release version="0.3.1" date="2026-10-12">
+      <description>
+        <p>Polishes Study chat, adds full-document text selection and copying,
+        compacts the document toolbar, and preserves the user's default PDF viewer.</p>
+      </description>
+    </release>
     <release version="0.3.0" date="2026-10-11">
       <description>
         <p>Renames the application to SnaPdf, adds backward-compatible data
