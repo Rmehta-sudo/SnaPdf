@@ -1,6 +1,6 @@
 use crate::chat::{
     ChatAttachment, ChatCommand, ChatEvent, ChatMessage, ChatProvider, ChatRole, ChatWorker,
-    mime_for_path,
+    ReasoningEffort, mime_for_path, model_supports_reasoning_effort,
 };
 use crate::model::{
     Annotation, AnnotationKind, AppState, RecentDocument, SidebarFileIcons, StudyChatSession,
@@ -18,11 +18,15 @@ use eframe::egui::{
     KeyboardShortcut, Layout, Margin, Modifiers, Rect, Response, RichText, ScrollArea, Sense,
     Stroke, StrokeKind, TextureHandle, TextureOptions, pos2, vec2,
 };
+use latex_rust::{Color as LatexColor, Dim, MathFont, PngOptions, latex_to_png};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::mpsc::{self, Receiver, TryRecvError};
+use std::sync::{
+    OnceLock,
+    mpsc::{self, Receiver, TryRecvError},
+};
 use std::time::{SystemTime, UNIX_EPOCH};
 use walkdir::WalkDir;
 
@@ -348,6 +352,8 @@ pub fn run() -> Result<()> {
             .with_app_id("io.snapdf.SnaPdf")
             .with_inner_size([1360.0, 860.0])
             .with_min_inner_size([820.0, 560.0]),
+        #[cfg(target_os = "linux")]
+        event_loop_builder: linux_event_loop_builder(),
         ..Default::default()
     };
 
@@ -357,6 +363,43 @@ pub fn run() -> Result<()> {
         Box::new(move |creation| Ok(Box::new(SnaPdfApp::new(creation, initial_path)))),
     )
     .map_err(|error| anyhow!(error.to_string()))
+}
+
+/// Winit does not currently expose native touchpad pinch events on Linux
+/// Wayland. When XWayland is available, run SnaPdf's window through X11 so the
+/// XI 2.4 listener can receive real begin/update/end pinch gestures. Respect an
+/// explicit winit backend choice and keep native Wayland on systems without an
+/// X display.
+#[cfg(target_os = "linux")]
+fn linux_event_loop_builder() -> Option<eframe::EventLoopBuilderHook> {
+    if !should_prefer_x11_gestures(
+        std::env::var_os("XDG_SESSION_TYPE").as_deref(),
+        std::env::var_os("WAYLAND_DISPLAY").as_deref(),
+        std::env::var_os("DISPLAY").as_deref(),
+        std::env::var_os("WINIT_UNIX_BACKEND").as_deref(),
+    ) {
+        return None;
+    }
+
+    Some(Box::new(|builder| {
+        use winit::platform::x11::EventLoopBuilderExtX11 as _;
+        builder.with_x11();
+    }))
+}
+
+#[cfg(target_os = "linux")]
+fn should_prefer_x11_gestures(
+    session_type: Option<&std::ffi::OsStr>,
+    wayland_display: Option<&std::ffi::OsStr>,
+    x_display: Option<&std::ffi::OsStr>,
+    explicit_backend: Option<&std::ffi::OsStr>,
+) -> bool {
+    if explicit_backend.is_some() || x_display.is_none() {
+        return false;
+    }
+
+    session_type.is_some_and(|value| value.eq_ignore_ascii_case("wayland"))
+        || wayland_display.is_some()
 }
 
 pub struct SnaPdfApp {
@@ -715,11 +758,13 @@ impl SnaPdfApp {
     }
 
     fn open_file_dialog(&mut self) {
-        if let Some(path) = rfd::FileDialog::new()
+        if let Some(paths) = rfd::FileDialog::new()
             .add_filter("PDF document", &["pdf", "PDF"])
-            .pick_file()
+            .pick_files()
         {
-            self.open_document(path);
+            for path in paths {
+                self.open_document(path);
+            }
         }
     }
 
@@ -1693,6 +1738,7 @@ impl SnaPdfApp {
         let previous_tab = KeyboardShortcut::new(Modifiers::CTRL | Modifiers::SHIFT, Key::Tab);
         let undo = KeyboardShortcut::new(Modifiers::CTRL, Key::Z);
         let redo = KeyboardShortcut::new(Modifiers::CTRL | Modifiers::SHIFT, Key::Z);
+        let toggle_study_chat = KeyboardShortcut::new(Modifiers::CTRL | Modifiers::SHIFT, Key::A);
 
         if self.presentation_mode {
             let (exit, previous, next, zoom_in_pressed, zoom_out_pressed) =
@@ -1746,6 +1792,12 @@ impl SnaPdfApp {
             return;
         }
 
+        if ctx.input_mut(|input| input.consume_shortcut(&toggle_study_chat))
+            && !self.state.hide_study_chat
+        {
+            self.study_chat.visible = !self.study_chat.visible;
+        }
+
         if ctx.input_mut(|input| input.consume_shortcut(&new_project_prefix)) {
             self.project_shortcut_armed_until = Some(ctx.input(|input| input.time + 1.5));
             self.status = "Ctrl+K pressed — press Ctrl+O to add a project folder.".to_owned();
@@ -1791,9 +1843,20 @@ impl SnaPdfApp {
                 self.persist();
             }
         }
+        let selectable_label_has_selection = ctx
+            .plugin::<egui::text_selection::LabelSelectionState>()
+            .lock()
+            .has_selection();
+        let copy_event = ctx.input(|input| {
+            input
+                .events
+                .iter()
+                .any(|event| matches!(event, egui::Event::Copy))
+        });
         if !ctx.egui_wants_keyboard_input()
+            && !selectable_label_has_selection
             && self.text_selection.is_some()
-            && ctx.input_mut(|input| input.consume_shortcut(&copy))
+            && (copy_event || ctx.input_mut(|input| input.consume_shortcut(&copy)))
         {
             self.copy_text_selection(ctx);
         }
@@ -3603,16 +3666,21 @@ impl SnaPdfApp {
     }
 
     fn choose_chat_attachment(&mut self) {
-        if let Some(path) = rfd::FileDialog::new()
+        if let Some(paths) = rfd::FileDialog::new()
             .add_filter(
                 "Study material",
                 &[
                     "pdf", "png", "jpg", "jpeg", "webp", "gif", "txt", "md", "tex", "csv",
                 ],
             )
-            .pick_file()
+            .pick_files()
         {
-            self.add_chat_attachment(path);
+            for path in paths {
+                if self.study_chat.attachments.len() >= 6 {
+                    break;
+                }
+                self.add_chat_attachment(path);
+            }
         }
     }
 
@@ -3632,6 +3700,9 @@ impl SnaPdfApp {
             self.study_chat.status = "Choose a model before sending.".to_owned();
             return;
         };
+        let reasoning_effort = (provider == ChatProvider::ChatGpt
+            && model_supports_reasoning_effort(&model))
+        .then_some(self.state.chat_reasoning_effort);
         if self.study_chat.busy {
             return;
         }
@@ -3682,6 +3753,7 @@ impl SnaPdfApp {
                 request_id,
                 provider,
                 model,
+                reasoning_effort,
                 messages: conversation,
             })
             .is_err()
@@ -3792,7 +3864,7 @@ impl SnaPdfApp {
                         &self.study_chat.prompt,
                         (ui.available_width() - 46.0).max(1.0),
                     );
-                    let footer_height = if connected { 200.0 } else { 176.0 }
+                    let footer_height = if connected { 156.0 } else { 168.0 }
                         + (composer_rows.saturating_sub(1) as f32 * 18.0)
                         + if self.study_chat.attachments.is_empty() { 0.0 } else { 32.0 };
                     let messages = self
@@ -3829,7 +3901,14 @@ impl SnaPdfApp {
                                     && index + 1 == messages.len()
                                     && busy
                                     && active_provider == Some(provider);
-                                if !streaming && chat_message(ui, message, false) {
+                                if !streaming
+                                    && chat_message(
+                                        ui,
+                                        message,
+                                        false,
+                                        self.state.chat_font_size,
+                                    )
+                                {
                                     copied_notice = Some(if message.role == ChatRole::User {
                                         "Prompt copied."
                                     } else {
@@ -3976,19 +4055,6 @@ impl SnaPdfApp {
                                             {
                                                 self.send_chat_message();
                                             }
-                                            for candidate in
-                                                [ChatProvider::Gemini, ChatProvider::ChatGpt]
-                                            {
-                                                if chat_provider_pill(
-                                                    ui,
-                                                    candidate.label(),
-                                                    self.study_chat.provider == candidate,
-                                                )
-                                                .clicked()
-                                                {
-                                                    self.study_chat.provider = candidate;
-                                                }
-                                            }
                                         });
                                     });
                                 });
@@ -4003,66 +4069,205 @@ impl SnaPdfApp {
                             ui.add_space(7.0);
 
                             if connected {
-                                ui.horizontal(|ui| {
-                                    let account = self
-                                        .study_chat
-                                        .accounts
-                                        .get(&provider)
-                                        .cloned()
-                                        .unwrap_or_else(|| format!("{} connected", provider.label()));
-                                    ui.label(
-                                        RichText::new("●")
-                                            .size(9.0)
-                                            .color(Color32::from_rgb(44, 193, 142)),
-                                    );
-                                    ui.add(
-                                        egui::Label::new(
-                                            RichText::new(account)
-                                                .size(10.5)
-                                                .color(Color32::from_rgb(174, 174, 174)),
-                                        )
-                                        .truncate(),
-                                    );
-                                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                                        if ui.small_button("Sign out").clicked() {
-                                            let _ = self
-                                                .chat_worker
-                                                .commands
-                                                .send(ChatCommand::SignOut(provider));
-                                        }
-                                    });
-                                });
                                 let models = self
                                     .study_chat
                                     .models
                                     .get(&provider)
                                     .cloned()
                                     .unwrap_or_default();
-                                let selected = self
+                                let selected_model = self
                                     .study_chat
                                     .selected_models
                                     .entry(provider)
-                                    .or_insert_with(|| models.first().cloned().unwrap_or_default());
-                                ui.horizontal(|ui| {
-                                    ui.label(
-                                        RichText::new("Model")
-                                            .size(10.5)
-                                            .color(Color32::from_rgb(145, 145, 145)),
-                                    );
-                                    egui::ComboBox::from_id_salt(("study-model", provider))
-                                        .width((ui.available_width() - 2.0).max(1.0))
-                                        .selected_text(if selected.is_empty() {
-                                            "Loading models…"
-                                        } else {
-                                            selected.as_str()
-                                        })
-                                        .show_ui(ui, |ui| {
-                                            for model in &models {
-                                                ui.selectable_value(selected, model.clone(), model);
+                                    .or_insert_with(|| models.first().cloned().unwrap_or_default())
+                                    .clone();
+                                let account = self
+                                    .study_chat
+                                    .accounts
+                                    .get(&provider)
+                                    .cloned()
+                                    .unwrap_or_else(|| format!("{} connected", provider.label()));
+                                let reasoning_supported = provider == ChatProvider::ChatGpt
+                                    && model_supports_reasoning_effort(&selected_model);
+                                let mut chosen_provider = None;
+                                let mut chosen_model = None;
+                                let mut chosen_effort = None;
+                                let mut sign_out = false;
+
+                                ui.horizontal_top(|ui| {
+                                    ui.vertical(|ui| {
+                                        ui.label(chat_control_label("AI"));
+                                        let response = chat_dropdown_button(
+                                            ui,
+                                            provider.label(),
+                                            112.0,
+                                            true,
+                                            "Choose AI provider",
+                                        );
+                                        egui::Popup::menu(&response).show(|ui| {
+                                            for candidate in [
+                                                ChatProvider::ChatGpt,
+                                                ChatProvider::Gemini,
+                                            ] {
+                                                if ui
+                                                    .selectable_label(
+                                                        candidate == provider,
+                                                        candidate.label(),
+                                                    )
+                                                    .clicked()
+                                                {
+                                                    chosen_provider = Some(candidate);
+                                                    ui.close();
+                                                }
                                             }
                                         });
+                                        ui.add_space(3.0);
+                                        ui.horizontal(|ui| {
+                                            ui.label(
+                                                RichText::new("●")
+                                                    .size(8.0)
+                                                    .color(CHAT_ACCENT),
+                                            );
+                                            ui.add(
+                                                egui::Label::new(
+                                                    RichText::new(elide(&account, 28))
+                                                        .size(10.0)
+                                                        .color(CHAT_MUTED),
+                                                )
+                                                .truncate(),
+                                            );
+                                            if ui
+                                                .add(
+                                                    egui::Button::new(
+                                                        RichText::new("Sign out")
+                                                            .size(9.5)
+                                                            .color(CHAT_MUTED),
+                                                    )
+                                                    .frame(false),
+                                                )
+                                                .clicked()
+                                            {
+                                                sign_out = true;
+                                            }
+                                        });
+                                    });
+
+                                    ui.with_layout(Layout::right_to_left(Align::TOP), |ui| {
+                                        if reasoning_supported {
+                                            ui.vertical(|ui| {
+                                                ui.label(chat_control_label("Thinking"));
+                                                let response = chat_dropdown_button(
+                                                    ui,
+                                                    self.state.chat_reasoning_effort.label(),
+                                                    104.0,
+                                                    false,
+                                                    "Choose reasoning effort",
+                                                );
+                                                egui::Popup::menu(&response).show(|ui| {
+                                                    for effort in [
+                                                        ReasoningEffort::Instant,
+                                                        ReasoningEffort::Medium,
+                                                        ReasoningEffort::High,
+                                                    ] {
+                                                        if ui
+                                                            .selectable_label(
+                                                                effort
+                                                                    == self.state.chat_reasoning_effort,
+                                                                effort.label(),
+                                                            )
+                                                            .clicked()
+                                                        {
+                                                            chosen_effort = Some(effort);
+                                                            ui.close();
+                                                        }
+                                                    }
+                                                });
+                                            });
+                                            ui.add_space(8.0);
+                                        }
+
+                                        ui.vertical(|ui| {
+                                            ui.label(chat_control_label("Model"));
+                                            let model_text = if selected_model.is_empty() {
+                                                "Loading…"
+                                            } else {
+                                                selected_model.as_str()
+                                            };
+                                            let model_width =
+                                                (model_text.chars().count() as f32 * 7.0 + 38.0)
+                                                    .clamp(132.0, 232.0);
+                                            let response = chat_dropdown_button(
+                                                ui,
+                                                model_text,
+                                                model_width,
+                                                false,
+                                                "Choose model",
+                                            );
+                                            egui::Popup::menu(&response).show(|ui| {
+                                                ui.set_min_width(model_width);
+                                                for model in &models {
+                                                    if ui
+                                                        .selectable_label(
+                                                            *model == selected_model,
+                                                            model,
+                                                        )
+                                                        .clicked()
+                                                    {
+                                                        chosen_model = Some(model.clone());
+                                                        ui.close();
+                                                    }
+                                                }
+                                            });
+                                        });
+                                    });
                                 });
+
+                                if let Some(provider) = chosen_provider {
+                                    self.study_chat.provider = provider;
+                                }
+                                if let Some(model) = chosen_model {
+                                    self.study_chat.selected_models.insert(provider, model);
+                                }
+                                if let Some(effort) = chosen_effort {
+                                    self.state.chat_reasoning_effort = effort;
+                                    self.persist();
+                                }
+                                if sign_out {
+                                    let _ = self
+                                        .chat_worker
+                                        .commands
+                                        .send(ChatCommand::SignOut(provider));
+                                }
                             } else {
+                                let mut chosen_provider = None;
+                                ui.label(chat_control_label("AI"));
+                                let response = chat_dropdown_button(
+                                    ui,
+                                    provider.label(),
+                                    112.0,
+                                    true,
+                                    "Choose AI provider",
+                                );
+                                egui::Popup::menu(&response).show(|ui| {
+                                    for candidate in
+                                        [ChatProvider::ChatGpt, ChatProvider::Gemini]
+                                    {
+                                        if ui
+                                            .selectable_label(
+                                                candidate == provider,
+                                                candidate.label(),
+                                            )
+                                            .clicked()
+                                        {
+                                            chosen_provider = Some(candidate);
+                                            ui.close();
+                                        }
+                                    }
+                                });
+                                if let Some(provider) = chosen_provider {
+                                    self.study_chat.provider = provider;
+                                }
+                                ui.add_space(6.0);
                                 match provider {
                                     ChatProvider::ChatGpt => {
                                         if ui
@@ -4665,6 +4870,9 @@ impl SnaPdfApp {
                                                 if response.drag_started() || response.clicked() {
                                                     if let Some(glyph) = nearest_glyph(glyphs, page_rect, source_size, pointer) {
                                                         ctx.memory_mut(|memory| memory.stop_text_input());
+                                                        ctx.plugin::<egui::text_selection::LabelSelectionState>()
+                                                            .lock()
+                                                            .clear_selection();
                                                         let position = TextPosition { page: index, glyph };
                                                         self.text_selection = Some(TextSelection { anchor: position, focus: position });
                                                         self.text_selection_dragging = response.drag_started();
@@ -5368,6 +5576,7 @@ impl SnaPdfApp {
         let mut open = true;
         let mut toolbar_ratio = self.state.chrome_scale_ratio;
         let mut sidebar_ratio = self.state.sidebar_scale_ratio;
+        let mut chat_font_size = self.state.chat_font_size;
         let mut file_icons = self.state.sidebar_file_icons;
         let mut changed = false;
         egui::Window::new("View settings")
@@ -5426,6 +5635,15 @@ impl SnaPdfApp {
                     .radio_value(&mut file_icons, SidebarFileIcons::None, "No icons")
                     .changed();
                 ui.add_space(10.0);
+                ui.label(RichText::new("Study chat text").size(12.0));
+                changed |= ui
+                    .add(
+                        egui::Slider::new(&mut chat_font_size, 11.0..=20.0)
+                            .step_by(0.5)
+                            .suffix(" pt"),
+                    )
+                    .changed();
+                ui.add_space(10.0);
                 changed |= ui
                     .checkbox(
                         &mut self.state.warn_before_replacing_study_chat,
@@ -5438,6 +5656,11 @@ impl SnaPdfApp {
                         "Hide Study chat and disable its actions",
                     )
                     .changed();
+                ui.label(
+                    RichText::new("Ctrl+Shift+A shows or hides the chat panel when it is enabled.")
+                        .size(10.5)
+                        .color(theme::MUTED),
+                );
             });
         if !open {
             self.show_view_settings = false;
@@ -5445,6 +5668,7 @@ impl SnaPdfApp {
         if changed {
             self.state.chrome_scale_ratio = toolbar_ratio;
             self.state.sidebar_scale_ratio = sidebar_ratio;
+            self.state.chat_font_size = chat_font_size;
             self.state.sidebar_file_icons = file_icons;
             self.state.sidebar_file_icons_initialized = true;
             if self.state.hide_study_chat {
@@ -7340,7 +7564,7 @@ fn chat_status(ui: &mut egui::Ui, status: &str, busy: bool) {
     });
 }
 
-fn chat_message(ui: &mut egui::Ui, message: &ChatMessage, streaming: bool) -> bool {
+fn chat_message(ui: &mut egui::Ui, message: &ChatMessage, streaming: bool, text_size: f32) -> bool {
     let mut copied = false;
     let available = ui.available_width().max(1.0);
     match message.role {
@@ -7358,7 +7582,7 @@ fn chat_message(ui: &mut egui::Ui, message: &ChatMessage, streaming: bool) -> bo
                         .show(ui, |ui| {
                             ui.set_width((bubble_width - 24.0).max(1.0));
                             chat_message_attachments(ui, message);
-                            render_chat_markdown(ui, &message.text);
+                            render_chat_markdown(ui, &message.text, text_size);
                         });
                     ui.allocate_ui_with_layout(
                         vec2(bubble_width, 23.0),
@@ -7385,7 +7609,7 @@ fn chat_message(ui: &mut egui::Ui, message: &ChatMessage, streaming: bool) -> bo
                         });
                     } else {
                         chat_message_attachments(ui, message);
-                        render_chat_markdown(ui, &message.text);
+                        render_chat_markdown(ui, &message.text, text_size);
                         ui.add_space(4.0);
                         if chat_copy_button(ui, "Copy reply").clicked() {
                             ui.ctx().copy_text(message.text.clone());
@@ -7530,31 +7754,64 @@ fn chat_send_button(ui: &mut egui::Ui, enabled: bool) -> Response {
     response.on_hover_text("Send message (Enter)")
 }
 
-fn chat_provider_pill(ui: &mut egui::Ui, label: &str, selected: bool) -> Response {
-    let text =
-        RichText::new(label)
-            .size(10.5)
-            .color(if selected { Color32::WHITE } else { CHAT_MUTED });
-    ui.add(
-        egui::Button::new(text)
-            .fill(if selected {
-                CHAT_ACCENT
-            } else {
-                Color32::from_rgb(42, 42, 42)
-            })
-            .stroke(Stroke::new(
-                1.0,
-                if selected {
-                    CHAT_ACCENT
-                } else {
-                    Color32::from_rgb(62, 62, 62)
-                },
-            ))
-            .corner_radius(CornerRadius::same(10)),
-    )
+fn chat_control_label(label: &str) -> RichText {
+    RichText::new(label).size(9.5).color(CHAT_MUTED)
 }
 
-fn render_chat_markdown(ui: &mut egui::Ui, markdown: &str) {
+fn chat_dropdown_button(
+    ui: &mut egui::Ui,
+    label: &str,
+    width: f32,
+    accent: bool,
+    help: &str,
+) -> Response {
+    let (rect, response) = ui.allocate_exact_size(vec2(width, 28.0), Sense::click());
+    let fill = if accent {
+        if response.hovered() {
+            Color32::from_rgb(27, 177, 137)
+        } else {
+            CHAT_ACCENT
+        }
+    } else if response.hovered() {
+        Color32::from_rgb(54, 54, 54)
+    } else {
+        Color32::from_rgb(43, 43, 43)
+    };
+    ui.painter().rect_filled(rect, CornerRadius::same(14), fill);
+    ui.painter().rect_stroke(
+        rect,
+        CornerRadius::same(14),
+        Stroke::new(
+            1.0,
+            if accent {
+                CHAT_ACCENT
+            } else {
+                Color32::from_rgb(67, 67, 67)
+            },
+        ),
+        StrokeKind::Inside,
+    );
+    ui.painter().text(
+        pos2(rect.left() + 12.0, rect.center().y),
+        Align2::LEFT_CENTER,
+        label,
+        FontId::proportional(10.5),
+        if accent { Color32::WHITE } else { CHAT_TEXT },
+    );
+    let center = pos2(rect.right() - 13.0, rect.center().y + 1.0);
+    ui.painter().add(egui::Shape::convex_polygon(
+        vec![
+            center + vec2(-3.5, -2.0),
+            center + vec2(3.5, -2.0),
+            center + vec2(0.0, 2.5),
+        ],
+        if accent { Color32::WHITE } else { CHAT_MUTED },
+        Stroke::NONE,
+    ));
+    response.on_hover_text(help)
+}
+
+fn render_chat_markdown(ui: &mut egui::Ui, markdown: &str, base_size: f32) {
     if markdown.is_empty() {
         return;
     }
@@ -7592,7 +7849,7 @@ fn render_chat_markdown(ui: &mut egui::Ui, markdown: &str) {
                         egui::Label::new(
                             RichText::new(code)
                                 .monospace()
-                                .size(11.5)
+                                .size((base_size - 1.0).max(10.0))
                                 .color(Color32::from_rgb(220, 220, 220)),
                         )
                         .wrap()
@@ -7608,13 +7865,13 @@ fn render_chat_markdown(ui: &mut egui::Ui, markdown: &str) {
             continue;
         }
         if let Some((level, heading)) = markdown_heading(trimmed) {
-            markdown_label(
+            render_chat_rich_text(
                 ui,
                 heading,
                 match level {
-                    1 => 19.0,
-                    2 => 17.0,
-                    _ => 15.0,
+                    1 => base_size + 6.0,
+                    2 => base_size + 4.0,
+                    _ => base_size + 2.0,
                 },
                 Color32::from_rgb(248, 248, 248),
                 true,
@@ -7634,30 +7891,51 @@ fn render_chat_markdown(ui: &mut egui::Ui, markdown: &str) {
                 );
                 index += 1;
             }
-            Frame::new()
-                .fill(Color32::from_rgb(39, 47, 45))
-                .stroke(Stroke::new(1.0, Color32::from_rgb(49, 102, 88)))
-                .corner_radius(CornerRadius::same(6))
-                .inner_margin(Margin::symmetric(10, 7))
+            let quote_response = Frame::new()
+                .inner_margin(Margin {
+                    left: 10,
+                    right: 2,
+                    top: 3,
+                    bottom: 3,
+                })
                 .show(ui, |ui| {
                     ui.set_width(ui.available_width().max(1.0));
-                    markdown_label(
-                        ui,
-                        &quote.join(" "),
-                        12.5,
-                        Color32::from_rgb(216, 229, 225),
-                        false,
-                    );
+                    render_chat_rich_text(ui, &quote.join(" "), base_size, CHAT_TEXT, false);
                 });
+            ui.painter().line_segment(
+                [
+                    quote_response.response.rect.left_top(),
+                    quote_response.response.rect.left_bottom(),
+                ],
+                Stroke::new(2.0, Color32::from_rgb(104, 104, 104)),
+            );
             ui.add_space(4.0);
+            continue;
+        }
+        if let Some(table) = markdown_table(&lines, index) {
+            render_markdown_table(ui, &table, base_size);
+            index += table.consumed;
+            ui.add_space(5.0);
+            continue;
+        }
+        if let Some((formula, consumed)) = display_math_block(&lines, index) {
+            render_chat_math(ui, &formula, base_size, true);
+            index += consumed;
+            ui.add_space(3.0);
+            continue;
+        }
+        if let Some(formula) = display_math_line(trimmed) {
+            render_chat_math(ui, formula, base_size, true);
+            index += 1;
+            ui.add_space(3.0);
             continue;
         }
         if let Some(item) = markdown_bullet(trimmed) {
             ui.horizontal(|ui| {
-                ui.label(RichText::new("•").size(15.0).color(CHAT_ACCENT));
+                ui.label(RichText::new("•").size(base_size + 2.0).color(CHAT_ACCENT));
                 ui.vertical(|ui| {
                     ui.set_width(ui.available_width().max(1.0));
-                    markdown_label(ui, item, 13.0, CHAT_TEXT, false);
+                    render_chat_rich_text(ui, item, base_size, CHAT_TEXT, false);
                 });
             });
             index += 1;
@@ -7667,12 +7945,12 @@ fn render_chat_markdown(ui: &mut egui::Ui, markdown: &str) {
             ui.horizontal(|ui| {
                 ui.label(
                     RichText::new(format!("{number}."))
-                        .size(12.5)
+                        .size(base_size)
                         .color(CHAT_ACCENT),
                 );
                 ui.vertical(|ui| {
                     ui.set_width(ui.available_width().max(1.0));
-                    markdown_label(ui, item, 13.0, CHAT_TEXT, false);
+                    render_chat_rich_text(ui, item, base_size, CHAT_TEXT, false);
                 });
             });
             index += 1;
@@ -7688,8 +7966,297 @@ fn render_chat_markdown(ui: &mut egui::Ui, markdown: &str) {
             paragraph.push(lines[index].trim());
             index += 1;
         }
-        markdown_label(ui, &paragraph.join(" "), 13.0, CHAT_TEXT, false);
+        render_chat_rich_text(ui, &paragraph.join(" "), base_size, CHAT_TEXT, false);
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct MarkdownTable {
+    headers: Vec<String>,
+    rows: Vec<Vec<String>>,
+    consumed: usize,
+}
+
+fn markdown_table(lines: &[&str], start: usize) -> Option<MarkdownTable> {
+    let headers = markdown_table_cells(lines.get(start)?)?;
+    let separators = markdown_table_cells(lines.get(start + 1)?)?;
+    if headers.is_empty()
+        || headers.len() != separators.len()
+        || !separators.iter().all(|cell| {
+            let core = cell.trim().trim_start_matches(':').trim_end_matches(':');
+            core.len() >= 3 && core.chars().all(|character| character == '-')
+        })
+    {
+        return None;
+    }
+    let mut rows = Vec::new();
+    let mut consumed = 2;
+    while let Some(line) = lines.get(start + consumed) {
+        let Some(cells) = markdown_table_cells(line) else {
+            break;
+        };
+        if cells.len() != headers.len() {
+            break;
+        }
+        rows.push(cells);
+        consumed += 1;
+    }
+    Some(MarkdownTable {
+        headers,
+        rows,
+        consumed,
+    })
+}
+
+fn markdown_table_cells(line: &str) -> Option<Vec<String>> {
+    let trimmed = line.trim();
+    if !trimmed.contains('|') {
+        return None;
+    }
+    let body = trimmed.strip_prefix('|').unwrap_or(trimmed);
+    let body = body.strip_suffix('|').unwrap_or(body);
+    let cells = body
+        .split('|')
+        .map(|cell| cell.trim().to_owned())
+        .collect::<Vec<_>>();
+    (cells.len() >= 2).then_some(cells)
+}
+
+fn render_markdown_table(ui: &mut egui::Ui, table: &MarkdownTable, base_size: f32) {
+    let columns = table.headers.len().max(1);
+    // Reserve the outer one-point border on both sides so the table never widens its chat panel.
+    let width = (ui.available_width() - 2.0).max(1.0);
+    let cell_width = (width / columns as f32).max(42.0);
+    Frame::new()
+        .stroke(Stroke::new(1.0, Color32::from_rgb(61, 61, 61)))
+        .corner_radius(CornerRadius::same(6))
+        .fill(Color32::from_rgb(31, 31, 31))
+        .inner_margin(Margin::ZERO)
+        .show(ui, |ui| {
+            let mut cells = Vec::new();
+            let grid = egui::Grid::new(ui.next_auto_id())
+                .num_columns(columns)
+                .striped(false)
+                .spacing(egui::Vec2::ZERO)
+                .show(ui, |ui| {
+                    for (row_index, row) in std::iter::once(&table.headers)
+                        .chain(table.rows.iter())
+                        .enumerate()
+                    {
+                        for cell in row {
+                            let response = Frame::new()
+                                .fill(if row_index == 0 {
+                                    Color32::from_rgb(39, 39, 39)
+                                } else if row_index % 2 == 0 {
+                                    Color32::from_rgb(34, 34, 34)
+                                } else {
+                                    Color32::from_rgb(30, 30, 30)
+                                })
+                                .inner_margin(Margin::symmetric(8, 6))
+                                .show(ui, |ui| {
+                                    ui.set_min_width((cell_width - 16.0).max(1.0));
+                                    ui.set_max_width((cell_width - 16.0).max(1.0));
+                                    render_chat_rich_text(
+                                        ui,
+                                        cell,
+                                        base_size,
+                                        CHAT_TEXT,
+                                        row_index == 0,
+                                    );
+                                })
+                                .response;
+                            cells.push((row_index, response.rect));
+                        }
+                        ui.end_row();
+                    }
+                });
+
+            let border = Stroke::new(1.0, Color32::from_rgb(61, 61, 61));
+            for (row_index, rect) in cells {
+                if rect.right() < grid.response.rect.right() - 0.5 {
+                    ui.painter()
+                        .line_segment([rect.right_top(), rect.right_bottom()], border);
+                }
+                if row_index < table.rows.len() {
+                    ui.painter()
+                        .line_segment([rect.left_bottom(), rect.right_bottom()], border);
+                }
+            }
+        });
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ChatTextSegment<'a> {
+    Text(&'a str),
+    Math(&'a str, bool),
+}
+
+fn chat_text_segments(text: &str) -> Vec<ChatTextSegment<'_>> {
+    let delimiters = [
+        (r"\[", r"\]", true),
+        ("$$", "$$", true),
+        (r"\(", r"\)", false),
+        ("$", "$", false),
+    ];
+    let mut segments = Vec::new();
+    let mut cursor = 0;
+    while cursor < text.len() {
+        let next = delimiters
+            .iter()
+            .filter_map(|(open, close, display)| {
+                text[cursor..]
+                    .find(open)
+                    .map(|offset| (cursor + offset, *open, *close, *display))
+            })
+            .filter(|(position, open, _, _)| {
+                *open != "$" || *position == 0 || text.as_bytes()[position - 1] != b'\\'
+            })
+            .min_by_key(|(position, open, _, _)| (*position, usize::MAX - open.len()));
+        let Some((start, open, close, display)) = next else {
+            segments.push(ChatTextSegment::Text(&text[cursor..]));
+            break;
+        };
+        let body_start = start + open.len();
+        let Some(relative_end) = text[body_start..].find(close) else {
+            segments.push(ChatTextSegment::Text(&text[cursor..]));
+            break;
+        };
+        let end = body_start + relative_end;
+        if start > cursor {
+            segments.push(ChatTextSegment::Text(&text[cursor..start]));
+        }
+        let formula = text[body_start..end].trim();
+        if formula.is_empty() {
+            segments.push(ChatTextSegment::Text(&text[start..end + close.len()]));
+        } else {
+            segments.push(ChatTextSegment::Math(formula, display));
+        }
+        cursor = end + close.len();
+    }
+    if segments.is_empty() {
+        segments.push(ChatTextSegment::Text(text));
+    }
+    segments
+}
+
+fn display_math_line(line: &str) -> Option<&str> {
+    if let Some(body) = line
+        .strip_prefix(r"\[")
+        .and_then(|body| body.strip_suffix(r"\]"))
+    {
+        return (!body.trim().is_empty()).then_some(body.trim());
+    }
+    line.strip_prefix("$$")
+        .and_then(|body| body.strip_suffix("$$"))
+        .map(str::trim)
+        .filter(|body| !body.is_empty())
+}
+
+fn display_math_block(lines: &[&str], start: usize) -> Option<(String, usize)> {
+    let opening = lines.get(start)?.trim();
+    let closing = match opening {
+        r"\[" => r"\]",
+        "$$" => "$$",
+        _ => return None,
+    };
+    let mut formula = Vec::new();
+    let mut index = start + 1;
+    while let Some(line) = lines.get(index) {
+        if line.trim() == closing {
+            return (!formula.is_empty()).then(|| (formula.join(" "), index - start + 1));
+        }
+        formula.push(line.trim());
+        index += 1;
+    }
+    None
+}
+
+fn render_chat_rich_text(ui: &mut egui::Ui, text: &str, size: f32, color: Color32, strong: bool) {
+    let segments = chat_text_segments(text);
+    if !segments
+        .iter()
+        .any(|segment| matches!(segment, ChatTextSegment::Math(_, _)))
+    {
+        markdown_label(ui, text, size, color, strong);
+        return;
+    }
+    ui.horizontal_wrapped(|ui| {
+        ui.spacing_mut().item_spacing.x = 2.0;
+        for segment in segments {
+            match segment {
+                ChatTextSegment::Text(text) if !text.is_empty() => {
+                    let mut job = markdown_inline_job(ui, text, size, color, strong);
+                    job.wrap.max_width = ui.available_width().max(1.0);
+                    ui.add(egui::Label::new(job).wrap().selectable(true));
+                }
+                ChatTextSegment::Math(formula, display) => {
+                    render_chat_math(ui, formula, size, display);
+                }
+                ChatTextSegment::Text(_) => {}
+            }
+        }
+    });
+}
+
+#[derive(Clone)]
+struct CachedChatMath {
+    texture: TextureHandle,
+    size: egui::Vec2,
+}
+
+fn render_chat_math(ui: &mut egui::Ui, formula: &str, size: f32, display: bool) {
+    let cache_id = egui::Id::new(("chat-math", formula, (size * 2.0).round() as i32, display));
+    let cached = ui
+        .ctx()
+        .data_mut(|data| data.get_temp::<CachedChatMath>(cache_id));
+    let cached = cached.or_else(|| {
+        let font = chat_math_font()?;
+        let mut options = PngOptions::new();
+        options.font_size_pt = Dim::from_i64(size.round().max(10.0) as i64);
+        options.dpi = Dim::from_i64(144);
+        options.color = LatexColor::rgb(CHAT_TEXT.r(), CHAT_TEXT.g(), CHAT_TEXT.b());
+        options.display = display;
+        let png = latex_to_png(formula, font, &options).ok()?;
+        let image = image::load_from_memory(&png).ok()?.into_rgba8();
+        let dimensions = [image.width() as usize, image.height() as usize];
+        let pixels = image.into_raw();
+        let texture = ui.ctx().load_texture(
+            format!("chat-math-{cache_id:?}"),
+            ColorImage::from_rgba_unmultiplied(dimensions, &pixels),
+            TextureOptions::LINEAR,
+        );
+        let rendered = CachedChatMath {
+            texture,
+            size: vec2(dimensions[0] as f32 / 2.0, dimensions[1] as f32 / 2.0),
+        };
+        ui.ctx()
+            .data_mut(|data| data.insert_temp(cache_id, rendered.clone()));
+        Some(rendered)
+    });
+    if let Some(cached) = cached {
+        let max_width = ui.available_width().max(1.0);
+        let scale = (max_width / cached.size.x.max(1.0)).min(1.0);
+        let image = egui::Image::new((cached.texture.id(), cached.size * scale));
+        if display {
+            ui.with_layout(Layout::top_down(Align::Center), |ui| {
+                ui.add(image);
+            });
+        } else {
+            ui.add(image);
+        }
+    } else {
+        ui.label(
+            RichText::new(formula)
+                .monospace()
+                .size(size)
+                .color(CHAT_TEXT),
+        );
+    }
+}
+
+fn chat_math_font() -> Option<&'static MathFont> {
+    static FONT: OnceLock<Option<MathFont>> = OnceLock::new();
+    FONT.get_or_init(|| MathFont::stix_two_math().ok()).as_ref()
 }
 
 fn markdown_heading(line: &str) -> Option<(usize, &str)> {
@@ -7723,6 +8290,9 @@ fn markdown_block_start(line: &str) -> bool {
         || line.starts_with('>')
         || markdown_bullet(line).is_some()
         || markdown_ordered_item(line).is_some()
+        || display_math_line(line).is_some()
+        || matches!(line, r"\[" | "$$")
+        || line.contains('|')
 }
 
 fn markdown_label(ui: &mut egui::Ui, text: &str, size: f32, color: Color32, strong: bool) {
@@ -9160,7 +9730,7 @@ mod tests {
             };
             let response = ui.scope(|ui| {
                 ui.set_width(180.0);
-                chat_message(ui, &message, false);
+                chat_message(ui, &message, false, 14.5);
             });
             assert!(
                 response.response.rect.width() <= 180.0,
@@ -9191,7 +9761,7 @@ mod tests {
             };
             let response = ui.scope(|ui| {
                 ui.set_width(360.0);
-                chat_message(ui, &message, false);
+                chat_message(ui, &message, false, 14.5);
             });
             assert!(
                 response.response.rect.height() < 120.0,
@@ -9233,6 +9803,76 @@ mod tests {
             );
             assert_eq!(job.text, "Bold and italic with code and a link");
             assert!(job.sections.len() >= 4);
+        });
+    }
+
+    #[test]
+    fn chat_math_parser_recognizes_inline_and_display_latex() {
+        let segments = chat_text_segments(
+            r"Distance \(D=a\chi\), then \[v=\frac{dD}{dt}\] at the present time.",
+        );
+        assert!(segments.contains(&ChatTextSegment::Math(r"D=a\chi", false)));
+        assert!(segments.contains(&ChatTextSegment::Math(r"v=\frac{dD}{dt}", true)));
+
+        let block_lines = [r"\[", r"v=\frac{dD}{dt}", r"\]"];
+        assert_eq!(
+            display_math_block(&block_lines, 0),
+            Some((r"v=\frac{dD}{dt}".to_owned(), 3))
+        );
+    }
+
+    #[test]
+    fn screenshot_equations_render_to_real_math_images() {
+        let font = chat_math_font().expect("embedded STIX Two Math font");
+        for formula in [
+            r"D(t)=a(t)\chi",
+            r"v=\frac{dD}{dt}=\dot a(t)\chi",
+            r"v=\dot a\frac{D}{a}=\underbrace{\frac{\dot a}{a}}_{H(t)}D",
+        ] {
+            let mut options = PngOptions::new();
+            options.font_size_pt = Dim::from_i64(15);
+            options.dpi = Dim::from_i64(144);
+            options.display = true;
+            let png = latex_to_png(formula, font, &options).expect("equation should render");
+            assert!(png.starts_with(b"\x89PNG"));
+        }
+    }
+
+    #[test]
+    fn markdown_tables_are_parsed_as_rows_instead_of_plain_pipe_text() {
+        let lines = [
+            r"| Scale factor \(a\) | Distance \(D=a\chi\) |",
+            "|---|---|",
+            "| 1 | 3 |",
+            "| 2 | 6 |",
+        ];
+        let table = markdown_table(&lines, 0).expect("valid Markdown table");
+        assert_eq!(table.headers.len(), 2);
+        assert_eq!(table.rows, vec![vec!["1", "3"], vec!["2", "6"]]);
+        assert_eq!(table.consumed, 4);
+    }
+
+    #[test]
+    fn markdown_table_grid_stays_inside_the_chat_panel() {
+        egui::__run_test_ui(|ui| {
+            ui.set_width(360.0);
+            let table = MarkdownTable {
+                headers: vec![
+                    r"Scale factor \(a\)".to_owned(),
+                    r"Distance \(D=a\chi\)".to_owned(),
+                ],
+                rows: vec![vec!["1".to_owned(), "3".to_owned()]],
+                consumed: 3,
+            };
+            let response = ui.scope(|ui| {
+                ui.set_width(360.0);
+                render_markdown_table(ui, &table, 16.0);
+            });
+            assert!(
+                response.response.rect.width() <= 360.0,
+                "table expanded to {} points",
+                response.response.rect.width()
+            );
         });
     }
 
@@ -9445,6 +10085,38 @@ mod tests {
         assert!(trackpad_pinch_factor(&[precision_pinch]) > 1.0);
         assert_eq!(trackpad_pinch_factor(&[mouse_wheel]), 1.0);
     }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn wayland_session_prefers_x11_when_xwayland_is_available() {
+        use std::ffi::OsStr;
+
+        assert!(should_prefer_x11_gestures(
+            Some(OsStr::new("wayland")),
+            Some(OsStr::new("wayland-0")),
+            Some(OsStr::new(":0")),
+            None,
+        ));
+        assert!(!should_prefer_x11_gestures(
+            Some(OsStr::new("wayland")),
+            Some(OsStr::new("wayland-0")),
+            None,
+            None,
+        ));
+        assert!(!should_prefer_x11_gestures(
+            Some(OsStr::new("wayland")),
+            Some(OsStr::new("wayland-0")),
+            Some(OsStr::new(":0")),
+            Some(OsStr::new("wayland")),
+        ));
+        assert!(!should_prefer_x11_gestures(
+            Some(OsStr::new("x11")),
+            None,
+            Some(OsStr::new(":0")),
+            None,
+        ));
+    }
+
     #[test]
     fn pinch_preserves_document_point_using_absolute_scroll_offset() {
         let pages = [[400.0, 600.0], [400.0, 800.0]];

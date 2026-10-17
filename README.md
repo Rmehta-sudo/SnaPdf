@@ -152,11 +152,13 @@ Click the chat-bubble button in the document toolbar to open the resizable panel
 - **ChatGPT:** click **Continue with ChatGPT**. Sign-in happens in your normal browser through OpenAI's [official open-source account flow](https://developers.openai.com/siwc/token-sharing-open-source); SnaPdf never sees your password. Available models are loaded from your eligible account after sign-in.
 - **Gemini:** click **Connect Gemini** and paste a key created in [Google AI Studio](https://aistudio.google.com/app/apikey). Available Gemini models are loaded after the key is validated. A direct Google-account sign-in requires SnaPdf to have a registered Google OAuth client, so the portable open-source build deliberately uses the official user-owned API-key route instead of pretending to provide OAuth.
 
-Use the paperclip button in the composer to attach a PDF, image, or text file. **Attach current PDF** sends the document you are reading. The capture button beside it changes the cursor into a crosshair; drag around a diagram, equation, map, or paragraph and the exact rendered region is added as an image—without sending it through Math OCR.
+Use the paperclip button in the composer to attach one or several PDFs, images, or text files in a single selection. **Attach current PDF** adds the document you are reading. The capture button beside it changes the cursor into a crosshair; drag around a diagram, equation, map, or paragraph and the exact rendered region is added as an image—without sending it through Math OCR.
 
 Select ordinary PDF text and click **Ask** to attach it directly. After a normal Snip OCR operation, click **Add to study chat** to do the same with recognized text; it is not copied to the clipboard. Attachments remain local until you press **Send**. Each provider keeps a separate on-screen conversation; when you send, SnaPdf transmits that conversation's history and chosen attachments to that provider so follow-up questions retain context. SnaPdf does not upload projects or PDFs in the background.
 
-`Enter` sends a chat message; `Shift+Enter` adds another line. Remove an attachment with its `×` before sending, or close the study panel without affecting the PDF. Closing the panel or SnaPdf does not delete a conversation. Use the chat selector to move between the five saved conversations, the new-chat button to start another, and the separate trash button to delete the current chat. When all five slots are occupied, SnaPdf warns before replacing the least recently opened chat; that warning can be disabled in the dialog or View settings.
+`Enter` sends a chat message; `Shift+Enter` adds another line. Remove an attachment with its `×` before sending, or close the study panel without affecting the PDF. Chat replies render Markdown, tables, inline equations, and display equations directly in the conversation. Compatible ChatGPT reasoning models also show an **Instant / Medium / High** thinking selector; this sends the provider's real reasoning-effort setting rather than changing the wording of your prompt.
+
+Closing the panel or SnaPdf does not delete a conversation. Press `Ctrl+Shift+A` to show or hide the panel without reaching for the mouse. Use the chat selector to move between the five saved conversations, the new-chat button to start another, and the separate trash button to delete the current chat. When all five slots are occupied, SnaPdf warns before replacing the least recently opened chat; that warning can be disabled in the dialog or View settings. The chat message font size can also be adjusted independently in View settings.
 
 If you do not want chat features in the reading workspace, enable **Hide Study chat and disable its actions** in View settings. This removes the chat button and the Ask/OCR-to-chat actions until the setting is switched off.
 
@@ -193,9 +195,10 @@ The controls beside the annotation tools provide three focused views:
 
 | Shortcut | Action |
 | --- | --- |
-| `Ctrl+O` | Open a PDF |
+| `Ctrl+O` | Open one or several PDFs |
 | `Ctrl+K`, then `Ctrl+O` | Add a project folder |
 | `Ctrl+F` | Open Search |
+| `Ctrl+Shift+A` | Show or hide Study chat |
 | `Ctrl+P` | Print |
 | `Ctrl+W` | Close the current tab |
 | `Ctrl+Shift+T` | Restore the most recently closed tab |

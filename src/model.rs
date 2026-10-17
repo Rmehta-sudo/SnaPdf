@@ -1,4 +1,4 @@
-use crate::chat::{ChatMessage, ChatProvider};
+use crate::chat::{ChatMessage, ChatProvider, ReasoningEffort};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -62,6 +62,12 @@ pub struct AppState {
     /// Completely removes Study chat and all of its entry points from the interface.
     #[serde(default)]
     pub hide_study_chat: bool,
+    /// Message text size inside Study chat only; surrounding application chrome is unaffected.
+    #[serde(default = "default_chat_font_size")]
+    pub chat_font_size: f32,
+    /// Reasoning effort used by compatible ChatGPT models.
+    #[serde(default)]
+    pub chat_reasoning_effort: ReasoningEffort,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -165,6 +171,10 @@ fn default_chrome_scale_ratio() -> f32 {
 
 fn default_sidebar_scale_ratio() -> f32 {
     0.8
+}
+
+fn default_chat_font_size() -> f32 {
+    16.0
 }
 
 impl Project {
@@ -362,6 +372,11 @@ impl AppState {
         } else {
             self.sidebar_scale_ratio.clamp(0.5, 1.25)
         };
+        self.chat_font_size = if self.chat_font_size <= 0.0 {
+            default_chat_font_size()
+        } else {
+            self.chat_font_size.clamp(11.0, 20.0)
+        };
         if !self.sidebar_file_icons_initialized {
             self.sidebar_file_icons = SidebarFileIcons::None;
             self.sidebar_file_icons_initialized = true;
@@ -441,6 +456,8 @@ mod tests {
     fn legacy_state_uses_sixty_percent_chrome_ratio() {
         let state: AppState = serde_json::from_str("{}").expect("legacy state should deserialize");
         assert!((state.chrome_scale_ratio - 0.6).abs() < f32::EPSILON);
+        assert!((state.chat_font_size - 16.0).abs() < f32::EPSILON);
+        assert_eq!(state.chat_reasoning_effort, ReasoningEffort::Medium);
         assert_eq!(state.sidebar_file_icons, SidebarFileIcons::None);
     }
 

@@ -45,6 +45,41 @@ pub enum ChatRole {
     Assistant,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ReasoningEffort {
+    /// Low API reasoning effort: the closest Responses API equivalent to ChatGPT Instant.
+    Instant,
+    #[default]
+    Medium,
+    High,
+}
+
+impl ReasoningEffort {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Instant => "Instant",
+            Self::Medium => "Medium",
+            Self::High => "High",
+        }
+    }
+
+    fn api_value(self) -> &'static str {
+        match self {
+            Self::Instant => "low",
+            Self::Medium => "medium",
+            Self::High => "high",
+        }
+    }
+}
+
+pub fn model_supports_reasoning_effort(model: &str) -> bool {
+    let model = model.to_ascii_lowercase();
+    ["gpt-5", "gpt-6", "o1", "o3", "o4"]
+        .iter()
+        .any(|prefix| model.starts_with(prefix))
+}
+
 #[derive(Debug, Clone)]
 pub struct ChatAttachment {
     pub name: String,
@@ -94,6 +129,7 @@ pub enum ChatCommand {
         request_id: u64,
         provider: ChatProvider,
         model: String,
+        reasoning_effort: Option<ReasoningEffort>,
         messages: Vec<ChatMessage>,
     },
     Shutdown,
@@ -222,6 +258,7 @@ fn worker_loop(
                 request_id,
                 provider,
                 model,
+                reasoning_effort,
                 messages,
             } => match provider {
                 ChatProvider::ChatGpt => send_openai(
@@ -230,6 +267,7 @@ fn worker_loop(
                     &mut credentials,
                     request_id,
                     &model,
+                    reasoning_effort,
                     &messages,
                 ),
                 ChatProvider::Gemini => send_gemini(
@@ -660,6 +698,7 @@ fn send_openai(
     credentials: &mut Credentials,
     request_id: u64,
     model: &str,
+    reasoning_effort: Option<ReasoningEffort>,
     messages: &[ChatMessage],
 ) -> Result<()> {
     let token = ensure_openai_token(client, credentials)?;
@@ -667,15 +706,11 @@ fn send_openai(
         .iter()
         .map(openai_message)
         .collect::<Result<Vec<_>>>()?;
+    let body = openai_request_body(model, reasoning_effort, input);
     let response = client
         .post(format!("{OPENAI_API}/responses"))
         .bearer_auth(token)
-        .json(&json!({
-            "model": model,
-            "store": false,
-            "stream": true,
-            "input": input,
-        }))
+        .json(&body)
         .send()?;
     stream_sse(
         response,
@@ -694,6 +729,23 @@ fn send_openai(
     )?;
     let _ = events.send(ChatEvent::ResponseComplete { request_id });
     Ok(())
+}
+
+fn openai_request_body(
+    model: &str,
+    reasoning_effort: Option<ReasoningEffort>,
+    input: Vec<Value>,
+) -> Value {
+    let mut body = json!({
+        "model": model,
+        "store": false,
+        "stream": true,
+        "input": input,
+    });
+    if let Some(effort) = reasoning_effort {
+        body["reasoning"] = json!({"effort": effort.api_value()});
+    }
+    body
 }
 
 fn openai_message(message: &ChatMessage) -> Result<Value> {
@@ -939,5 +991,22 @@ mod tests {
         let restored: ChatMessage = serde_json::from_str(&encoded).unwrap();
         assert_eq!(restored.text, "Explain the figure");
         assert!(restored.attachments.is_empty());
+    }
+
+    #[test]
+    fn openai_reasoning_effort_is_only_added_when_requested() {
+        let instant = openai_request_body("gpt-5.2", Some(ReasoningEffort::Instant), Vec::new());
+        assert_eq!(instant["reasoning"]["effort"], "low");
+        let high = openai_request_body("gpt-5.2", Some(ReasoningEffort::High), Vec::new());
+        assert_eq!(high["reasoning"]["effort"], "high");
+        let unsupported = openai_request_body("gpt-4o", None, Vec::new());
+        assert!(unsupported.get("reasoning").is_none());
+    }
+
+    #[test]
+    fn reasoning_picker_is_limited_to_reasoning_model_families() {
+        assert!(model_supports_reasoning_effort("gpt-5.2"));
+        assert!(model_supports_reasoning_effort("o3"));
+        assert!(!model_supports_reasoning_effort("gpt-4o"));
     }
 }

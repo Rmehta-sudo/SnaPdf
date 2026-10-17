@@ -28,6 +28,14 @@
   </provides>
   <content_rating type="oars-1.1"/>
   <releases>
+    <release version="0.3.2" date="2026-10-17">
+      <description>
+        <p>Restores native trackpad pinch-to-zoom after a desktop session switches from X11 to Wayland.</p>
+        <p>Improves Study chat with rendered equations and Markdown tables,
+        adjustable text size and reasoning effort, a panel shortcut, and
+        multi-file attachments. The Open dialog now supports multiple PDFs.</p>
+      </description>
+    </release>
     <release version="0.3.1" date="2026-10-12">
       <description>
         <p>Polishes Study chat, adds full-document text selection and copying,
