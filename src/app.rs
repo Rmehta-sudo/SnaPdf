@@ -546,6 +546,7 @@ pub struct SnaPdfApp {
     browser_scan: Option<Receiver<BrowserScanResult>>,
     pinned_comment: Option<u64>,
     show_view_settings: bool,
+    pdf_default_application: Option<String>,
     confirm_save_to_source: bool,
     pending_source_save: Option<(PathBuf, PathBuf)>,
 }
@@ -673,6 +674,7 @@ impl SnaPdfApp {
             browser_scan: None,
             pinned_comment: None,
             show_view_settings: false,
+            pdf_default_application: None,
             confirm_save_to_source: false,
             pending_source_save: None,
         };
@@ -2273,6 +2275,7 @@ impl SnaPdfApp {
                         .on_hover_text("View settings")
                         .clicked()
                     {
+                        self.pdf_default_application = current_pdf_default_application();
                         self.show_view_settings = true;
                     }
                 });
@@ -5875,6 +5878,7 @@ impl SnaPdfApp {
         let mut chat_font_size = self.state.chat_font_size;
         let mut file_icons = self.state.sidebar_file_icons;
         let mut changed = false;
+        let mut set_default_pdf_viewer = false;
         egui::Window::new("View settings")
             .open(&mut open)
             .collapsible(false)
@@ -5957,7 +5961,45 @@ impl SnaPdfApp {
                         .size(10.5)
                         .color(theme::MUTED),
                 );
+                ui.add_space(10.0);
+                ui.separator();
+                ui.add_space(4.0);
+                ui.label(RichText::new("Default PDF application").size(12.0));
+                let current_default = self.pdf_default_application.clone();
+                let is_default = current_default
+                    .as_deref()
+                    .is_some_and(|desktop_id| desktop_id == "io.snapdf.SnaPdf.desktop");
+                ui.label(
+                    RichText::new(if is_default {
+                        "SnaPdf is currently your default PDF application."
+                    } else {
+                        "Installation never changes this; choose it only if you want to."
+                    })
+                    .size(10.5)
+                    .color(theme::MUTED),
+                );
+                let button_label = if is_default {
+                    "SnaPdf is the default"
+                } else {
+                    "Make SnaPdf the default PDF app"
+                };
+                if ui
+                    .add_enabled(!is_default, egui::Button::new(button_label))
+                    .clicked()
+                {
+                    set_default_pdf_viewer = true;
+                }
+                if !is_default && let Some(desktop_id) = current_default {
+                    ui.label(
+                        RichText::new(format!("Current default: {desktop_id}"))
+                            .size(10.0)
+                            .color(theme::MUTED),
+                    );
+                }
             });
+        if set_default_pdf_viewer {
+            self.set_default_pdf_viewer();
+        }
         if !open {
             self.show_view_settings = false;
         }
@@ -5977,6 +6019,26 @@ impl SnaPdfApp {
             }
             ctx.set_zoom_factor(chrome_zoom(self.state.ui_scale, toolbar_ratio));
             self.persist();
+        }
+    }
+
+    fn set_default_pdf_viewer(&mut self) {
+        match Command::new("xdg-mime")
+            .args(["default", "io.snapdf.SnaPdf.desktop", "application/pdf"])
+            .status()
+        {
+            Ok(status) if status.success() => {
+                self.pdf_default_application = Some("io.snapdf.SnaPdf.desktop".to_owned());
+                self.status = "SnaPdf is now the default PDF application.".to_owned();
+            }
+            Ok(status) => {
+                self.status = format!(
+                    "Could not set the default PDF application (xdg-mime exited with {status})."
+                );
+            }
+            Err(error) => {
+                self.status = format!("Could not run xdg-mime: {error}");
+            }
         }
     }
 
@@ -7323,6 +7385,18 @@ fn elide(text: &str, max_chars: usize) -> String {
     }
     let keep = max_chars.saturating_sub(3);
     format!("{}...", text.chars().take(keep).collect::<String>())
+}
+
+fn current_pdf_default_application() -> Option<String> {
+    let output = Command::new("xdg-mime")
+        .args(["query", "default", "application/pdf"])
+        .output()
+        .ok()?;
+    output
+        .status
+        .success()
+        .then(|| String::from_utf8_lossy(&output.stdout).trim().to_owned())
+        .filter(|desktop_id| !desktop_id.is_empty())
 }
 
 fn normalized_chat_title(text: &str) -> Option<String> {

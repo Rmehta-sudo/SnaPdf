@@ -45,15 +45,16 @@ The recommended installation is the portable, checksum-verified AppImage. It ins
 Download the small installer, inspect it if you wish, then run it:
 
 ```bash
-curl --proto '=https' --tlsv1.2 -fLO \
-  https://github.com/Rmehta-sudo/SnaPdf/releases/latest/download/install-snapdf.sh
-less install-snapdf.sh
-sh install-snapdf.sh
+curl --proto '=https' --tlsv1.2 -fL \
+  https://github.com/Rmehta-sudo/SnaPdf/releases/latest/download/install-snapdf.sh \
+  -o /tmp/install-snapdf.sh
+less /tmp/install-snapdf.sh
+sh /tmp/install-snapdf.sh
 ```
 
-The installer discovers the latest release, downloads the AppImage and its published `SHA256SUMS`, refuses to continue unless the checksum matches, and places SnaPdf under your home directory. It also creates the application-menu entry and icon. It never uses `sudo`, does not modify system directories, and does not replace your current default PDF viewer.
+The installer discovers the latest release, downloads the AppImage and its published `SHA256SUMS`, refuses to continue unless the checksum matches, and places SnaPdf under your home directory. It also creates the application-menu entry and icon. It never uses `sudo`, does not modify system directories, and does not replace your current default PDF viewer. To make SnaPdf your default later, use the explicit **Make SnaPdf the default PDF app** action in View settings.
 
-Afterward, open **SnaPdf** from the application menu and pin it to your dock, or run `snapdf` from a terminal. You can delete the downloaded `install-snapdf.sh` once installation finishes.
+Afterward, open **SnaPdf** from the application menu and pin it to your dock, or run `snapdf` from a terminal. You can delete `/tmp/install-snapdf.sh` once installation finishes.
 
 Portable releases currently target **x86_64 Linux desktops**. The launcher uses AppImage's extract-and-run mode, so it does not require FUSE. Other CPU architectures can still use the source build until matching portable releases are added.
 
