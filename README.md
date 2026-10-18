@@ -127,9 +127,14 @@ snapdf-uninstall --purge
 ```
 
 If you are running a downloaded AppImage directly, launch it once first; that creates the same
-`snapdf-uninstall` command. Use that command for removal—the AppImage does not have a separate
-`--uninstall` option. The future AUR package, once published, should instead be removed through
-pacman with `yay -Rns snapdf`.
+`snapdf-uninstall` command. You can also remove it directly with:
+
+```bash
+./SnaPdf-*.AppImage --uninstall
+```
+
+The future AUR package, once published, should instead be removed through pacman with
+`yay -Rns snapdf`.
 
 SnaPdf’s workspace state is stored at `~/.config/snapdf/state.json`; connected study-chat credentials are stored separately at `~/.config/snapdf/chat-credentials.json` with owner-only permissions; its optional OCR runtime and models are stored under `~/.local/share/snapdf/ocr`. Remove those paths too only if you also want to erase saved workspace data, provider connections, and OCR data. Upgrading from the former SnapPDF name migrates `~/.config/snappdf` and `~/.local/share/snappdf` without overwriting newer SnaPdf data, so projects, annotations, chats, settings, credentials, and OCR models remain available.
 

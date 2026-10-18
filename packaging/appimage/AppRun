@@ -57,17 +57,24 @@ register_desktop_entry() {
     launcher="${SNAPDF_EXECUTABLE:-$APPIMAGE}"
     expected_exec="Exec=\"$launcher\" %F"
 
+    mkdir -p "$applications_dir" "$icons_dir"
     if [ ! -f "$desktop_file" ] || ! grep -Fqx "$expected_exec" "$desktop_file"; then
-        mkdir -p "$applications_dir" "$icons_dir"
         escaped_launcher="$(printf '%s' "$launcher" | sed 's/[&|]/\\&/g')"
         sed "s|@EXEC@|\"$escaped_launcher\"|g" \
             "$APPDIR/usr/share/snapdf/$APP_ID.desktop" > "$desktop_file"
-        cp "$APPDIR/usr/share/icons/hicolor/scalable/apps/$APP_ID.svg" \
-            "$icons_dir/$APP_ID.svg"
-        command -v update-desktop-database >/dev/null 2>&1 \
-            && update-desktop-database "$applications_dir" >/dev/null 2>&1 \
-            || true
     fi
+
+    # Refresh the icon even when the desktop entry already exists. Older
+    # installations could retain a valid entry while losing the user icon,
+    # which makes Ubuntu/GNOME fall back to a generic application symbol.
+    cp "$APPDIR/usr/share/icons/hicolor/scalable/apps/$APP_ID.svg" \
+        "$icons_dir/$APP_ID.svg"
+    command -v update-desktop-database >/dev/null 2>&1 \
+        && update-desktop-database "$applications_dir" >/dev/null 2>&1 \
+        || true
+    command -v gtk-update-icon-cache >/dev/null 2>&1 \
+        && gtk-update-icon-cache -f -t "$data_home/icons/hicolor" >/dev/null 2>&1 \
+        || true
 
     rm -f "$applications_dir/io.snappdf.SnapPDF.desktop"
     rm -f "$icons_dir/io.snappdf.SnapPDF.svg"
