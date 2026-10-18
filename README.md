@@ -112,6 +112,13 @@ This removes the application, terminal launcher, menu entry, and icon, but delib
 projects, reading positions, annotations, study chats, credentials, settings, and downloaded OCR
 data so that a reinstall can resume where you stopped. Your PDFs are never moved or deleted.
 
+If you downloaded the AppImage yourself instead, download the newest
+`SnaPdf-…-x86_64.AppImage` from the [releases page](https://github.com/Rmehta-sudo/SnaPdf/releases/latest),
+make it executable, and replace your previous AppImage with it. Launch the new file once so SnaPdf
+refreshes its application-menu entry and terminal launcher. This also preserves your projects,
+annotations, chats, settings, credentials, and OCR data because those are stored separately from the
+AppImage. You do not need to reinstall Rust or any system packages.
+
 To remove both the application and all SnaPdf-owned user data, use the explicit purge mode and
 confirm the warning:
 
@@ -119,9 +126,10 @@ confirm the warning:
 snapdf-uninstall --purge
 ```
 
-If you are running a downloaded AppImage directly, launching it once creates the same
-`snapdf-uninstall` command. You can also run `./SnaPdf-*.AppImage --uninstall`. The future AUR
-package, once published, should instead be removed through pacman with `yay -Rns snapdf`.
+If you are running a downloaded AppImage directly, launch it once first; that creates the same
+`snapdf-uninstall` command. Use that command for removal—the AppImage does not have a separate
+`--uninstall` option. The future AUR package, once published, should instead be removed through
+pacman with `yay -Rns snapdf`.
 
 SnaPdf’s workspace state is stored at `~/.config/snapdf/state.json`; connected study-chat credentials are stored separately at `~/.config/snapdf/chat-credentials.json` with owner-only permissions; its optional OCR runtime and models are stored under `~/.local/share/snapdf/ocr`. Remove those paths too only if you also want to erase saved workspace data, provider connections, and OCR data. Upgrading from the former SnapPDF name migrates `~/.config/snappdf` and `~/.local/share/snappdf` without overwriting newer SnaPdf data, so projects, annotations, chats, settings, credentials, and OCR models remain available.
 
