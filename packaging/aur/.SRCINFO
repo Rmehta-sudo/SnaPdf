@@ -18,6 +18,6 @@ pkgbase = snapdf
 	sha256sums = 460b68ea27d4e8a714713f75f99fed6ab62d4d3cf70216d9e4f4eb03cb55774b
 	sha256sums = e5ab173cb99250daa845451a83855279820b7a57f678d8ec0e3dc985043704a0
 	source_x86_64 = SnaPdf-0.3.3-x86_64.AppImage::https://github.com/Rmehta-sudo/SnaPdf/releases/download/v0.3.3/SnaPdf-0.3.3-x86_64.AppImage
-	sha256sums_x86_64 = 200dcf2845a3a82384de84d97fbe33ff40e69cafcb6cb6e20339f47f90ea9340
+	sha256sums_x86_64 = 5069c65b054a6eab6efaf15603ba871c66e157f7f6143855eaf980dc32693f6f
 
 pkgname = snapdf
