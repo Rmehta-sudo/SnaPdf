@@ -1,7 +1,7 @@
 # Maintainer: Rachit Mehta <Rmehta-sudo@users.noreply.github.com>
 
 pkgname=snapdf
-pkgver=0.3.3
+pkgver=0.3.4
 pkgrel=1
 pkgdesc="Project-based PDF reading workspace with annotations, offline OCR, and study chat"
 arch=('x86_64')
@@ -14,7 +14,7 @@ _appimage="SnaPdf-${pkgver}-${CARCH}.AppImage"
 source=('snapdf' 'LICENSE')
 source_x86_64=("${_appimage}::${url}/releases/download/v${pkgver}/${_appimage}")
 sha256sums=('460b68ea27d4e8a714713f75f99fed6ab62d4d3cf70216d9e4f4eb03cb55774b' 'e5ab173cb99250daa845451a83855279820b7a57f678d8ec0e3dc985043704a0')
-sha256sums_x86_64=('5069c65b054a6eab6efaf15603ba871c66e157f7f6143855eaf980dc32693f6f')
+sha256sums_x86_64=('8ad4af2410f0c58fb6a6bc18131d2a0ec251e853050121308d81916052b33c1c')
 
 prepare() {
   chmod +x "${_appimage}"
