@@ -3,7 +3,8 @@ use crate::chat::{
     ReasoningEffort, mime_for_path, model_supports_reasoning_effort,
 };
 use crate::model::{
-    Annotation, AnnotationKind, AppState, RecentDocument, SidebarFileIcons, StudyChatSession,
+    Annotation, AnnotationKind, AppState, DEFAULT_CHROME_SCALE_RATIO, DEFAULT_SIDEBAR_SCALE_RATIO,
+    DEFAULT_UI_SCALE, RecentDocument, SidebarFileIcons, StudyChatSession, is_discoverable_pdf,
     is_pdf,
 };
 use crate::ocr::{OcrCommand, OcrEvent, OcrWorker};
@@ -349,11 +350,30 @@ struct CachedPage {
     last_used_frame: u64,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum LaunchTarget {
+    Pdf(PathBuf),
+    Project(PathBuf),
+}
+
+fn launch_target_from_args(
+    args: impl IntoIterator<Item = std::ffi::OsString>,
+) -> Option<LaunchTarget> {
+    args.into_iter().find_map(|argument| {
+        let path = PathBuf::from(argument);
+        let path = path.canonicalize().unwrap_or(path);
+        if path.is_dir() {
+            Some(LaunchTarget::Project(path))
+        } else if path.is_file() && is_pdf(&path) {
+            Some(LaunchTarget::Pdf(path))
+        } else {
+            None
+        }
+    })
+}
+
 pub fn run() -> Result<()> {
-    let initial_path = std::env::args_os()
-        .skip(1)
-        .map(PathBuf::from)
-        .find(|path| path.is_file() && is_pdf(path));
+    let launch_target = launch_target_from_args(std::env::args_os().skip(1));
 
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
@@ -369,7 +389,7 @@ pub fn run() -> Result<()> {
     eframe::run_native(
         "SnaPdf",
         options,
-        Box::new(move |creation| Ok(Box::new(SnaPdfApp::new(creation, initial_path)))),
+        Box::new(move |creation| Ok(Box::new(SnaPdfApp::new(creation, launch_target)))),
     )
     .map_err(|error| anyhow!(error.to_string()))
 }
@@ -552,12 +572,22 @@ pub struct SnaPdfApp {
 }
 
 impl SnaPdfApp {
-    fn new(creation: &eframe::CreationContext<'_>, initial_path: Option<PathBuf>) -> Self {
+    fn new(creation: &eframe::CreationContext<'_>, launch_target: Option<LaunchTarget>) -> Self {
         install_unicode_fallback_fonts(&creation.egui_ctx);
         theme::apply(&creation.egui_ctx);
         let mut state = storage::load();
         state.prune_missing();
         state.normalize_recents();
+        let initial_path = match launch_target {
+            Some(LaunchTarget::Pdf(path)) => Some(path),
+            Some(LaunchTarget::Project(root)) => {
+                if state.add_project(root) {
+                    let _ = storage::save(&state);
+                }
+                None
+            }
+            None => None,
+        };
         if state.study_chats.is_empty() && state.active_study_chat.is_none() {
             state.warn_before_replacing_study_chat = true;
         }
@@ -569,7 +599,7 @@ impl SnaPdfApp {
         }
         creation
             .egui_ctx
-            .set_zoom_factor(chrome_zoom(state.ui_scale, state.chrome_scale_ratio));
+            .set_zoom_factor(interface_zoom(state.ui_scale));
         let session_recents = state.recent_documents.clone();
         let project_files = state
             .projects
@@ -997,7 +1027,7 @@ impl SnaPdfApp {
                 .follow_links(false)
                 .into_iter()
                 .filter_map(Result::ok)
-                .filter(|entry| entry.file_type().is_file() && is_pdf(entry.path()))
+                .filter(|entry| entry.file_type().is_file() && is_discoverable_pdf(entry.path()))
             {
                 let path = entry.into_path();
                 entries.push(BrowserEntry {
@@ -1284,17 +1314,23 @@ impl SnaPdfApp {
                             .file_stem()
                             .and_then(|name| name.to_str())
                             .unwrap_or("document");
+                        let backup_directory = source
+                            .parent()
+                            .unwrap_or_else(|| Path::new("."))
+                            .join(".snapdf-backups");
                         let backup =
-                            source.with_file_name(format!("{stem}.snapdf-backup-{timestamp}.pdf"));
-                        match fs::copy(&source, &backup)
+                            backup_directory.join(format!("{stem}.snapdf-backup-{timestamp}.pdf"));
+                        match fs::create_dir_all(&backup_directory)
+                            .and_then(|_| fs::copy(&source, &backup))
                             .and_then(|_| fs::rename(&temporary, &source))
                         {
                             Ok(_) => {
                                 self.state.annotations.remove(&source);
                                 self.persist();
                                 self.status = format!(
-                                    "Saved {exported} annotations to the PDF. Backup: {}",
-                                    backup.display()
+                                    "Saved {exported} annotations into {}. Recovery backup: {}",
+                                    file_name(&source),
+                                    backup.display(),
                                 );
                                 self.open_document(source);
                             }
@@ -1644,7 +1680,7 @@ impl SnaPdfApp {
             .follow_links(false)
             .into_iter()
             .filter_map(Result::ok)
-            .filter(|entry| entry.file_type().is_file() && is_pdf(entry.path()))
+            .filter(|entry| entry.file_type().is_file() && is_discoverable_pdf(entry.path()))
             .map(|entry| entry.into_path())
             .collect::<Vec<_>>();
         paths.sort();
@@ -1774,7 +1810,7 @@ impl SnaPdfApp {
             }
             if let Some(scale) = self.mode_ui_scale_restore.take() {
                 self.state.ui_scale = scale;
-                ctx.set_zoom_factor(chrome_zoom(scale, self.state.chrome_scale_ratio));
+                ctx.set_zoom_factor(interface_zoom(scale));
                 self.persist();
             }
         }
@@ -1800,7 +1836,7 @@ impl SnaPdfApp {
             }
             if let Some(scale) = self.mode_ui_scale_restore.take() {
                 self.state.ui_scale = scale;
-                ctx.set_zoom_factor(chrome_zoom(scale, self.state.chrome_scale_ratio));
+                ctx.set_zoom_factor(interface_zoom(scale));
                 self.persist();
             }
             self.presentation_fit_height_requested = false;
@@ -1906,28 +1942,12 @@ impl SnaPdfApp {
             self.project_shortcut_armed_until = None;
         }
         if ctx.input_mut(|input| input.consume_shortcut(&zoom_in)) {
-            let previous = self.state.ui_scale;
-            self.state.ui_scale = (self.state.ui_scale + 0.1).min(5.0);
-            self.zoom *= self.state.ui_scale / previous.max(0.1);
-            ctx.set_zoom_factor(chrome_zoom(
-                self.state.ui_scale,
-                self.state.chrome_scale_ratio,
-            ));
-            if !self.reader_mode {
-                self.persist();
-            }
+            let cursor = ctx.input(|input| input.pointer.hover_pos());
+            self.apply_pinch_zoom(1.1, cursor, ctx);
         }
         if ctx.input_mut(|input| input.consume_shortcut(&zoom_out)) {
-            let previous = self.state.ui_scale;
-            self.state.ui_scale = (self.state.ui_scale - 0.1).max(0.7);
-            self.zoom *= self.state.ui_scale / previous.max(0.1);
-            ctx.set_zoom_factor(chrome_zoom(
-                self.state.ui_scale,
-                self.state.chrome_scale_ratio,
-            ));
-            if !self.reader_mode {
-                self.persist();
-            }
+            let cursor = ctx.input(|input| input.pointer.hover_pos());
+            self.apply_pinch_zoom(1.0 / 1.1, cursor, ctx);
         }
         let selectable_label_has_selection = ctx
             .plugin::<egui::text_selection::LabelSelectionState>()
@@ -2299,10 +2319,9 @@ impl SnaPdfApp {
             )
             .show(root, |ui| {
                 bounded_panel_content(ui, "project-sidebar-content", |ui| {
-                    // The document uses the global zoom; the explorer has its own readable scale.
-                    let explorer_factor = (self.state.sidebar_scale_ratio
-                        / self.state.chrome_scale_ratio.max(0.1))
-                    .clamp(0.1, 4.0);
+                    // The global factor is only the overall interface scale. Explorer and
+                    // top-bar preferences are independent local ratios.
+                    let explorer_factor = interface_region_scale(self.state.sidebar_scale_ratio);
                     ui.style_mut().spacing.item_spacing *= explorer_factor;
                     ui.style_mut().spacing.button_padding *= explorer_factor;
                     ui.style_mut().spacing.interact_size *= explorer_factor;
@@ -3050,6 +3069,7 @@ impl SnaPdfApp {
     }
 
     fn document_tabs(&mut self, ui: &mut egui::Ui) {
+        let scale = toolbar_visual_scale(ui);
         let documents = self.state.open_documents.clone();
         let mut activate = None;
         let mut close = None;
@@ -3083,7 +3103,7 @@ impl SnaPdfApp {
                                                     &self.state.display_name(path),
                                                     28,
                                                 ))
-                                                .size(11.8)
+                                                .size(11.8 * scale)
                                                 .color(if active {
                                                     Color32::from_rgb(245, 247, 250)
                                                 } else {
@@ -3099,8 +3119,10 @@ impl SnaPdfApp {
                                     }
                                     if ui
                                         .add(
-                                            egui::Button::new(RichText::new("×").size(12.5))
-                                                .frame(false),
+                                            egui::Button::new(
+                                                RichText::new("×").size(12.5 * scale),
+                                            )
+                                            .frame(false),
                                         )
                                         .on_hover_text("Close tab")
                                         .clicked()
@@ -3111,7 +3133,7 @@ impl SnaPdfApp {
                             });
                     }
                     if ui
-                        .add(egui::Button::new(RichText::new("+").size(18.0)).frame(false))
+                        .add(egui::Button::new(RichText::new("+").size(18.0 * scale)).frame(false))
                         .on_hover_text("Open PDF")
                         .clicked()
                     {
@@ -3346,7 +3368,14 @@ impl SnaPdfApp {
                     .inner_margin(Margin::symmetric(8, 1)),
             )
             .show(root, |ui| {
-                ui.add_space(5.0);
+                let toolbar_factor = interface_region_scale(self.state.chrome_scale_ratio);
+                ui.style_mut().spacing.item_spacing *= toolbar_factor;
+                ui.style_mut().spacing.button_padding *= toolbar_factor;
+                ui.style_mut().spacing.interact_size *= toolbar_factor;
+                for font in ui.style_mut().text_styles.values_mut() {
+                    font.size *= toolbar_factor;
+                }
+                ui.add_space(5.0 * toolbar_factor);
                 self.document_tabs(ui);
                 ui.separator();
                 let mut breadcrumb_action = None;
@@ -3440,12 +3469,16 @@ impl SnaPdfApp {
                     ui.scope(|ui| {
                         let row = Rect::from_min_size(
                             ui.cursor().min,
-                            vec2(ui.available_width(), DOCUMENT_TOOLBAR_HEIGHT),
+                            vec2(
+                                ui.available_width(),
+                                DOCUMENT_TOOLBAR_HEIGHT * toolbar_factor,
+                            ),
                         );
                         ui.allocate_rect(row, Sense::hover());
                         // A small optical correction keeps both vector icons and text labels
                         // centered between the separators instead of sitting on the baseline.
-                        let content_row = row.translate(vec2(0.0, DOCUMENT_TOOLBAR_OPTICAL_Y));
+                        let content_row =
+                            row.translate(vec2(0.0, DOCUMENT_TOOLBAR_OPTICAL_Y * toolbar_factor));
                         let third = row.width() / 3.0;
                         let left = Rect::from_min_max(
                             content_row.min,
@@ -3465,34 +3498,24 @@ impl SnaPdfApp {
                             ),
                             |ui| {
                                 ui.horizontal(|ui| {
-                                    // Zoom group: document zoom is primary; surrounding chrome follows the configured ratio.
+                                    // Document zoom is independent from every interface scale.
                                     if compact_text_button(ui, "−", "Zoom out (Ctrl+-)").clicked()
                                     {
-                                        let previous = self.state.ui_scale;
-                                        self.state.ui_scale = (self.state.ui_scale - 0.1).max(0.7);
-                                        self.zoom *= self.state.ui_scale / previous.max(0.1);
-                                        ui.ctx().set_zoom_factor(chrome_zoom(
-                                            self.state.ui_scale,
-                                            self.state.chrome_scale_ratio,
-                                        ));
-                                        self.persist();
+                                        let cursor =
+                                            ui.ctx().input(|input| input.pointer.hover_pos());
+                                        self.apply_pinch_zoom(1.0 / 1.1, cursor, ui.ctx());
                                     }
                                     ui.label(
                                         RichText::new(format!(
                                             "{}%",
-                                            (self.state.ui_scale * 100.0).round() as i32
+                                            (self.zoom * 100.0).round() as i32
                                         ))
                                         .monospace(),
                                     );
                                     if compact_text_button(ui, "+", "Zoom in (Ctrl++)").clicked() {
-                                        let previous = self.state.ui_scale;
-                                        self.state.ui_scale = (self.state.ui_scale + 0.1).min(5.0);
-                                        self.zoom *= self.state.ui_scale / previous.max(0.1);
-                                        ui.ctx().set_zoom_factor(chrome_zoom(
-                                            self.state.ui_scale,
-                                            self.state.chrome_scale_ratio,
-                                        ));
-                                        self.persist();
+                                        let cursor =
+                                            ui.ctx().input(|input| input.pointer.hover_pos());
+                                        self.apply_pinch_zoom(1.1, cursor, ui.ctx());
                                     }
                                     ui.add_space(5.0);
                                     ui.separator();
@@ -3502,7 +3525,7 @@ impl SnaPdfApp {
                                             self.page_entry = (self.current_page + 1).to_string();
                                         }
                                         let response = ui.add_sized(
-                                            [42.0, 20.0],
+                                            [42.0 * toolbar_factor, 20.0 * toolbar_factor],
                                             egui::TextEdit::singleline(&mut self.page_entry)
                                                 .horizontal_align(Align::Center)
                                                 .margin(Margin::symmetric(4, 2)),
@@ -3853,6 +3876,119 @@ impl SnaPdfApp {
         }
     }
 
+    fn study_chat_compact_controls(
+        &mut self,
+        ui: &mut egui::Ui,
+        provider: ChatProvider,
+        connected: bool,
+        text_size: f32,
+    ) {
+        if connected {
+            let models = self
+                .study_chat
+                .models
+                .get(&provider)
+                .cloned()
+                .unwrap_or_default();
+            let selected_model = self
+                .study_chat
+                .selected_models
+                .entry(provider)
+                .or_insert_with(|| models.first().cloned().unwrap_or_default())
+                .clone();
+            let reasoning_supported = provider == ChatProvider::ChatGpt
+                && model_supports_reasoning_effort(&selected_model);
+            let model_text = if selected_model.is_empty() {
+                "Loading…"
+            } else {
+                selected_model.as_str()
+            };
+            let (model_width, thinking_width, spacer) =
+                chat_model_control_widths(ui.available_width(), reasoning_supported);
+            let mut chosen_model = None;
+            let mut chosen_effort = None;
+
+            if reasoning_supported {
+                let response = chat_dropdown_button(
+                    ui,
+                    self.state.chat_reasoning_effort.label(),
+                    thinking_width,
+                    false,
+                    "Choose thinking level",
+                    text_size,
+                );
+                egui::Popup::menu(&response).show(|ui| {
+                    for effort in [
+                        ReasoningEffort::Instant,
+                        ReasoningEffort::Medium,
+                        ReasoningEffort::High,
+                    ] {
+                        if ui
+                            .selectable_label(
+                                effort == self.state.chat_reasoning_effort,
+                                effort.label(),
+                            )
+                            .clicked()
+                        {
+                            chosen_effort = Some(effort);
+                            ui.close();
+                        }
+                    }
+                });
+            }
+
+            let response = chat_dropdown_button(
+                ui,
+                model_text,
+                model_width,
+                false,
+                "Choose model",
+                text_size,
+            );
+            egui::Popup::menu(&response).show(|ui| {
+                ui.set_min_width(model_width.max(132.0));
+                for model in &models {
+                    if ui
+                        .selectable_label(*model == selected_model, model)
+                        .clicked()
+                    {
+                        chosen_model = Some(model.clone());
+                        ui.close();
+                    }
+                }
+            });
+
+            ui.add_space(spacer);
+
+            if let Some(model) = chosen_model {
+                self.study_chat.selected_models.insert(provider, model);
+            }
+            if let Some(effort) = chosen_effort {
+                self.state.chat_reasoning_effort = effort;
+                self.persist();
+            }
+        } else {
+            let connect = chat_action_button(
+                ui,
+                "Connect",
+                72.0_f32.min(ui.available_width().max(1.0)),
+                "Connect the selected AI provider",
+                text_size,
+            );
+            if connect.clicked() {
+                match provider {
+                    ChatProvider::ChatGpt => {
+                        self.study_chat.status = "Opening secure ChatGPT sign-in…".to_owned();
+                        let _ = self.chat_worker.commands.send(ChatCommand::SignInChatGpt);
+                    }
+                    ChatProvider::Gemini => {
+                        self.study_chat.show_gemini_key = true;
+                    }
+                }
+            }
+        }
+    }
+
     fn study_chat_panel(&mut self, root: &mut egui::Ui) {
         if self.state.hide_study_chat
             || !self.study_chat.visible
@@ -3868,19 +4004,22 @@ impl SnaPdfApp {
             .max_size(f32::INFINITY)
             .frame(
                 Frame::new()
-                    .fill(Color32::from_rgb(33, 33, 33))
-                    .stroke(Stroke::new(1.0, Color32::from_rgb(57, 57, 57)))
+                    .fill(CHAT_CANVAS)
+                    .stroke(Stroke::new(1.0, CHAT_DIVIDER))
                     .inner_margin(Margin::ZERO),
             )
             .show(root, |ui| {
                 bounded_panel_content(ui, "study-chat-content", |ui| {
+                    let chat_font_size = self.state.chat_font_size;
+                    apply_chat_typography(ui, chat_font_size);
                     let provider = self.study_chat.provider;
 
                     Frame::new()
-                        .fill(Color32::from_rgb(23, 23, 23))
-                        .inner_margin(Margin::symmetric(14, 9))
+                        .fill(CHAT_HEADER)
+                        .inner_margin(Margin::symmetric(16, 11))
                         .show(ui, |ui| {
                             let mut begin_rename = false;
+                            let mut chosen_provider = None;
                             let account_connected = self
                                 .study_chat
                                 .connected
@@ -3899,12 +4038,28 @@ impl SnaPdfApp {
                                 "Sign in".to_owned()
                             };
                             ui.horizontal(|ui| {
-                                ui.label(
-                                    RichText::new("Study chat")
-                                        .size(15.0)
-                                        .strong()
-                                        .color(Color32::from_rgb(242, 242, 242)),
+                                let provider_menu = chat_header_provider_button(
+                                    ui,
+                                    provider.label(),
+                                    chat_font_size,
+                                    "Choose AI provider",
                                 );
+                                egui::Popup::menu(&provider_menu).show(|ui| {
+                                    for candidate in
+                                        [ChatProvider::ChatGpt, ChatProvider::Gemini]
+                                    {
+                                        if ui
+                                            .selectable_label(
+                                                candidate == provider,
+                                                candidate.label(),
+                                            )
+                                            .clicked()
+                                        {
+                                            chosen_provider = Some(candidate);
+                                            ui.close();
+                                        }
+                                    }
+                                });
                                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                                     if chat_icon_button(ui, ToolbarIcon::Close, true, "Close study chat").clicked() {
                                         self.study_chat.visible = false;
@@ -3948,27 +4103,23 @@ impl SnaPdfApp {
                                                     if account_connected { "●" } else { "○" },
                                                     account_button_label
                                                 ))
-                                                .size(10.5)
+                                                .size(chat_control_text_size(chat_font_size))
                                                 .color(if account_connected {
                                                     Color32::from_rgb(193, 239, 227)
                                                 } else {
                                                     CHAT_TEXT
                                                 }),
                                             )
-                                            .fill(if account_connected {
-                                                Color32::from_rgb(27, 92, 77)
-                                            } else {
-                                                Color32::from_rgb(48, 48, 48)
-                                            })
+                                            .fill(Color32::from_rgb(31, 31, 31))
                                             .stroke(Stroke::new(
                                                 1.0,
                                                 if account_connected {
-                                                    Color32::from_rgb(40, 137, 113)
+                                                    Color32::from_rgb(55, 92, 82)
                                                 } else {
-                                                    Color32::from_rgb(78, 78, 78)
+                                                    Color32::from_rgb(55, 55, 55)
                                                 },
                                             ))
-                                            .corner_radius(CornerRadius::same(7))
+                                            .corner_radius(CornerRadius::same(12))
                                             .min_size(vec2(58.0, 23.0)),
                                         )
                                         .on_hover_text(format!(
@@ -3980,13 +4131,13 @@ impl SnaPdfApp {
                                         ui.set_min_width(220.0);
                                         ui.label(
                                             RichText::new(provider.label())
-                                                .size(11.0)
+                                                .size(chat_control_text_size(chat_font_size))
                                                 .strong(),
                                         );
                                         ui.add(
                                             egui::Label::new(
                                                 RichText::new(&account_name)
-                                                    .size(10.5)
+                                                    .size(chat_meta_text_size(chat_font_size))
                                                     .color(CHAT_MUTED),
                                             )
                                             .wrap(),
@@ -4051,6 +4202,9 @@ impl SnaPdfApp {
                                     });
                                 });
                             });
+                            if let Some(provider) = chosen_provider {
+                                self.study_chat.provider = provider;
+                            }
                             if begin_rename {
                                 self.begin_study_chat_rename();
                             }
@@ -4106,48 +4260,32 @@ impl SnaPdfApp {
                                 let active_title = self.study_chat.active_session().title.clone();
                                 let history_width = ui.available_width().max(1.0);
                                 let mut switch_to = None;
-                                ui.scope(|ui| {
-                                    let visuals = &mut ui.style_mut().visuals.widgets;
-                                    for widget in [
-                                        &mut visuals.inactive,
-                                        &mut visuals.hovered,
-                                        &mut visuals.active,
-                                        &mut visuals.open,
-                                    ] {
-                                        widget.corner_radius = CornerRadius::same(10);
-                                        widget.bg_stroke =
-                                            Stroke::new(1.0, Color32::from_rgb(58, 58, 58));
+                                let history = chat_history_button(
+                                    ui,
+                                    &active_title,
+                                    history_width,
+                                    "Switch conversation",
+                                    chat_font_size,
+                                );
+                                egui::Popup::menu(&history).show(|ui| {
+                                    ui.set_min_width((history_width - 14.0).max(120.0));
+                                    ui.set_max_width((history_width - 14.0).max(120.0));
+                                    for chat in &self.study_chat.sessions {
+                                        if ui
+                                            .add_sized(
+                                                [ui.available_width(), 30.0],
+                                                egui::Button::selectable(
+                                                    chat.id
+                                                        == self.study_chat.active_session_id,
+                                                    &chat.title,
+                                                )
+                                                .truncate(),
+                                            )
+                                            .clicked()
+                                        {
+                                            switch_to = Some(chat.id);
+                                        }
                                     }
-                                    visuals.inactive.weak_bg_fill = Color32::from_rgb(35, 35, 35);
-                                    visuals.hovered.weak_bg_fill = Color32::from_rgb(43, 43, 43);
-                                    visuals.active.weak_bg_fill = Color32::from_rgb(45, 45, 45);
-                                    visuals.open.weak_bg_fill = Color32::from_rgb(43, 43, 43);
-
-                                    egui::ComboBox::from_id_salt("study-chat-history")
-                                        .width(history_width)
-                                        .selected_text(active_title)
-                                        .show_ui(ui, |ui| {
-                                            ui.set_min_width((history_width - 14.0).max(120.0));
-                                            ui.set_max_width((history_width - 14.0).max(120.0));
-                                            for chat in &self.study_chat.sessions {
-                                                if ui
-                                                    .add_sized(
-                                                        [ui.available_width(), 28.0],
-                                                        egui::Button::selectable(
-                                                            chat.id
-                                                                == self
-                                                                    .study_chat
-                                                                    .active_session_id,
-                                                            &chat.title,
-                                                        )
-                                                        .truncate(),
-                                                    )
-                                                    .clicked()
-                                                {
-                                                    switch_to = Some(chat.id);
-                                                }
-                                            }
-                                        });
                                 });
                                 if let Some(id) = switch_to {
                                     self.activate_study_chat(id);
@@ -4169,7 +4307,7 @@ impl SnaPdfApp {
                         &self.study_chat.prompt,
                         (ui.available_width() - 46.0).max(1.0),
                     );
-                    let footer_height = if connected { 150.0 } else { 188.0 }
+                    let footer_height = 104.0
                         + (composer_rows.saturating_sub(1) as f32 * 18.0)
                         + if self.study_chat.attachments.is_empty() { 0.0 } else { 32.0 };
                     let messages = self
@@ -4194,10 +4332,10 @@ impl SnaPdfApp {
                             ui.set_min_width(ui.available_width());
                             ui.add_space(16.0);
                             if messages.is_empty() {
-                                chat_empty_state(ui);
+                                chat_empty_state(ui, chat_font_size);
                                 if chat_status_visible(&status, busy) {
                                     ui.add_space(12.0);
-                                    chat_status(ui, &status, busy);
+                                    chat_status(ui, &status, busy, chat_font_size);
                                 }
                             }
                             for (index, message) in messages.iter().enumerate() {
@@ -4224,7 +4362,7 @@ impl SnaPdfApp {
                                     && chat_status_visible(&status, busy)
                                 {
                                     ui.add_space(3.0);
-                                    chat_status(ui, &status, busy);
+                                    chat_status(ui, &status, busy, chat_font_size);
                                 }
                                 ui.add_space(14.0);
                             }
@@ -4235,8 +4373,8 @@ impl SnaPdfApp {
                     }
 
                     Frame::new()
-                        .fill(Color32::from_rgb(23, 23, 23))
-                        .inner_margin(Margin::symmetric(14, 10))
+                        .fill(CHAT_CANVAS)
+                        .inner_margin(Margin::symmetric(16, 12))
                         .show(ui, |ui| {
                             let mut remove = None;
                             if !self.study_chat.attachments.is_empty() {
@@ -4247,9 +4385,9 @@ impl SnaPdfApp {
                                         ui.horizontal(|ui| {
                                             for (index, attachment) in self.study_chat.attachments.iter().enumerate() {
                                                 Frame::new()
-                                                    .fill(Color32::from_rgb(48, 48, 48))
-                                                    .stroke(Stroke::new(1.0, Color32::from_rgb(66, 66, 66)))
-                                                    .corner_radius(CornerRadius::same(9))
+                                                    .fill(Color32::from_rgb(36, 36, 36))
+                                                    .stroke(Stroke::new(1.0, Color32::from_rgb(55, 55, 55)))
+                                                    .corner_radius(CornerRadius::same(10))
                                                     .inner_margin(Margin::symmetric(8, 5))
                                                     .show(ui, |ui| {
                                                         ui.horizontal(|ui| {
@@ -4259,7 +4397,7 @@ impl SnaPdfApp {
                                                                     attachment.kind_label(),
                                                                     elide(&attachment.name, 20)
                                                                 ))
-                                                                .size(10.5)
+                                                                .size(chat_meta_text_size(chat_font_size))
                                                                 .color(Color32::from_rgb(218, 218, 218)),
                                                             );
                                                             if ui.add(egui::Button::new("×").frame(false)).clicked() {
@@ -4278,10 +4416,10 @@ impl SnaPdfApp {
 
                             let mut send_with_enter = false;
                             Frame::new()
-                                .fill(Color32::from_rgb(43, 43, 43))
-                                .stroke(Stroke::new(1.0, Color32::from_rgb(62, 62, 62)))
-                                .corner_radius(CornerRadius::same(20))
-                                .inner_margin(Margin::symmetric(11, 8))
+                                .fill(Color32::from_rgb(35, 35, 35))
+                                .stroke(Stroke::new(1.0, Color32::from_rgb(58, 58, 58)))
+                                .corner_radius(CornerRadius::same(22))
+                                .inner_margin(Margin::symmetric(12, 9))
                                 .show(ui, |ui| {
                                     let input_height = chat_prompt_viewport_height(composer_rows);
                                     let content_height =
@@ -4303,7 +4441,7 @@ impl SnaPdfApp {
                                                     &mut self.study_chat.prompt,
                                                 )
                                                 .id(egui::Id::new("study-chat-prompt"))
-                                                .hint_text("Message your study assistant…")
+                                                .hint_text("Ask about this PDF or your files…")
                                                 .desired_width(input_width)
                                                 .desired_rows(composer_content_rows)
                                                 .frame(Frame::NONE)
@@ -4359,6 +4497,13 @@ impl SnaPdfApp {
                                             {
                                                 self.send_chat_message();
                                             }
+                                            ui.add_space(4.0);
+                                            self.study_chat_compact_controls(
+                                                ui,
+                                                provider,
+                                                connected,
+                                                chat_font_size,
+                                            );
                                         });
                                     });
                                 });
@@ -4370,241 +4515,6 @@ impl SnaPdfApp {
                                 self.send_chat_message();
                             }
 
-                            ui.add_space(7.0);
-
-                            if connected {
-                                let models = self
-                                    .study_chat
-                                    .models
-                                    .get(&provider)
-                                    .cloned()
-                                    .unwrap_or_default();
-                                let selected_model = self
-                                    .study_chat
-                                    .selected_models
-                                    .entry(provider)
-                                    .or_insert_with(|| models.first().cloned().unwrap_or_default())
-                                    .clone();
-                                let account = self
-                                    .study_chat
-                                    .accounts
-                                    .get(&provider)
-                                    .cloned()
-                                    .unwrap_or_else(|| format!("{} connected", provider.label()));
-                                let reasoning_supported = provider == ChatProvider::ChatGpt
-                                    && model_supports_reasoning_effort(&selected_model);
-                                let mut chosen_provider = None;
-                                let mut chosen_model = None;
-                                let mut chosen_effort = None;
-                                let mut sign_out = false;
-
-                                let model_text = if selected_model.is_empty() {
-                                    "Loading…"
-                                } else {
-                                    selected_model.as_str()
-                                };
-                                let (provider_width, model_width, thinking_width, spacer) =
-                                    chat_control_widths(ui.available_width(), reasoning_supported);
-                                ui.horizontal(|ui| {
-                                    ui.spacing_mut().item_spacing.x = 6.0;
-                                    let response = chat_dropdown_button(
-                                        ui,
-                                        provider.label(),
-                                        provider_width,
-                                        true,
-                                        "Choose AI provider",
-                                    );
-                                    egui::Popup::menu(&response).show(|ui| {
-                                        for candidate in
-                                            [ChatProvider::ChatGpt, ChatProvider::Gemini]
-                                        {
-                                            if ui
-                                                .selectable_label(
-                                                    candidate == provider,
-                                                    candidate.label(),
-                                                )
-                                                .clicked()
-                                            {
-                                                chosen_provider = Some(candidate);
-                                                ui.close();
-                                            }
-                                        }
-                                    });
-
-                                    ui.add_space(spacer);
-                                    let response = chat_dropdown_button(
-                                        ui,
-                                        model_text,
-                                        model_width,
-                                        false,
-                                        "Choose model",
-                                    );
-                                    egui::Popup::menu(&response).show(|ui| {
-                                        ui.set_min_width(model_width.max(132.0));
-                                        for model in &models {
-                                            if ui
-                                                .selectable_label(*model == selected_model, model)
-                                                .clicked()
-                                            {
-                                                chosen_model = Some(model.clone());
-                                                ui.close();
-                                            }
-                                        }
-                                    });
-
-                                    if reasoning_supported {
-                                        let response = chat_dropdown_button(
-                                            ui,
-                                            self.state.chat_reasoning_effort.label(),
-                                            thinking_width,
-                                            false,
-                                            "Choose thinking level",
-                                        );
-                                        egui::Popup::menu(&response).show(|ui| {
-                                            for effort in [
-                                                ReasoningEffort::Instant,
-                                                ReasoningEffort::Medium,
-                                                ReasoningEffort::High,
-                                            ] {
-                                                if ui
-                                                    .selectable_label(
-                                                        effort == self.state.chat_reasoning_effort,
-                                                        effort.label(),
-                                                    )
-                                                    .clicked()
-                                                {
-                                                    chosen_effort = Some(effort);
-                                                    ui.close();
-                                                }
-                                            }
-                                        });
-                                    }
-                                });
-
-                                ui.add_space(2.0);
-                                ui.horizontal(|ui| {
-                                    let (dot, _) =
-                                        ui.allocate_exact_size(vec2(9.0, 18.0), Sense::hover());
-                                    ui.painter().circle_filled(dot.center(), 2.5, CHAT_ACCENT);
-                                    let account_width = (ui.available_width() - 58.0).max(1.0);
-                                    ui.add_sized(
-                                        [account_width, 18.0],
-                                        egui::Label::new(
-                                            RichText::new(&account)
-                                                .size(9.5)
-                                                .color(CHAT_MUTED),
-                                        )
-                                        .truncate(),
-                                    );
-                                    if ui
-                                        .add_sized(
-                                            [54.0, 18.0],
-                                            egui::Button::new(
-                                                RichText::new("Sign out")
-                                                    .size(9.5)
-                                                    .color(CHAT_MUTED),
-                                            )
-                                            .frame(false),
-                                        )
-                                        .clicked()
-                                    {
-                                        sign_out = true;
-                                    }
-                                });
-
-                                if let Some(provider) = chosen_provider {
-                                    self.study_chat.provider = provider;
-                                }
-                                if let Some(model) = chosen_model {
-                                    self.study_chat.selected_models.insert(provider, model);
-                                }
-                                if let Some(effort) = chosen_effort {
-                                    self.state.chat_reasoning_effort = effort;
-                                    self.persist();
-                                }
-                                if sign_out {
-                                    let _ = self
-                                        .chat_worker
-                                        .commands
-                                        .send(ChatCommand::SignOut(provider));
-                                }
-                            } else {
-                                let mut chosen_provider = None;
-                                let response = chat_dropdown_button(
-                                    ui,
-                                    provider.label(),
-                                    ui.available_width().clamp(1.0, 112.0),
-                                    true,
-                                    "Choose AI provider",
-                                );
-                                egui::Popup::menu(&response).show(|ui| {
-                                    for candidate in
-                                        [ChatProvider::ChatGpt, ChatProvider::Gemini]
-                                    {
-                                        if ui
-                                            .selectable_label(
-                                                candidate == provider,
-                                                candidate.label(),
-                                            )
-                                            .clicked()
-                                        {
-                                            chosen_provider = Some(candidate);
-                                            ui.close();
-                                        }
-                                    }
-                                });
-                                if let Some(provider) = chosen_provider {
-                                    self.study_chat.provider = provider;
-                                }
-                                ui.add_space(6.0);
-                                match provider {
-                                    ChatProvider::ChatGpt => {
-                                        if ui
-                                            .add_sized(
-                                                [ui.available_width().max(1.0), 30.0],
-                                                egui::Button::new("Continue with ChatGPT"),
-                                            )
-                                            .clicked()
-                                        {
-                                            self.study_chat.status =
-                                                "Opening secure ChatGPT sign-in…".to_owned();
-                                            let _ = self
-                                                .chat_worker
-                                                .commands
-                                                .send(ChatCommand::SignInChatGpt);
-                                        }
-                                        ui.add(
-                                            egui::Label::new(
-                                                RichText::new(
-                                                    "Official browser sign-in. SnaPdf never sees your password.",
-                                                )
-                                                .size(10.0)
-                                                .color(Color32::from_rgb(145, 145, 145)),
-                                            )
-                                            .wrap(),
-                                        );
-                                    }
-                                    ChatProvider::Gemini => {
-                                        if ui
-                                            .add_sized(
-                                                [ui.available_width().max(1.0), 30.0],
-                                                egui::Button::new("Connect Gemini"),
-                                            )
-                                            .clicked()
-                                        {
-                                            self.study_chat.show_gemini_key = true;
-                                        }
-                                        ui.add(
-                                            egui::Label::new(
-                                                RichText::new("Connect with a Google AI Studio API key.")
-                                                    .size(10.0)
-                                                    .color(Color32::from_rgb(145, 145, 145)),
-                                            )
-                                            .wrap(),
-                                        );
-                                    }
-                                }
-                            }
                         });
                 });
             });
@@ -4637,10 +4547,11 @@ impl SnaPdfApp {
 
                 let viewer_rect = ui.clip_rect();
                 let zoom_before_pinch = self.zoom;
-                let (pointer_position, egui_pinch_zoom, time) = ctx.input(|input| {
+                let (pointer_position, egui_pinch_zoom, ctrl_wheel_zoom, time) = ctx.input(|input| {
                     (
                         input.pointer.hover_pos().or_else(|| input.pointer.interact_pos()),
                         trackpad_pinch_factor(&input.events),
+                        ctrl_mouse_wheel_zoom_factor(&input.events),
                         input.time,
                     )
                 });
@@ -4674,15 +4585,25 @@ impl SnaPdfApp {
                 let use_native = native_event_seen
                     || self.native_pinch_active
                     || time < self.native_pinch_suppress_until;
-                let pinch_zoom = if use_native { native_factor } else { egui_pinch_zoom };
+                let gesture_zoom = if use_native {
+                    native_factor
+                } else {
+                    egui_pinch_zoom * ctrl_wheel_zoom
+                };
                 let over_viewer = pointer_position.is_none_or(|pos| viewer_rect.contains(pos));
-                if over_viewer && (pinch_zoom - 1.0).abs() > 0.0001 {
+                if over_viewer && (gesture_zoom - 1.0).abs() > 0.0001 {
                     // Eguis ScrollArea also consumes scroll deltas. A gesture
                     // must never both scale the page and scroll the document.
-                    self.apply_pinch_zoom(pinch_zoom, Some(pointer_position.unwrap_or(viewer_rect.center())), &ctx);
+                    self.apply_pinch_zoom(
+                        gesture_zoom,
+                        Some(pointer_position.unwrap_or(viewer_rect.center())),
+                        &ctx,
+                    );
                 }
                 let pinch_in_progress = over_viewer
-                    && (use_native || (egui_pinch_zoom - 1.0).abs() > 0.0001);
+                    && (use_native
+                        || (egui_pinch_zoom - 1.0).abs() > 0.0001
+                        || (ctrl_wheel_zoom - 1.0).abs() > 0.0001);
                 if pinch_in_progress {
                     // Native touchpads can deliver a pinch and a synthetic wheel
                     // event on separate paths. Discard the smooth-wheel movement;
@@ -4692,9 +4613,13 @@ impl SnaPdfApp {
                 }
                 if pinch_in_progress && std::env::var_os("SNAPDF_PINCH_DEBUG").is_some() {
                     eprintln!(
-                        "[snapdf pinch] source={} native={:.5} egui={:.5} zoom={:.4} old_offset={:?}",
+                        "[snapdf zoom] source={} native={:.5} egui={:.5} wheel={:.5} zoom={:.4} old_offset={:?}",
                         if use_native { "xinput" } else { "egui" },
-                        native_factor, egui_pinch_zoom, self.zoom, self.document_scroll_offset,
+                        native_factor,
+                        egui_pinch_zoom,
+                        ctrl_wheel_zoom,
+                        self.zoom,
+                        self.document_scroll_offset,
                     );
                 }
                 if self.pending_selection_highlight && self.selection_text_ready() {
@@ -5873,6 +5798,7 @@ impl SnaPdfApp {
             return;
         }
         let mut open = true;
+        let mut interface_scale = self.state.ui_scale;
         let mut toolbar_ratio = self.state.chrome_scale_ratio;
         let mut sidebar_ratio = self.state.sidebar_scale_ratio;
         let mut chat_font_size = self.state.chat_font_size;
@@ -5887,18 +5813,41 @@ impl SnaPdfApp {
             .show(ctx, |ui| {
                 ui.label(RichText::new("Interface scale").strong());
                 ui.label(
-                    RichText::new("Keep controls compact while making the PDF the visual focus.")
+                    RichText::new(
+                        "Scale the interface independently. PDF zoom stays in the document toolbar, pinch gesture, and Ctrl+scroll.",
+                    )
                         .size(11.5)
                         .color(theme::MUTED),
                 );
                 ui.add_space(8.0);
+                ui.label(RichText::new("Overall interface").size(12.0));
+                changed |= ui
+                    .add(
+                        egui::Slider::new(
+                            &mut interface_scale,
+                            DEFAULT_UI_SCALE * 0.5..=DEFAULT_UI_SCALE * 2.0,
+                        )
+                            .step_by((DEFAULT_UI_SCALE * 0.05) as f64)
+                            .custom_formatter(|value, _| {
+                                format!("{}%", normalized_scale_percent(value, DEFAULT_UI_SCALE))
+                            }),
+                    )
+                    .changed();
+                ui.add_space(7.0);
                 ui.label(RichText::new("Top bar").size(12.0));
                 changed |= ui
                     .add(
-                        egui::Slider::new(&mut toolbar_ratio, 0.4..=1.0)
-                            .step_by(0.05)
+                        egui::Slider::new(
+                            &mut toolbar_ratio,
+                            DEFAULT_CHROME_SCALE_RATIO * 0.5
+                                ..=DEFAULT_CHROME_SCALE_RATIO * 2.0,
+                        )
+                            .step_by((DEFAULT_CHROME_SCALE_RATIO * 0.05) as f64)
                             .custom_formatter(|value, _| {
-                                format!("{}%", (value * 100.0).round() as i32)
+                                format!(
+                                    "{}%",
+                                    normalized_scale_percent(value, DEFAULT_CHROME_SCALE_RATIO)
+                                )
                             }),
                     )
                     .changed();
@@ -5906,17 +5855,28 @@ impl SnaPdfApp {
                 ui.label(RichText::new("File explorer").size(12.0));
                 changed |= ui
                     .add(
-                        egui::Slider::new(&mut sidebar_ratio, 0.5..=1.25)
-                            .step_by(0.05)
+                        egui::Slider::new(
+                            &mut sidebar_ratio,
+                            DEFAULT_SIDEBAR_SCALE_RATIO * 0.5
+                                ..=DEFAULT_SIDEBAR_SCALE_RATIO * 2.0,
+                        )
+                            .step_by((DEFAULT_SIDEBAR_SCALE_RATIO * 0.05) as f64)
                             .custom_formatter(|value, _| {
-                                format!("{}%", (value * 100.0).round() as i32)
+                                format!(
+                                    "{}%",
+                                    normalized_scale_percent(value, DEFAULT_SIDEBAR_SCALE_RATIO)
+                                )
                             }),
                     )
                     .changed();
                 ui.add_space(6.0);
-                if ui.small_button("Reset defaults (60% / 80%)").clicked() {
-                    toolbar_ratio = 0.6;
-                    sidebar_ratio = 0.8;
+                if ui
+                    .small_button("Reset defaults (100% each)")
+                    .clicked()
+                {
+                    interface_scale = DEFAULT_UI_SCALE;
+                    toolbar_ratio = DEFAULT_CHROME_SCALE_RATIO;
+                    sidebar_ratio = DEFAULT_SIDEBAR_SCALE_RATIO;
                     changed = true;
                 }
                 ui.add_space(10.0);
@@ -5938,7 +5898,7 @@ impl SnaPdfApp {
                 ui.label(RichText::new("Study chat text").size(12.0));
                 changed |= ui
                     .add(
-                        egui::Slider::new(&mut chat_font_size, 11.0..=20.0)
+                        egui::Slider::new(&mut chat_font_size, 11.0..=28.0)
                             .step_by(0.5)
                             .suffix(" pt"),
                     )
@@ -6004,6 +5964,15 @@ impl SnaPdfApp {
             self.show_view_settings = false;
         }
         if changed {
+            let previous_interface_zoom = interface_zoom(self.state.ui_scale);
+            let next_interface_zoom = interface_zoom(interface_scale);
+            if (next_interface_zoom - previous_interface_zoom).abs() > f32::EPSILON {
+                // egui's zoom factor scales every painted point. Counter-scale
+                // the document so changing interface size never changes the PDF.
+                self.zoom =
+                    (self.zoom * previous_interface_zoom / next_interface_zoom).clamp(0.2, 8.0);
+            }
+            self.state.ui_scale = interface_scale;
             self.state.chrome_scale_ratio = toolbar_ratio;
             self.state.sidebar_scale_ratio = sidebar_ratio;
             self.state.chat_font_size = chat_font_size;
@@ -6017,7 +5986,7 @@ impl SnaPdfApp {
                     self.drag_start = None;
                 }
             }
-            ctx.set_zoom_factor(chrome_zoom(self.state.ui_scale, toolbar_ratio));
+            ctx.set_zoom_factor(next_interface_zoom);
             self.persist();
         }
     }
@@ -6096,7 +6065,9 @@ impl SnaPdfApp {
                 ui.label("This writes SnaPdf annotations into the PDF on disk so other viewers can see them.");
                 ui.add_space(6.0);
                 ui.label(
-                    RichText::new("A timestamped backup of the original PDF will be created first.")
+                    RichText::new(
+                        "A timestamped recovery backup will be kept in the hidden .snapdf-backups folder.",
+                    )
                         .size(11.5)
                         .color(theme::MUTED),
                 );
@@ -6804,6 +6775,10 @@ fn pdf_tree_count(node: &PdfTreeNode) -> usize {
 }
 
 fn sidebar_visual_scale(ui: &egui::Ui) -> f32 {
+    (ui.spacing().interact_size.y / 18.0).clamp(0.1, 4.0)
+}
+
+fn toolbar_visual_scale(ui: &egui::Ui) -> f32 {
     (ui.spacing().interact_size.y / 18.0).clamp(0.1, 4.0)
 }
 
@@ -7816,9 +7791,10 @@ fn mini_mode_icon_button(ui: &mut egui::Ui, icon: ModeControlIcon, help: &str) -
 }
 
 fn compact_text_button(ui: &mut egui::Ui, text: &str, help: &str) -> Response {
+    let scale = toolbar_visual_scale(ui);
     ui.add_sized(
-        [22.0, 20.0],
-        egui::Button::new(RichText::new(text).size(13.0)).frame(false),
+        [22.0 * scale, 20.0 * scale],
+        egui::Button::new(RichText::new(text).size(13.0 * scale)).frame(false),
     )
     .on_hover_text(help)
 }
@@ -7904,18 +7880,51 @@ fn bounded_panel_content<R>(
     add_contents(&mut content)
 }
 
+const CHAT_CANVAS: Color32 = Color32::from_rgb(14, 14, 14);
+const CHAT_HEADER: Color32 = Color32::from_rgb(21, 21, 21);
+const CHAT_DIVIDER: Color32 = Color32::from_rgb(48, 48, 48);
 const CHAT_ACCENT: Color32 = Color32::from_rgb(16, 163, 127);
 const CHAT_TEXT: Color32 = Color32::from_rgb(236, 236, 236);
 const CHAT_MUTED: Color32 = Color32::from_rgb(166, 166, 166);
 
-fn chat_empty_state(ui: &mut egui::Ui) {
+fn chat_control_text_size(base: f32) -> f32 {
+    (base * 0.78).clamp(10.5, 22.0)
+}
+
+fn chat_meta_text_size(base: f32) -> f32 {
+    (base * 0.68).clamp(9.5, 19.0)
+}
+
+fn apply_chat_typography(ui: &mut egui::Ui, base: f32) {
+    let style = ui.style_mut();
+    style
+        .text_styles
+        .insert(egui::TextStyle::Body, FontId::proportional(base));
+    style.text_styles.insert(
+        egui::TextStyle::Button,
+        FontId::proportional(chat_control_text_size(base)),
+    );
+    style.text_styles.insert(
+        egui::TextStyle::Small,
+        FontId::proportional(chat_meta_text_size(base)),
+    );
+    style.text_styles.insert(
+        egui::TextStyle::Heading,
+        FontId::proportional((base + 1.5).clamp(13.0, 30.0)),
+    );
+    style
+        .text_styles
+        .insert(egui::TextStyle::Monospace, FontId::monospace(base));
+}
+
+fn chat_empty_state(ui: &mut egui::Ui, text_size: f32) {
     ui.add_space(22.0);
     ui.vertical_centered(|ui| {
         chat_assistant_mark(ui, 42.0);
         ui.add_space(10.0);
         ui.label(
             RichText::new("What are you studying?")
-                .size(17.0)
+                .size((text_size + 1.5).clamp(13.0, 30.0))
                 .strong()
                 .color(CHAT_TEXT),
         );
@@ -7925,7 +7934,7 @@ fn chat_empty_state(ui: &mut egui::Ui) {
                 RichText::new(
                     "Ask a question, attach a PDF, or capture a figure without leaving the page.",
                 )
-                .size(12.5)
+                .size(chat_control_text_size(text_size))
                 .color(CHAT_MUTED),
             )
             .wrap()
@@ -7943,7 +7952,7 @@ fn chat_status_visible(status: &str, busy: bool) -> bool {
         || normalized.to_ascii_lowercase().ends_with(" is ready."))
 }
 
-fn chat_status(ui: &mut egui::Ui, status: &str, busy: bool) {
+fn chat_status(ui: &mut egui::Ui, status: &str, busy: bool, text_size: f32) {
     ui.horizontal(|ui| {
         ui.add_space(34.0);
         if busy {
@@ -7952,37 +7961,45 @@ fn chat_status(ui: &mut egui::Ui, status: &str, busy: bool) {
             let (rect, _) = ui.allocate_exact_size(vec2(11.0, 11.0), Sense::hover());
             ui.painter().circle_filled(rect.center(), 3.0, CHAT_ACCENT);
         }
-        ui.add(egui::Label::new(RichText::new(status).size(10.5).color(CHAT_MUTED)).wrap());
+        ui.add(
+            egui::Label::new(
+                RichText::new(status)
+                    .size(chat_meta_text_size(text_size))
+                    .color(CHAT_MUTED),
+            )
+            .wrap(),
+        );
     });
 }
 
 fn chat_message(ui: &mut egui::Ui, message: &ChatMessage, streaming: bool, text_size: f32) -> bool {
     let mut copied = false;
     let available = ui.available_width().max(1.0);
+    let edge_margin = 16.0_f32.min(available * 0.06);
+    let readable_width = (available - edge_margin * 2.0).clamp(1.0, 760.0);
+    let leading = ((available - readable_width) * 0.5).max(0.0);
     match message.role {
         ChatRole::User => {
-            let horizontal_margin = 14.0_f32.min(available * 0.06);
-            let content_width = (available - horizontal_margin * 2.0).max(1.0);
-            let bubble_width = chat_user_bubble_width(&message.text, content_width, text_size);
+            let bubble_width = chat_user_bubble_width(&message.text, readable_width, text_size);
             ui.horizontal(|ui| {
-                ui.add_space((horizontal_margin + content_width - bubble_width).max(0.0));
+                ui.add_space((leading + readable_width - bubble_width).max(0.0));
                 ui.vertical(|ui| {
                     ui.set_width(bubble_width);
                     Frame::new()
-                        .fill(Color32::from_rgb(45, 45, 45))
-                        .stroke(Stroke::new(1.0, Color32::from_rgb(58, 58, 58)))
+                        .fill(Color32::from_rgb(40, 40, 40))
+                        .stroke(Stroke::new(1.0, Color32::from_rgb(52, 52, 52)))
                         .corner_radius(CornerRadius::same(18))
                         .inner_margin(Margin::symmetric(13, 10))
                         .show(ui, |ui| {
                             ui.set_width((bubble_width - 26.0).max(1.0));
-                            chat_message_attachments(ui, message);
+                            chat_message_attachments(ui, message, text_size);
                             render_chat_markdown(ui, &message.text, text_size);
                         });
                     ui.allocate_ui_with_layout(
                         vec2(bubble_width, 23.0),
                         Layout::right_to_left(Align::Center),
                         |ui| {
-                            if chat_copy_button(ui, "Copy prompt").clicked() {
+                            if chat_copy_button(ui, "Copy prompt", text_size).clicked() {
                                 ui.ctx().copy_text(message.text.clone());
                                 copied = true;
                             }
@@ -7993,22 +8010,25 @@ fn chat_message(ui: &mut egui::Ui, message: &ChatMessage, streaming: bool, text_
         }
         ChatRole::Assistant => {
             ui.horizontal(|ui| {
-                let horizontal_margin = 14.0_f32.min(available * 0.06);
-                ui.add_space(horizontal_margin);
-                chat_assistant_mark(ui, 23.0);
-                ui.add_space(5.0);
+                ui.add_space(leading);
+                chat_assistant_mark(ui, 20.0);
+                ui.add_space(8.0);
                 ui.vertical(|ui| {
-                    ui.set_width((ui.available_width() - horizontal_margin).max(1.0));
+                    ui.set_width((readable_width - 28.0).max(1.0));
                     if streaming {
                         ui.horizontal(|ui| {
                             ui.add(egui::Spinner::new().size(13.0).color(CHAT_ACCENT));
-                            ui.label(RichText::new("Generating…").size(12.0).color(CHAT_MUTED));
+                            ui.label(
+                                RichText::new("Generating…")
+                                    .size(chat_control_text_size(text_size))
+                                    .color(CHAT_MUTED),
+                            );
                         });
                     } else {
-                        chat_message_attachments(ui, message);
+                        chat_message_attachments(ui, message, text_size);
                         render_chat_markdown(ui, &message.text, text_size);
                         ui.add_space(4.0);
-                        if chat_copy_button(ui, "Copy reply").clicked() {
+                        if chat_copy_button(ui, "Copy reply", text_size).clicked() {
                             ui.ctx().copy_text(message.text.clone());
                             copied = true;
                         }
@@ -8025,6 +8045,11 @@ fn chat_assistant_mark(ui: &mut egui::Ui, size: f32) {
     let radius = size * 0.48;
     ui.painter()
         .circle_filled(rect.center(), radius, CHAT_ACCENT);
+    ui.painter().circle_stroke(
+        rect.center(),
+        radius,
+        Stroke::new(1.0, Color32::from_rgb(55, 207, 167)),
+    );
     let center = rect.center();
     let long = size * 0.22;
     let short = size * 0.08;
@@ -8087,7 +8112,7 @@ fn chat_user_bubble_width(text: &str, available: f32, text_size: f32) -> f32 {
         .min(available)
 }
 
-fn chat_message_attachments(ui: &mut egui::Ui, message: &ChatMessage) {
+fn chat_message_attachments(ui: &mut egui::Ui, message: &ChatMessage, text_size: f32) {
     if message.attachments.is_empty() {
         return;
     }
@@ -8104,7 +8129,7 @@ fn chat_message_attachments(ui: &mut egui::Ui, message: &ChatMessage) {
                             attachment.kind_label(),
                             elide(&attachment.name, 26)
                         ))
-                        .size(10.0)
+                        .size(chat_meta_text_size(text_size))
                         .color(Color32::from_rgb(207, 207, 207)),
                     );
                 });
@@ -8113,7 +8138,7 @@ fn chat_message_attachments(ui: &mut egui::Ui, message: &ChatMessage) {
     ui.add_space(5.0);
 }
 
-fn chat_copy_button(ui: &mut egui::Ui, help: &str) -> Response {
+fn chat_copy_button(ui: &mut egui::Ui, help: &str, text_size: f32) -> Response {
     let (rect, response) = ui.allocate_exact_size(vec2(56.0, 23.0), Sense::click());
     if response.hovered() {
         ui.painter()
@@ -8129,7 +8154,7 @@ fn chat_copy_button(ui: &mut egui::Ui, help: &str) -> Response {
         pos2(rect.left() + 22.0, rect.center().y),
         Align2::LEFT_CENTER,
         "Copy",
-        FontId::proportional(10.5),
+        FontId::proportional(chat_meta_text_size(text_size)),
         CHAT_MUTED,
     );
     response.on_hover_text(help)
@@ -8216,20 +8241,89 @@ fn chat_send_button(ui: &mut egui::Ui, enabled: bool) -> Response {
     response.on_hover_text("Send message (Enter)")
 }
 
-fn chat_control_widths(available: f32, show_thinking: bool) -> (f32, f32, f32, f32) {
+fn chat_action_button(
+    ui: &mut egui::Ui,
+    label: &str,
+    width: f32,
+    help: &str,
+    text_size: f32,
+) -> Response {
+    let (rect, response) = ui.allocate_exact_size(vec2(width, 26.0), Sense::click());
+    let fill = if response.hovered() {
+        Color32::from_rgb(49, 49, 49)
+    } else {
+        Color32::from_rgb(40, 40, 40)
+    };
+    ui.painter().rect_filled(rect, CornerRadius::same(13), fill);
+    ui.painter().rect_stroke(
+        rect,
+        CornerRadius::same(13),
+        Stroke::new(1.0, Color32::from_rgb(64, 64, 64)),
+        StrokeKind::Inside,
+    );
+    ui.painter().text(
+        rect.center(),
+        Align2::CENTER_CENTER,
+        label,
+        FontId::proportional(chat_control_text_size(text_size)),
+        CHAT_TEXT,
+    );
+    response.on_hover_text(help)
+}
+
+fn chat_history_button(
+    ui: &mut egui::Ui,
+    label: &str,
+    width: f32,
+    help: &str,
+    text_size: f32,
+) -> Response {
+    let (rect, response) = ui.allocate_exact_size(vec2(width, 27.0), Sense::click());
+    if response.hovered() {
+        ui.painter()
+            .rect_filled(rect, CornerRadius::same(7), Color32::from_rgb(28, 28, 28));
+    }
+    let font = FontId::proportional(chat_control_text_size(text_size));
+    let fitted = fitted_chat_control_text(
+        ui.painter(),
+        label,
+        &font,
+        CHAT_MUTED,
+        (width - 30.0).max(0.0),
+    );
+    ui.painter().text(
+        pos2(rect.left() + 4.0, rect.center().y),
+        Align2::LEFT_CENTER,
+        fitted,
+        font,
+        CHAT_MUTED,
+    );
+    let center = pos2(rect.right() - 11.0, rect.center().y + 1.0);
+    ui.painter().add(egui::Shape::convex_polygon(
+        vec![
+            center + vec2(-3.5, -2.0),
+            center + vec2(3.5, -2.0),
+            center + vec2(0.0, 2.5),
+        ],
+        CHAT_MUTED,
+        Stroke::NONE,
+    ));
+    response.on_hover_text(help)
+}
+
+fn chat_model_control_widths(available: f32, show_thinking: bool) -> (f32, f32, f32) {
     let available = available.max(1.0);
-    let gap_count = if show_thinking { 2.0 } else { 1.0 };
-    let gaps = gap_count * 6.0;
-    let provider = (available * 0.25).clamp(54.0, 104.0).min(available);
+    let gap = if show_thinking { 6.0 } else { 0.0 };
+    let usable = (available - gap).max(1.0);
     let thinking = if show_thinking {
-        (available * 0.22).clamp(52.0, 92.0)
+        (available * 0.28).clamp(42.0, 92.0).min(usable * 0.45)
     } else {
         0.0
     };
-    let raw_model = (available - provider - thinking - gaps).max(1.0);
+    let raw_model = (usable - thinking).max(1.0);
     let model = raw_model.min(184.0);
     let spacer = (raw_model - model).max(0.0);
-    (provider, model, thinking, spacer)
+    (model, thinking, spacer)
 }
 
 fn fitted_chat_control_text(
@@ -8273,8 +8367,9 @@ fn chat_dropdown_button(
     width: f32,
     accent: bool,
     help: &str,
+    text_size: f32,
 ) -> Response {
-    let (rect, response) = ui.allocate_exact_size(vec2(width, 28.0), Sense::click());
+    let (rect, response) = ui.allocate_exact_size(vec2(width, 26.0), Sense::click());
     let fill = if accent {
         if response.hovered() {
             Color32::from_rgb(27, 177, 137)
@@ -8282,26 +8377,26 @@ fn chat_dropdown_button(
             CHAT_ACCENT
         }
     } else if response.hovered() {
-        Color32::from_rgb(54, 54, 54)
+        Color32::from_rgb(49, 49, 49)
     } else {
-        Color32::from_rgb(43, 43, 43)
+        Color32::from_rgb(40, 40, 40)
     };
-    ui.painter().rect_filled(rect, CornerRadius::same(14), fill);
+    ui.painter().rect_filled(rect, CornerRadius::same(13), fill);
     ui.painter().rect_stroke(
         rect,
-        CornerRadius::same(14),
+        CornerRadius::same(13),
         Stroke::new(
             1.0,
             if accent {
                 CHAT_ACCENT
             } else {
-                Color32::from_rgb(67, 67, 67)
+                Color32::from_rgb(64, 64, 64)
             },
         ),
         StrokeKind::Inside,
     );
     let text_color = if accent { Color32::WHITE } else { CHAT_TEXT };
-    let font = FontId::proportional(10.5);
+    let font = FontId::proportional(chat_control_text_size(text_size));
     let fitted_label = fitted_chat_control_text(
         ui.painter(),
         label,
@@ -8324,6 +8419,53 @@ fn chat_dropdown_button(
             center + vec2(0.0, 2.5),
         ],
         if accent { Color32::WHITE } else { CHAT_MUTED },
+        Stroke::NONE,
+    ));
+    response.on_hover_text(help)
+}
+
+fn chat_header_provider_button(
+    ui: &mut egui::Ui,
+    label: &str,
+    text_size: f32,
+    help: &str,
+) -> Response {
+    let font_size = (text_size * 0.96).clamp(12.0, 19.0);
+    let font = FontId::proportional(font_size);
+    let label_width = ui
+        .painter()
+        .layout_no_wrap(label.to_owned(), font.clone(), CHAT_TEXT)
+        .size()
+        .x;
+    let width = (label_width + 34.0).clamp(92.0, 160.0);
+    let (rect, response) = ui.allocate_exact_size(vec2(width, 31.0), Sense::click());
+    let fill = if response.hovered() {
+        Color32::from_rgb(40, 40, 40)
+    } else {
+        Color32::from_rgb(31, 31, 31)
+    };
+    ui.painter().rect_filled(rect, CornerRadius::same(15), fill);
+    ui.painter().rect_stroke(
+        rect,
+        CornerRadius::same(15),
+        Stroke::new(1.0, Color32::from_rgb(57, 57, 57)),
+        StrokeKind::Inside,
+    );
+    ui.painter().text(
+        pos2(rect.left() + 13.0, rect.center().y),
+        Align2::LEFT_CENTER,
+        label,
+        font,
+        CHAT_TEXT,
+    );
+    let center = pos2(rect.right() - 13.0, rect.center().y + 1.0);
+    ui.painter().add(egui::Shape::convex_polygon(
+        vec![
+            center + vec2(-3.5, -2.0),
+            center + vec2(3.5, -2.0),
+            center + vec2(0.0, 2.5),
+        ],
+        CHAT_MUTED,
         Stroke::NONE,
     ));
     response.on_hover_text(help)
@@ -9477,10 +9619,11 @@ fn png_from_rgb(width: usize, height: usize, rgb: Vec<u8>) -> Result<Vec<u8>> {
 }
 
 fn path_breadcrumbs(ui: &mut egui::Ui, path: Option<&Path>) -> Option<BreadcrumbAction> {
+    let scale = toolbar_visual_scale(ui);
     let Some(path) = path else {
         ui.label(
             RichText::new("No document open")
-                .size(13.0)
+                .size(13.0 * scale)
                 .color(theme::MUTED),
         );
         return None;
@@ -9501,7 +9644,7 @@ fn path_breadcrumbs(ui: &mut egui::Ui, path: Option<&Path>) -> Option<Breadcrumb
             .add(
                 egui::Button::new(
                     RichText::new(label)
-                        .size(13.0)
+                        .size(13.0 * scale)
                         .color(Color32::from_rgb(177, 177, 177)),
                 )
                 .frame(false)
@@ -9522,7 +9665,7 @@ fn path_breadcrumbs(ui: &mut egui::Ui, path: Option<&Path>) -> Option<Breadcrumb
         if !is_last {
             ui.label(
                 RichText::new("/")
-                    .size(13.0)
+                    .size(13.0 * scale)
                     .color(Color32::from_rgb(92, 92, 92)),
             );
         }
@@ -9530,8 +9673,18 @@ fn path_breadcrumbs(ui: &mut egui::Ui, path: Option<&Path>) -> Option<Breadcrumb
     action
 }
 
-fn chrome_zoom(document_zoom: f32, ratio: f32) -> f32 {
-    (document_zoom * ratio).clamp(0.28, 5.0)
+const BASE_INTERFACE_REGION_SCALE: f32 = 0.6;
+
+fn interface_zoom(interface_scale: f32) -> f32 {
+    (interface_scale * BASE_INTERFACE_REGION_SCALE).clamp(0.28, 5.0)
+}
+
+fn interface_region_scale(region_scale: f32) -> f32 {
+    (region_scale / BASE_INTERFACE_REGION_SCALE).clamp(0.1, 4.0)
+}
+
+fn normalized_scale_percent(value: f64, baseline: f32) -> i32 {
+    (value / f64::from(baseline) * 100.0).round() as i32
 }
 
 fn presentation_fit_zoom(page_size: [f32; 2], viewport: egui::Vec2) -> f32 {
@@ -9604,6 +9757,30 @@ fn trackpad_pinch_factor(events: &[egui::Event]) -> f32 {
         native_factor
     } else if precision_scroll.abs() > f32::EPSILON {
         (precision_scroll / 200.0).exp()
+    } else {
+        1.0
+    }
+}
+
+/// Turn Ctrl/Command + a conventional mouse-wheel step into document zoom.
+/// Point-granularity events are intentionally left to `trackpad_pinch_factor`
+/// so precision touchpad gestures are never applied twice.
+fn ctrl_mouse_wheel_zoom_factor(events: &[egui::Event]) -> f32 {
+    let wheel_lines = events
+        .iter()
+        .filter_map(|event| match event {
+            egui::Event::MouseWheel {
+                unit: egui::MouseWheelUnit::Line,
+                delta,
+                modifiers,
+                ..
+            } if modifiers.ctrl || modifiers.command => Some(delta.y),
+            _ => None,
+        })
+        .sum::<f32>();
+
+    if wheel_lines.abs() > f32::EPSILON {
+        (wheel_lines * 0.12).exp().clamp(0.5, 2.0)
     } else {
         1.0
     }
@@ -10300,6 +10477,15 @@ mod tests {
     use super::*;
 
     #[test]
+    fn dot_cli_argument_resolves_to_the_current_directory_project() {
+        let expected = std::env::current_dir().unwrap().canonicalize().unwrap();
+        assert_eq!(
+            launch_target_from_args([std::ffi::OsString::from(".")]),
+            Some(LaunchTarget::Project(expected))
+        );
+    }
+
+    #[test]
     fn bounded_panel_content_does_not_restore_a_wider_intrinsic_size() {
         egui::__run_test_ui(|ui| {
             let response = egui::Panel::left("bounded-panel-test")
@@ -10387,8 +10573,8 @@ mod tests {
     #[test]
     fn chat_footer_controls_fit_the_available_row() {
         for available in [180.0_f32, 300.0, 430.0, 900.0] {
-            let (provider, model, thinking, spacer) = chat_control_widths(available, true);
-            assert!(provider + model + thinking + spacer + 12.0 <= available + 0.01);
+            let (model, thinking, spacer) = chat_model_control_widths(available, true);
+            assert!(model + thinking + spacer + 6.0 <= available + 0.01);
         }
     }
 
@@ -10734,6 +10920,55 @@ mod tests {
 
         assert!(trackpad_pinch_factor(&[precision_pinch]) > 1.0);
         assert_eq!(trackpad_pinch_factor(&[mouse_wheel]), 1.0);
+    }
+
+    #[test]
+    fn ctrl_mouse_wheel_zooms_without_double_counting_precision_pinch() {
+        let ctrl = Modifiers {
+            ctrl: true,
+            ..Default::default()
+        };
+        let zoom_in = egui::Event::MouseWheel {
+            unit: egui::MouseWheelUnit::Line,
+            delta: vec2(0.0, 3.0),
+            phase: egui::TouchPhase::Move,
+            modifiers: ctrl,
+        };
+        let zoom_out = egui::Event::MouseWheel {
+            unit: egui::MouseWheelUnit::Line,
+            delta: vec2(0.0, -3.0),
+            phase: egui::TouchPhase::Move,
+            modifiers: ctrl,
+        };
+        let precision_pinch = egui::Event::MouseWheel {
+            unit: egui::MouseWheelUnit::Point,
+            delta: vec2(0.0, 20.0),
+            phase: egui::TouchPhase::Move,
+            modifiers: ctrl,
+        };
+
+        assert!(ctrl_mouse_wheel_zoom_factor(&[zoom_in]) > 1.0);
+        assert!(ctrl_mouse_wheel_zoom_factor(&[zoom_out]) < 1.0);
+        assert_eq!(ctrl_mouse_wheel_zoom_factor(&[precision_pinch]), 1.0);
+    }
+
+    #[test]
+    fn interface_regions_keep_independent_effective_scales() {
+        let overall = interface_zoom(1.0);
+        assert!((overall - BASE_INTERFACE_REGION_SCALE).abs() < f32::EPSILON);
+        assert!((overall * interface_region_scale(0.4) - 0.4).abs() < 0.0001);
+        assert!((overall * interface_region_scale(0.8) - 0.8).abs() < 0.0001);
+        assert!((interface_zoom(1.25) - 0.75).abs() < 0.0001);
+        assert_eq!(normalized_scale_percent(1.6, DEFAULT_UI_SCALE), 100);
+        assert_eq!(normalized_scale_percent(3.2, DEFAULT_UI_SCALE), 200);
+        assert_eq!(
+            normalized_scale_percent(0.9, DEFAULT_CHROME_SCALE_RATIO),
+            100
+        );
+        assert_eq!(
+            normalized_scale_percent(1.0, DEFAULT_SIDEBAR_SCALE_RATIO),
+            100
+        );
     }
 
     #[cfg(target_os = "linux")]

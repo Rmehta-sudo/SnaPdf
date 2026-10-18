@@ -89,8 +89,20 @@ This downloads the OCR runtime into `~/.local/share/snapdf/ocr`; the OCR models 
 
 ### Updating or uninstalling SnaPdf
 
-Run the installer again to update to the latest release. Every supported user-level installation
-also installs a dedicated removal command:
+If SnaPdf was installed with the curl installer, close the running app and run the same installer
+again. It automatically resolves the newest GitHub release, verifies its checksum, replaces only
+the installed AppImage, and preserves projects, annotations, chats, settings, credentials, and OCR
+data:
+
+```bash
+curl --proto '=https' --tlsv1.2 -fL \
+  https://github.com/Rmehta-sudo/SnaPdf/releases/latest/download/install-snapdf.sh \
+  -o /tmp/install-snapdf.sh
+sh /tmp/install-snapdf.sh
+```
+
+The terminal command remains `snapdf`; reopen the app after the installer finishes. Every supported
+user-level installation also installs a dedicated removal command:
 
 ```bash
 snapdf-uninstall
@@ -136,6 +148,16 @@ The source installer installs compilation dependencies on systems with `apt`, in
 3. Expand folders in the sidebar to browse PDFs at any depth.
 4. Open a document. It appears in a tab and is added to Recents.
 
+You can also turn the terminal's current directory into a project root directly:
+
+```bash
+cd /path/to/your/pdf-folder
+snapdf .
+```
+
+SnaPdf opens normally and adds that directory to the project sidebar, exactly like choosing it with
+**+ Project**. Running the command again does not create a duplicate project.
+
 Use the three far-left rail icons to switch between Files, document contents, and Search. The Settings icon is at the bottom of that rail.
 
 Click a segment in the path bar to browse that directory within SnaPdf. The built-in browser presents the directory tree and its PDFs, and opening a result creates a new tab.
@@ -180,7 +202,7 @@ The compact tools row provides highlighting, drawing, erasing, comments, text bo
 Annotations are stored locally by default so the original file stays untouched. When you need to share the marked-up PDF, use either:
 
 - **Export annotated copy** to write a separate copy; or
-- **Save annotations into this PDF** to write compatible overlays into the original after SnaPdf creates a timestamped backup.
+- **Save annotations into this PDF** to write compatible overlays into the original after SnaPdf creates a timestamped recovery copy inside the hidden `.snapdf-backups` folder beside the PDF.
 
 Use the path-row buttons to print, open the PDF in another installed app, export, or save.
 

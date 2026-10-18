@@ -5,6 +5,10 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 use walkdir::WalkDir;
 
+pub const DEFAULT_UI_SCALE: f32 = 1.6;
+pub const DEFAULT_CHROME_SCALE_RATIO: f32 = 0.9;
+pub const DEFAULT_SIDEBAR_SCALE_RATIO: f32 = 1.0;
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct AppState {
     #[serde(default)]
@@ -30,11 +34,14 @@ pub struct AppState {
     /// Zero-based last visible page for each document.
     #[serde(default)]
     pub reading_positions: HashMap<PathBuf, usize>,
+    /// Base scale for the application interface. Document zoom is stored and
+    /// applied separately by the viewer.
     #[serde(default = "default_ui_scale")]
     pub ui_scale: f32,
     #[serde(default = "default_chrome_scale_ratio")]
     pub chrome_scale_ratio: f32,
-    /// Explorer scale relative to document scale. Toolbar scale remains chrome_scale_ratio.
+    /// Explorer scale relative to the base interface scale. The top bar uses
+    /// `chrome_scale_ratio`.
     #[serde(default = "default_sidebar_scale_ratio")]
     pub sidebar_scale_ratio: f32,
     /// Visual treatment for PDF entries in the sidebar.
@@ -62,7 +69,7 @@ pub struct AppState {
     /// Completely removes Study chat and all of its entry points from the interface.
     #[serde(default)]
     pub hide_study_chat: bool,
-    /// Message text size inside Study chat only; surrounding application chrome is unaffected.
+    /// Base text size for the entire Study chat interface.
     #[serde(default = "default_chat_font_size")]
     pub chat_font_size: f32,
     /// Reasoning effort used by compatible ChatGPT models.
@@ -162,15 +169,15 @@ fn default_true() -> bool {
 }
 
 fn default_ui_scale() -> f32 {
-    1.0
+    DEFAULT_UI_SCALE
 }
 
 fn default_chrome_scale_ratio() -> f32 {
-    0.6
+    DEFAULT_CHROME_SCALE_RATIO
 }
 
 fn default_sidebar_scale_ratio() -> f32 {
-    0.8
+    DEFAULT_SIDEBAR_SCALE_RATIO
 }
 
 fn default_chat_font_size() -> f32 {
@@ -204,7 +211,7 @@ impl Project {
                     .is_some_and(|name| name.starts_with('.') && entry.depth() > 0)
             })
             .filter_map(Result::ok)
-            .filter(|entry| entry.file_type().is_file() && is_pdf(entry.path()))
+            .filter(|entry| entry.file_type().is_file() && is_discoverable_pdf(entry.path()))
             .map(|entry| entry.into_path())
             .collect();
 
@@ -360,22 +367,29 @@ impl AppState {
         self.ui_scale = if self.ui_scale <= 0.0 {
             1.0
         } else {
-            self.ui_scale.clamp(0.7, 5.0)
+            self.ui_scale
+                .clamp(DEFAULT_UI_SCALE * 0.5, DEFAULT_UI_SCALE * 2.0)
         };
         self.chrome_scale_ratio = if self.chrome_scale_ratio <= 0.0 {
             default_chrome_scale_ratio()
         } else {
-            self.chrome_scale_ratio.clamp(0.4, 1.0)
+            self.chrome_scale_ratio.clamp(
+                DEFAULT_CHROME_SCALE_RATIO * 0.5,
+                DEFAULT_CHROME_SCALE_RATIO * 2.0,
+            )
         };
         self.sidebar_scale_ratio = if self.sidebar_scale_ratio <= 0.0 {
             default_sidebar_scale_ratio()
         } else {
-            self.sidebar_scale_ratio.clamp(0.5, 1.25)
+            self.sidebar_scale_ratio.clamp(
+                DEFAULT_SIDEBAR_SCALE_RATIO * 0.5,
+                DEFAULT_SIDEBAR_SCALE_RATIO * 2.0,
+            )
         };
         self.chat_font_size = if self.chat_font_size <= 0.0 {
             default_chat_font_size()
         } else {
-            self.chat_font_size.clamp(11.0, 20.0)
+            self.chat_font_size.clamp(11.0, 28.0)
         };
         if !self.sidebar_file_icons_initialized {
             self.sidebar_file_icons = SidebarFileIcons::None;
@@ -397,6 +411,19 @@ pub fn is_pdf(path: &Path) -> bool {
         .is_some_and(|extension| extension.eq_ignore_ascii_case("pdf"))
 }
 
+/// Returns whether a PDF belongs in project and folder discovery results.
+///
+/// Older SnaPdf builds placed timestamped recovery copies beside the source
+/// PDF. Keep those copies recoverable on disk without presenting them as
+/// normal project documents.
+pub fn is_discoverable_pdf(path: &Path) -> bool {
+    is_pdf(path)
+        && !path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.to_ascii_lowercase().contains(".snapdf-backup-"))
+}
+
 fn upsert_recent(items: &mut Vec<RecentDocument>, item: RecentDocument, limit: usize) {
     items.retain(|existing| existing.path != item.path);
     items.insert(0, item);
@@ -412,6 +439,17 @@ mod tests {
         assert!(is_pdf(Path::new("paper.PDF")));
         assert!(is_pdf(Path::new("paper.pdf")));
         assert!(!is_pdf(Path::new("notes.txt")));
+    }
+
+    #[test]
+    fn recovery_backups_are_not_discovered_as_project_pdfs() {
+        assert!(is_discoverable_pdf(Path::new("paper.pdf")));
+        assert!(!is_discoverable_pdf(Path::new(
+            "paper.snapdf-backup-1792327344.pdf"
+        )));
+        assert!(!is_discoverable_pdf(Path::new(
+            "paper.SnaPdf-Backup-1792327344.PDF"
+        )));
     }
 
     #[test]
@@ -453,9 +491,11 @@ mod tests {
     }
 
     #[test]
-    fn legacy_state_uses_sixty_percent_chrome_ratio() {
+    fn missing_scale_preferences_use_the_new_visual_baseline() {
         let state: AppState = serde_json::from_str("{}").expect("legacy state should deserialize");
-        assert!((state.chrome_scale_ratio - 0.6).abs() < f32::EPSILON);
+        assert!((state.ui_scale - DEFAULT_UI_SCALE).abs() < f32::EPSILON);
+        assert!((state.chrome_scale_ratio - DEFAULT_CHROME_SCALE_RATIO).abs() < f32::EPSILON);
+        assert!((state.sidebar_scale_ratio - DEFAULT_SIDEBAR_SCALE_RATIO).abs() < f32::EPSILON);
         assert!((state.chat_font_size - 16.0).abs() < f32::EPSILON);
         assert_eq!(state.chat_reasoning_effort, ReasoningEffort::Medium);
         assert_eq!(state.sidebar_file_icons, SidebarFileIcons::None);

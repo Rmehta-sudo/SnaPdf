@@ -80,6 +80,67 @@ pub struct PdfFileSearchMatches {
     pub matches: Vec<PdfSearchMatch>,
 }
 
+/// Coalesces character-level text bounds into the line-level quadrilaterals
+/// expected by native PDF highlight annotations. Exporting one quadrilateral
+/// per glyph makes conforming viewers draw a rounded highlight capsule around
+/// every character, which appears as a row of vertical/hourglass marks.
+fn merge_highlight_rects(rects: &[[f32; 4]]) -> Vec<[f32; 4]> {
+    let mut merged = Vec::new();
+
+    for rect in rects {
+        if !rect.iter().all(|value| value.is_finite()) {
+            continue;
+        }
+        let rect = [
+            rect[0].min(rect[2]),
+            rect[1].min(rect[3]),
+            rect[0].max(rect[2]),
+            rect[1].max(rect[3]),
+        ];
+        let width = rect[2] - rect[0];
+        let height = rect[3] - rect[1];
+        if width <= f32::EPSILON || height <= f32::EPSILON {
+            continue;
+        }
+
+        if let Some(line) = merged.last_mut() {
+            let line: &mut [f32; 4] = line;
+            let line_height = line[3] - line[1];
+            let overlap = line[3].min(rect[3]) - line[1].max(rect[1]);
+            let same_line = overlap >= line_height.min(height) * 0.5;
+            let horizontal_gap = if rect[0] > line[2] {
+                rect[0] - line[2]
+            } else if line[0] > rect[2] {
+                line[0] - rect[2]
+            } else {
+                0.0
+            };
+            let close_enough = horizontal_gap <= line_height.max(height) * 1.5;
+
+            if same_line && close_enough {
+                line[0] = line[0].min(rect[0]);
+                line[1] = line[1].min(rect[1]);
+                line[2] = line[2].max(rect[2]);
+                line[3] = line[3].max(rect[3]);
+                continue;
+            }
+        }
+
+        merged.push(rect);
+    }
+
+    merged
+}
+
+fn highlight_quad_points(rect: [f32; 4]) -> PdfQuadPoints {
+    // PDF text-markup annotations use a special Z-order rather than the
+    // counter-clockwise order used by general quadrilaterals: the first edge
+    // is the top of the text and the second edge is the bottom.
+    PdfQuadPoints::new_from_values(
+        rect[0], rect[3], rect[2], rect[3], rect[0], rect[1], rect[2], rect[1],
+    )
+}
+
 /// Search PDFs independently of the viewer's rendering engine.
 ///
 /// PDFium is process-global and can only be initialised once, so a second PDFium
@@ -315,7 +376,9 @@ fn worker_loop(
                 let rendered = (|| -> Result<_, PdfiumError> {
                     let page = document.pages().get(page_index as i32)?;
                     let bitmap = page.render_with_config(
-                        &PdfRenderConfig::new().set_target_width(target_width as i32),
+                        &PdfRenderConfig::new()
+                            .set_target_width(target_width as i32)
+                            .render_annotations(true),
                     )?;
                     let image = bitmap.as_image()?.to_rgba8();
                     Ok((
@@ -520,6 +583,7 @@ fn worker_loop(
                             .map_err(|error| error.to_string())?;
                         match &annotation.kind {
                             AnnotationKind::Highlight { rects, color } => {
+                                let rects = merge_highlight_rects(rects);
                                 if rects.is_empty() {
                                     skipped += 1;
                                     continue;
@@ -543,15 +607,12 @@ fn worker_loop(
                                         color[0], color[1], color[2], color[3],
                                     ))
                                     .map_err(|error| error.to_string())?;
-                                for rect in rects {
+                                for rect in &rects {
                                     highlight
                                         .attachment_points_mut()
-                                        .create_attachment_point_at_end(
-                                            PdfQuadPoints::new_from_values(
-                                                rect[0], rect[1], rect[2], rect[1], rect[2],
-                                                rect[3], rect[0], rect[3],
-                                            ),
-                                        )
+                                        .create_attachment_point_at_end(highlight_quad_points(
+                                            *rect,
+                                        ))
                                         .map_err(|error| error.to_string())?;
                                 }
                                 if let Some(comment) =
@@ -770,8 +831,11 @@ fn worker_loop(
                     let page = document.pages().get(page_index as i32)?;
                     let page_width = page.width().value.max(1.0);
                     let page_height = page.height().value.max(1.0);
-                    let bitmap =
-                        page.render_with_config(&PdfRenderConfig::new().set_target_width(2400))?;
+                    let bitmap = page.render_with_config(
+                        &PdfRenderConfig::new()
+                            .set_target_width(2400)
+                            .render_annotations(true),
+                    )?;
                     let image = bitmap.as_image()?.to_rgb8();
                     let [left, bottom, right, top] = bounds;
                     let x1 = (left.min(right) / page_width * image.width() as f32)
@@ -861,3 +925,47 @@ fn append_bookmarks(
     }
 }
 use crate::model::{Annotation, AnnotationKind};
+
+#[cfg(test)]
+mod tests {
+    use super::{highlight_quad_points, merge_highlight_rects};
+
+    #[test]
+    fn character_highlights_are_merged_into_visual_lines() {
+        let rects = [
+            [10.0, 90.0, 18.0, 100.0],
+            [18.5, 90.0, 27.0, 100.0],
+            [31.0, 89.5, 40.0, 100.5],
+            [10.0, 70.0, 19.0, 80.0],
+            [19.5, 70.0, 28.0, 80.0],
+        ];
+
+        assert_eq!(
+            merge_highlight_rects(&rects),
+            vec![[10.0, 89.5, 40.0, 100.5], [10.0, 70.0, 28.0, 80.0]]
+        );
+    }
+
+    #[test]
+    fn distant_columns_remain_separate_highlight_runs() {
+        let rects = [
+            [10.0, 90.0, 20.0, 100.0],
+            [21.0, 90.0, 30.0, 100.0],
+            [100.0, 90.0, 110.0, 100.0],
+        ];
+
+        assert_eq!(
+            merge_highlight_rects(&rects),
+            vec![[10.0, 90.0, 30.0, 100.0], [100.0, 90.0, 110.0, 100.0]]
+        );
+    }
+
+    #[test]
+    fn text_markup_quad_points_use_pdf_z_order() {
+        let points = highlight_quad_points([10.0, 20.0, 30.0, 40.0]);
+        assert_eq!((points.x1().value, points.y1().value), (10.0, 40.0));
+        assert_eq!((points.x2().value, points.y2().value), (30.0, 40.0));
+        assert_eq!((points.x3().value, points.y3().value), (10.0, 20.0));
+        assert_eq!((points.x4().value, points.y4().value), (30.0, 20.0));
+    }
+}

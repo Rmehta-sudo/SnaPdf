@@ -28,6 +28,15 @@
   </provides>
   <content_rating type="oars-1.1"/>
   <releases>
+    <release version="0.3.4" date="2026-10-18">
+      <description>
+        <p>Refines Study chat styling and typography, separates interface-region scaling,
+        and keeps keyboard, wheel, and trackpad zoom focused on the PDF canvas.</p>
+        <p>Adds terminal project opening with snapdf ., improves safe in-place annotation
+        saving and hidden recovery backups, and exports standards-compliant continuous
+        PDF highlights across compatible viewers.</p>
+      </description>
+    </release>
     <release version="0.3.2" date="2026-10-17">
       <description>
         <p>Restores native trackpad pinch-to-zoom after a desktop session switches from X11 to Wayland.</p>

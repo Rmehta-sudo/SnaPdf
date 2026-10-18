@@ -25,6 +25,7 @@ if [[ -z "${VERSION}" ]]; then
 fi
 
 APPIMAGETOOL="${TOOLS_DIR}/appimagetool-${APPIMAGETOOL_VERSION}-${ARCH}.AppImage"
+RUNTIME_FILE="${PROJECT_ROOT}/.tmp/appimage/runtime-${ARCH}"
 OUTPUT="${DIST_DIR}/SnaPdf-${VERSION}-${ARCH}.AppImage"
 
 echo "Building SnaPdf ${VERSION}..."
@@ -73,8 +74,12 @@ fi
 
 rm -f "${OUTPUT}"
 echo "Creating ${OUTPUT##*/}..."
+runtime_args=()
+if [[ -f "${RUNTIME_FILE}" ]]; then
+  runtime_args=(--runtime-file "${RUNTIME_FILE}")
+fi
 APPIMAGE_EXTRACT_AND_RUN=1 ARCH="${ARCH}" VERSION="${VERSION}" \
-  "${APPIMAGETOOL}" "${APPDIR}" "${OUTPUT}"
+  "${APPIMAGETOOL}" "${runtime_args[@]}" "${APPDIR}" "${OUTPUT}"
 chmod 0755 "${OUTPUT}"
 
 echo
