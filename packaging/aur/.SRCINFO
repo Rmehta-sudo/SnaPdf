@@ -1,6 +1,6 @@
 pkgbase = snapdf
 	pkgdesc = Project-based PDF reading workspace with annotations, offline OCR, and study chat
-	pkgver = 0.3.4
+	pkgver = 0.3.5
 	pkgrel = 1
 	url = https://github.com/Rmehta-sudo/SnaPdf
 	arch = x86_64
@@ -17,7 +17,7 @@ pkgbase = snapdf
 	source = LICENSE
 	sha256sums = 460b68ea27d4e8a714713f75f99fed6ab62d4d3cf70216d9e4f4eb03cb55774b
 	sha256sums = e5ab173cb99250daa845451a83855279820b7a57f678d8ec0e3dc985043704a0
-	source_x86_64 = SnaPdf-0.3.4-x86_64.AppImage::https://github.com/Rmehta-sudo/SnaPdf/releases/download/v0.3.4/SnaPdf-0.3.4-x86_64.AppImage
-	sha256sums_x86_64 = 8ad4af2410f0c58fb6a6bc18131d2a0ec251e853050121308d81916052b33c1c
+	source_x86_64 = SnaPdf-0.3.5-x86_64.AppImage::https://github.com/Rmehta-sudo/SnaPdf/releases/download/v0.3.5/SnaPdf-0.3.5-x86_64.AppImage
+	sha256sums_x86_64 = e76a7c60e4e64cc8f53cb8103b3c7fdd03db2a5da671dbd19149594b143a1cb5
 
 pkgname = snapdf
