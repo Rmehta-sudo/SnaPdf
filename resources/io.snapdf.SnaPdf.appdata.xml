@@ -28,6 +28,15 @@
   </provides>
   <content_rating type="oars-1.1"/>
   <releases>
+    <release version="0.4.1" date="2026-11-01">
+      <description>
+        <p>Paging quickly through image-heavy PDFs no longer stalls: pages draw a quick preview
+        first, the page being read always renders before older requests, and pages skipped while
+        flipping are requested again when revisited.</p>
+        <p>Redesigns Settings as a centered panel with General, Appearance, and Study chat
+        sections, toggle switches, and clearer update status.</p>
+      </description>
+    </release>
     <release version="0.4.0" date="2026-11-01">
       <description>
         <p>Opening a PDF while SnaPdf is running now adds a tab to the existing window instead

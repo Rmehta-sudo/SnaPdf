@@ -1,9 +1,14 @@
 use crossbeam_channel::{Receiver, Sender, unbounded};
 use pdfium_bundled::pdfium_render::prelude::*;
+use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::process::Command;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+
+/// Width of the quick first pass drawn before a page's sharp render, so a
+/// page never sits blank while a large render is still queued.
+pub const PREVIEW_RENDER_WIDTH: u16 = 480;
 
 #[derive(Debug)]
 pub enum RenderCommand {
@@ -224,6 +229,13 @@ pub enum RenderEvent {
         height: usize,
         rgba: Vec<u8>,
     },
+    /// A render request was dropped because the reader had already moved on.
+    /// The UI must forget it so the page is requested again if revisited.
+    RenderSkipped {
+        page_index: usize,
+        generation: u64,
+        target_width: u16,
+    },
     TextExtracted {
         page_index: usize,
         generation: u64,
@@ -301,6 +313,36 @@ impl RenderWorker {
     }
 }
 
+/// Pick the most useful queued command. Document-level commands keep their
+/// arrival order; page work goes to whatever is nearest the page being read,
+/// with its quick preview first, then its sharp render, then its text layer.
+/// Fast paging therefore never waits behind renders for pages already left.
+fn next_command(queue: &mut VecDeque<RenderCommand>, focus: usize) -> Option<RenderCommand> {
+    let page_priority = |command: &RenderCommand| match command {
+        RenderCommand::RenderPage {
+            page_index,
+            target_width,
+            ..
+        } => Some((
+            page_index.abs_diff(focus),
+            u8::from(*target_width > PREVIEW_RENDER_WIDTH),
+        )),
+        RenderCommand::ExtractText { page_index, .. } => Some((page_index.abs_diff(focus), 2)),
+        _ => None,
+    };
+    let index = queue
+        .iter()
+        .position(|command| page_priority(command).is_none())
+        .or_else(|| {
+            queue
+                .iter()
+                .enumerate()
+                .min_by_key(|(index, command)| (page_priority(command), *index))
+                .map(|(index, _)| index)
+        })?;
+    queue.remove(index)
+}
+
 fn worker_loop(
     commands: Receiver<RenderCommand>,
     events: Sender<RenderEvent>,
@@ -326,7 +368,18 @@ fn worker_loop(
     let mut document = None;
     let mut active_generation = 0;
 
-    while let Ok(command) = commands.recv() {
+    let mut queue = VecDeque::new();
+    loop {
+        if queue.is_empty() {
+            match commands.recv() {
+                Ok(command) => queue.push_back(command),
+                Err(_) => break,
+            }
+        }
+        queue.extend(commands.try_iter());
+        let Some(command) = next_command(&mut queue, focused_page.load(Ordering::Relaxed)) else {
+            continue;
+        };
         match command {
             RenderCommand::Open { path, generation } => {
                 active_generation = generation;
@@ -363,13 +416,17 @@ fn worker_loop(
                 generation,
             } => {
                 let focus = focused_page.load(Ordering::Relaxed);
-                if generation != active_generation
-                    || generation != desired_generation.load(Ordering::Relaxed)
-                    || page_index.abs_diff(focus) > 2
-                {
-                    continue;
-                }
-                let Some(document) = document.as_ref() else {
+                let Some(document) = document.as_ref().filter(|_| {
+                    generation == active_generation
+                        && generation == desired_generation.load(Ordering::Relaxed)
+                        && page_index.abs_diff(focus) <= 2
+                }) else {
+                    let _ = events.send(RenderEvent::RenderSkipped {
+                        page_index,
+                        generation,
+                        target_width,
+                    });
+                    repaint.request_repaint();
                     continue;
                 };
 
@@ -928,7 +985,70 @@ use crate::model::{Annotation, AnnotationKind};
 
 #[cfg(test)]
 mod tests {
-    use super::{highlight_quad_points, merge_highlight_rects};
+    use super::{
+        PREVIEW_RENDER_WIDTH, RenderCommand, highlight_quad_points, merge_highlight_rects,
+        next_command,
+    };
+    use std::collections::VecDeque;
+
+    fn render(page_index: usize, target_width: u16) -> RenderCommand {
+        RenderCommand::RenderPage {
+            page_index,
+            target_width,
+            generation: 1,
+        }
+    }
+
+    fn order(queue: &mut VecDeque<RenderCommand>, focus: usize) -> Vec<(usize, u16)> {
+        std::iter::from_fn(|| next_command(queue, focus))
+            .map(|command| match command {
+                RenderCommand::RenderPage {
+                    page_index,
+                    target_width,
+                    ..
+                } => (page_index, target_width),
+                RenderCommand::ExtractText { page_index, .. } => (page_index, 0),
+                _ => (usize::MAX, 0),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn focused_page_preview_jumps_ahead_of_older_queued_renders() {
+        let mut queue = VecDeque::from([
+            render(3, 2400),
+            RenderCommand::ExtractText {
+                page_index: 5,
+                generation: 1,
+            },
+            render(5, 2400),
+            render(4, PREVIEW_RENDER_WIDTH),
+            render(5, PREVIEW_RENDER_WIDTH),
+        ]);
+        assert_eq!(
+            order(&mut queue, 5),
+            vec![
+                (5, PREVIEW_RENDER_WIDTH),
+                (5, 2400),
+                (5, 0),
+                (4, PREVIEW_RENDER_WIDTH),
+                (3, 2400),
+            ]
+        );
+    }
+
+    #[test]
+    fn document_commands_run_before_page_work_in_arrival_order() {
+        let mut queue = VecDeque::from([
+            render(0, 2400),
+            RenderCommand::Shutdown,
+            render(0, PREVIEW_RENDER_WIDTH),
+        ]);
+        assert!(matches!(
+            next_command(&mut queue, 0),
+            Some(RenderCommand::Shutdown)
+        ));
+    }
 
     #[test]
     fn character_highlights_are_merged_into_visual_lines() {

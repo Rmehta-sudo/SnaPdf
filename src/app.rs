@@ -10,8 +10,8 @@ use crate::model::{
 };
 use crate::ocr::{OcrCommand, OcrEvent, OcrWorker};
 use crate::pdf::{
-    LinkTarget, PdfFileSearchMatches, PdfLinkRegion, PdfOutlineItem, PdfSearchMatch, RenderCommand,
-    RenderEvent, RenderWorker, TextGlyph, search_pdf_files,
+    LinkTarget, PREVIEW_RENDER_WIDTH, PdfFileSearchMatches, PdfLinkRegion, PdfOutlineItem,
+    PdfSearchMatch, RenderCommand, RenderEvent, RenderWorker, TextGlyph, search_pdf_files,
 };
 use crate::update::{self, UpdateEvent, UpdateStatus, UpdateWorker};
 use crate::{storage, theme};
@@ -35,7 +35,7 @@ use walkdir::WalkDir;
 
 const MAX_TEXTURES: usize = 10;
 const MAX_TEXTURE_BYTES: usize = 256 * 1024 * 1024;
-const MAX_PENDING_PAGES: usize = 6;
+const MAX_PENDING_PAGES: usize = 16;
 const PAGE_GAP: f32 = 18.0;
 const KEYBOARD_TAP_SCROLL: f32 = 150.0;
 const WHEEL_SCROLL_MULTIPLIER: f32 = 1.65;
@@ -591,6 +591,7 @@ pub struct SnaPdfApp {
     browser_scan: Option<Receiver<BrowserScanResult>>,
     pinned_comment: Option<u64>,
     show_view_settings: bool,
+    settings_page: SettingsPage,
     pdf_default_application: Option<String>,
     confirm_save_to_source: bool,
     pending_source_save: Option<(PathBuf, PathBuf)>,
@@ -736,6 +737,7 @@ impl SnaPdfApp {
             browser_scan: None,
             pinned_comment: None,
             show_view_settings: false,
+            settings_page: SettingsPage::General,
             pdf_default_application: None,
             confirm_save_to_source: false,
             pending_source_save: None,
@@ -807,22 +809,21 @@ impl SnaPdfApp {
         }
     }
 
-    fn update_settings_section(&mut self, ui: &mut egui::Ui) {
-        ui.label(RichText::new("Updates").strong());
-        ui.label(RichText::new(format!("SnaPdf {}", update::CURRENT_VERSION)).size(12.0));
+    fn settings_updates_card(&mut self, ui: &mut egui::Ui) {
         let can_self_update = update::self_update_target().is_some();
-        let (message, color) = match &self.update_status {
+        let busy = matches!(
+            self.update_status,
+            UpdateStatus::Checking | UpdateStatus::Installing(_)
+        );
+        let (status, color) = match &self.update_status {
             UpdateStatus::Checking => ("Checking for updates…".to_owned(), theme::MUTED),
-            UpdateStatus::UpToDate => (
-                "You're on the latest release.".to_owned(),
-                Color32::from_rgb(120, 200, 140),
-            ),
+            UpdateStatus::UpToDate => ("You're on the latest release.".to_owned(), SETTINGS_OK),
             UpdateStatus::Available(release) => (
-                format!("SnaPdf {} is available.", release.version),
+                format!("Version {} is available.", release.version),
                 Color32::from_rgb(255, 196, 92),
             ),
             UpdateStatus::Installing(release) => (
-                format!("Downloading SnaPdf {}…", release.version),
+                format!("Downloading version {}…", release.version),
                 theme::MUTED,
             ),
             UpdateStatus::Failed(error) => (
@@ -830,43 +831,69 @@ impl SnaPdfApp {
                 Color32::from_rgb(235, 120, 110),
             ),
         };
-        ui.horizontal(|ui| {
-            if matches!(
-                self.update_status,
-                UpdateStatus::Checking | UpdateStatus::Installing(_)
-            ) {
-                ui.spinner();
+        let mut start_update = false;
+        let mut check = false;
+        settings_card(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.vertical(|ui| {
+                    ui.label(
+                        RichText::new(format!("SnaPdf {}", update::CURRENT_VERSION))
+                            .size(15.0)
+                            .strong()
+                            .color(Color32::from_rgb(236, 236, 236)),
+                    );
+                    ui.horizontal(|ui| {
+                        if busy {
+                            ui.spinner();
+                        }
+                        ui.label(RichText::new(&status).size(12.5).color(color));
+                    });
+                });
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    match &self.update_status {
+                        UpdateStatus::Available(release) if !can_self_update => {
+                            if ui.button("Release page").clicked() {
+                                let _ = webbrowser::open(&release.page_url);
+                            }
+                        }
+                        UpdateStatus::Available(_) => {
+                            if ui
+                                .add(
+                                    egui::Button::new(
+                                        RichText::new("Update and restart").color(Color32::BLACK),
+                                    )
+                                    .fill(SETTINGS_ACCENT),
+                                )
+                                .clicked()
+                            {
+                                start_update = true;
+                            }
+                        }
+                        _ if !busy => {
+                            if ui.button("Check for updates").clicked() {
+                                check = true;
+                            }
+                        }
+                        _ => {}
+                    }
+                });
+            });
+            if !can_self_update && matches!(self.update_status, UpdateStatus::Available(_)) {
+                ui.label(
+                    RichText::new(
+                        "This copy wasn't installed as the portable AppImage, so update it the way you installed it.",
+                    )
+                    .size(11.5)
+                    .color(theme::MUTED),
+                );
             }
-            ui.label(RichText::new(message).size(11.5).color(color));
         });
-        ui.horizontal(|ui| {
-            let available = matches!(self.update_status, UpdateStatus::Available(_));
-            if available && can_self_update {
-                if ui.button("Update and restart").clicked() {
-                    self.start_update();
-                }
-            } else if let UpdateStatus::Available(release) = &self.update_status
-                && ui.button("Open release page").clicked()
-            {
-                let _ = webbrowser::open(&release.page_url);
-            }
-            if !matches!(
-                self.update_status,
-                UpdateStatus::Checking | UpdateStatus::Installing(_)
-            ) && ui.button("Check again").clicked()
-            {
-                self.update_status = UpdateStatus::Checking;
-                self.update_worker.check();
-            }
-        });
-        if !can_self_update && matches!(self.update_status, UpdateStatus::Available(_)) {
-            ui.label(
-                RichText::new(
-                    "This copy was not installed as the portable AppImage; update it the way you installed it.",
-                )
-                .size(10.5)
-                .color(theme::MUTED),
-            );
+        if start_update {
+            self.start_update();
+        }
+        if check {
+            self.update_status = UpdateStatus::Checking;
+            self.update_worker.check();
         }
     }
 
@@ -893,6 +920,7 @@ impl SnaPdfApp {
                     if ui.button("Open settings").clicked() {
                         self.show_update_prompt = false;
                         self.pdf_default_application = current_pdf_default_application();
+                        self.settings_page = SettingsPage::General;
                         self.show_view_settings = true;
                     }
                     if ui.button("Later").clicked() {
@@ -1478,6 +1506,17 @@ impl SnaPdfApp {
                         );
                     }
                     self.trim_texture_cache();
+                }
+                RenderEvent::RenderSkipped {
+                    page_index,
+                    generation,
+                    target_width,
+                } => {
+                    self.pending_pages.remove(&PageKey {
+                        index: page_index,
+                        width: target_width,
+                        generation,
+                    });
                 }
                 RenderEvent::TextExtracted {
                     page_index,
@@ -5183,7 +5222,21 @@ impl SnaPdfApp {
                                     Stroke::new(1.0, Color32::from_gray(80)),
                                     StrokeKind::Inside,
                                 );
-                                if needs_render {
+                                // The worker only renders near the focused page;
+                                // asking for farther pages would just bounce back
+                                // as skipped requests every frame.
+                                if needs_render && index.abs_diff(visible_page) <= 2 {
+                                    // A blank page gets a quick low-resolution
+                                    // pass first; the sharp render replaces it.
+                                    if !self.textures.get(&index).is_some_and(|page| {
+                                        page.generation == generation
+                                    }) && target_width > PREVIEW_RENDER_WIDTH
+                                    {
+                                        self.request_page(PageKey {
+                                            width: PREVIEW_RENDER_WIDTH,
+                                            ..key
+                                        });
+                                    }
                                     self.request_page(key);
                                 }
                                 self.request_text(index, generation);
@@ -6065,7 +6118,6 @@ impl SnaPdfApp {
         if !self.show_view_settings {
             return;
         }
-        let mut open = true;
         let mut interface_scale = self.state.ui_scale;
         let mut toolbar_ratio = self.state.chrome_scale_ratio;
         let mut sidebar_ratio = self.state.sidebar_scale_ratio;
@@ -6073,166 +6125,283 @@ impl SnaPdfApp {
         let mut file_icons = self.state.sidebar_file_icons;
         let mut changed = false;
         let mut set_default_pdf_viewer = false;
-        egui::Window::new("View settings")
-            .open(&mut open)
-            .collapsible(false)
-            .resizable(false)
-            .default_width(300.0)
-            .show(ctx, |ui| {
-                self.update_settings_section(ui);
-                ui.add_space(8.0);
-                ui.separator();
-                ui.add_space(4.0);
-                ui.label(RichText::new("Interface scale").strong());
-                ui.label(
-                    RichText::new(
-                        "Scale the interface independently. PDF zoom stays in the document toolbar, pinch gesture, and Ctrl+scroll.",
-                    )
-                        .size(11.5)
-                        .color(theme::MUTED),
-                );
-                ui.add_space(8.0);
-                ui.label(RichText::new("Overall interface").size(12.0));
-                changed |= ui
-                    .add(
-                        egui::Slider::new(
-                            &mut interface_scale,
-                            DEFAULT_UI_SCALE * 0.5..=DEFAULT_UI_SCALE * 2.0,
-                        )
-                            .step_by((DEFAULT_UI_SCALE * 0.05) as f64)
-                            .custom_formatter(|value, _| {
-                                format!("{}%", normalized_scale_percent(value, DEFAULT_UI_SCALE))
-                            }),
-                    )
-                    .changed();
-                ui.add_space(7.0);
-                ui.label(RichText::new("Top bar").size(12.0));
-                changed |= ui
-                    .add(
-                        egui::Slider::new(
-                            &mut toolbar_ratio,
-                            DEFAULT_CHROME_SCALE_RATIO * 0.5
-                                ..=DEFAULT_CHROME_SCALE_RATIO * 2.0,
-                        )
-                            .step_by((DEFAULT_CHROME_SCALE_RATIO * 0.05) as f64)
-                            .custom_formatter(|value, _| {
-                                format!(
-                                    "{}%",
-                                    normalized_scale_percent(value, DEFAULT_CHROME_SCALE_RATIO)
-                                )
-                            }),
-                    )
-                    .changed();
-                ui.add_space(7.0);
-                ui.label(RichText::new("File explorer").size(12.0));
-                changed |= ui
-                    .add(
-                        egui::Slider::new(
-                            &mut sidebar_ratio,
-                            DEFAULT_SIDEBAR_SCALE_RATIO * 0.5
-                                ..=DEFAULT_SIDEBAR_SCALE_RATIO * 2.0,
-                        )
-                            .step_by((DEFAULT_SIDEBAR_SCALE_RATIO * 0.05) as f64)
-                            .custom_formatter(|value, _| {
-                                format!(
-                                    "{}%",
-                                    normalized_scale_percent(value, DEFAULT_SIDEBAR_SCALE_RATIO)
-                                )
-                            }),
-                    )
-                    .changed();
-                ui.add_space(6.0);
-                if ui
-                    .small_button("Reset defaults (100% each)")
-                    .clicked()
-                {
-                    interface_scale = DEFAULT_UI_SCALE;
-                    toolbar_ratio = DEFAULT_CHROME_SCALE_RATIO;
-                    sidebar_ratio = DEFAULT_SIDEBAR_SCALE_RATIO;
-                    changed = true;
-                }
-                ui.add_space(10.0);
-                ui.label(RichText::new("PDF icons in explorer").size(12.0));
-                changed |= ui
-                    .radio_value(&mut file_icons, SidebarFileIcons::Standard, "Standard")
-                    .changed();
-                changed |= ui
-                    .radio_value(
-                        &mut file_icons,
-                        SidebarFileIcons::VsCode,
-                        "VS Code-style PDF",
-                    )
-                    .changed();
-                changed |= ui
-                    .radio_value(&mut file_icons, SidebarFileIcons::None, "No icons")
-                    .changed();
-                ui.add_space(10.0);
-                ui.label(RichText::new("Study chat text").size(12.0));
-                changed |= ui
-                    .add(
-                        egui::Slider::new(&mut chat_font_size, 11.0..=28.0)
-                            .step_by(0.5)
-                            .suffix(" pt"),
-                    )
-                    .changed();
-                ui.add_space(10.0);
-                changed |= ui
-                    .checkbox(
-                        &mut self.state.warn_before_replacing_study_chat,
-                        "Warn before replacing the oldest Study chat",
-                    )
-                    .changed();
-                changed |= ui
-                    .checkbox(
-                        &mut self.state.hide_study_chat,
-                        "Hide Study chat and disable its actions",
-                    )
-                    .changed();
-                ui.label(
-                    RichText::new("Ctrl+Shift+A shows or hides the chat panel when it is enabled.")
-                        .size(10.5)
-                        .color(theme::MUTED),
-                );
-                ui.add_space(10.0);
-                ui.separator();
-                ui.add_space(4.0);
-                ui.label(RichText::new("Default PDF application").size(12.0));
-                let current_default = self.pdf_default_application.clone();
-                let is_default = current_default
-                    .as_deref()
-                    .is_some_and(|desktop_id| desktop_id == "io.snapdf.SnaPdf.desktop");
-                ui.label(
-                    RichText::new(if is_default {
-                        "SnaPdf is currently your default PDF application."
-                    } else {
-                        "Installation never changes this; choose it only if you want to."
+        let mut close = false;
+
+        let screen = ctx.content_rect();
+        let size = vec2(
+            (screen.width() - 48.0).clamp(320.0, 720.0),
+            (screen.height() - 48.0).clamp(300.0, 560.0),
+        );
+        const NAV_WIDTH: f32 = 184.0;
+        let modal = egui::Modal::new(egui::Id::new("settings-modal"))
+            .backdrop_color(Color32::from_black_alpha(130))
+            .frame(
+                Frame::new()
+                    .fill(SETTINGS_BG)
+                    .stroke(Stroke::new(1.0, Color32::from_rgb(58, 58, 58)))
+                    .corner_radius(CornerRadius::same(12))
+                    .shadow(egui::Shadow {
+                        offset: [0, 10],
+                        blur: 32,
+                        spread: 0,
+                        color: Color32::from_black_alpha(140),
                     })
-                    .size(10.5)
-                    .color(theme::MUTED),
+                    .inner_margin(Margin::ZERO),
+            )
+            .show(ctx, |ui| {
+                let (rect, _) = ui.allocate_exact_size(size, Sense::hover());
+                let nav_rect = Rect::from_min_size(rect.min, vec2(NAV_WIDTH, size.y));
+                let content_rect =
+                    Rect::from_min_max(pos2(rect.left() + NAV_WIDTH, rect.top()), rect.max);
+                ui.painter().rect_filled(
+                    nav_rect,
+                    CornerRadius {
+                        nw: 12,
+                        ne: 0,
+                        sw: 12,
+                        se: 0,
+                    },
+                    SETTINGS_NAV_BG,
                 );
-                let button_label = if is_default {
-                    "SnaPdf is the default"
-                } else {
-                    "Make SnaPdf the default PDF app"
-                };
-                if ui
-                    .add_enabled(!is_default, egui::Button::new(button_label))
-                    .clicked()
-                {
-                    set_default_pdf_viewer = true;
-                }
-                if !is_default && let Some(desktop_id) = current_default {
-                    ui.label(
-                        RichText::new(format!("Current default: {desktop_id}"))
-                            .size(10.0)
-                            .color(theme::MUTED),
-                    );
-                }
+                // Category navigation.
+                ui.scope_builder(
+                    egui::UiBuilder::new()
+                        .max_rect(nav_rect.shrink2(vec2(10.0, 18.0)))
+                        .layout(Layout::top_down(Align::Min)),
+                    |ui| {
+                        ui.horizontal(|ui| {
+                            ui.add_space(8.0);
+                            ui.label(
+                                RichText::new("Settings")
+                                    .size(19.0)
+                                    .strong()
+                                    .color(Color32::from_rgb(240, 240, 240)),
+                            );
+                        });
+                        ui.add_space(14.0);
+                        for page in [
+                            SettingsPage::General,
+                            SettingsPage::Appearance,
+                            SettingsPage::StudyChat,
+                        ] {
+                            if settings_nav_item(ui, page.label(), self.settings_page == page)
+                                .clicked()
+                            {
+                                self.settings_page = page;
+                            }
+                            ui.add_space(2.0);
+                        }
+                    },
+                );
+                // Page content.
+                ui.scope_builder(
+                    egui::UiBuilder::new()
+                        .max_rect(Rect::from_min_max(
+                            content_rect.min + vec2(24.0, 14.0),
+                            content_rect.max - vec2(10.0, 12.0),
+                        ))
+                        .layout(Layout::top_down(Align::Min)),
+                    |ui| {
+                        ui.horizontal(|ui| {
+                            ui.label(
+                                RichText::new(self.settings_page.label())
+                                    .size(17.0)
+                                    .strong()
+                                    .color(Color32::from_rgb(240, 240, 240)),
+                            );
+                            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                if chrome_button(ui, ToolbarIcon::Close, false, true, "Close (Esc)")
+                                    .clicked()
+                                {
+                                    close = true;
+                                }
+                            });
+                        });
+                        ui.add_space(8.0);
+                        ScrollArea::vertical()
+                            .id_salt("settings-scroll")
+                            .auto_shrink([false, false])
+                            .show(ui, |ui| {
+                                ui.set_width(ui.available_width() - 14.0);
+                                ui.spacing_mut().item_spacing.y = 10.0;
+                                ui.spacing_mut().slider_width = 170.0;
+                    match self.settings_page {
+                        SettingsPage::General => {
+                            self.settings_updates_card(ui);
+                            settings_card(ui, |ui| {
+                                let current =
+                                    self.pdf_default_application.clone();
+                                let is_default =
+                                    current.as_deref().is_some_and(|id| {
+                                        id == "io.snapdf.SnaPdf.desktop"
+                                    });
+                                let description = if is_default {
+                                    "SnaPdf opens PDFs from your file manager and browser.".to_owned()
+                                } else if let Some(id) = current {
+                                    format!("PDFs currently open in {}.", id.trim_end_matches(".desktop"))
+                                } else {
+                                    "Installing SnaPdf never changes your default.".to_owned()
+                                };
+                                settings_row(
+                                    ui,
+                                    "Default PDF app",
+                                    &description,
+                                    |ui| {
+                                        if is_default {
+                                            ui.label(
+                                                RichText::new("✓ Default")
+                                                    .color(SETTINGS_OK),
+                                            );
+                                        } else if ui
+                                            .button("Make default")
+                                            .clicked()
+                                        {
+                                            set_default_pdf_viewer = true;
+                                        }
+                                    },
+                                );
+                            });
+                        }
+                        SettingsPage::Appearance => {
+                            settings_card(ui, |ui| {
+                                settings_card_title(
+                                    ui,
+                                    "Interface size",
+                                    "PDF zoom is separate: use the toolbar, pinch, or Ctrl+scroll.",
+                                );
+                                for (label, value, default) in [
+                                    (
+                                        "Overall",
+                                        &mut interface_scale,
+                                        DEFAULT_UI_SCALE,
+                                    ),
+                                    (
+                                        "Top bar",
+                                        &mut toolbar_ratio,
+                                        DEFAULT_CHROME_SCALE_RATIO,
+                                    ),
+                                    (
+                                        "File explorer",
+                                        &mut sidebar_ratio,
+                                        DEFAULT_SIDEBAR_SCALE_RATIO,
+                                    ),
+                                ] {
+                                    settings_divider(ui);
+                                    settings_row(ui, label, "", |ui| {
+                                        changed |= settings_slider(
+                                            ui,
+                                            value,
+                                            default * 0.5..=default * 2.0,
+                                            (default * 0.05) as f64,
+                                            |value| {
+                                                format!(
+                                                    "{}%",
+                                                    normalized_scale_percent(value as f64, default)
+                                                )
+                                            },
+                                        );
+                                    });
+                                }
+                                settings_divider(ui);
+                                ui.horizontal(|ui| {
+                                    ui.with_layout(
+                                        Layout::right_to_left(Align::Center),
+                                        |ui| {
+                                            if ui
+                                                .button("Reset to 100%")
+                                                .clicked()
+                                            {
+                                                interface_scale =
+                                                    DEFAULT_UI_SCALE;
+                                                toolbar_ratio =
+                                                    DEFAULT_CHROME_SCALE_RATIO;
+                                                sidebar_ratio =
+                                                    DEFAULT_SIDEBAR_SCALE_RATIO;
+                                                changed = true;
+                                            }
+                                        },
+                                    );
+                                });
+                            });
+                            settings_card(ui, |ui| {
+                                settings_row(
+                                    ui,
+                                    "PDF icons in explorer",
+                                    "How PDFs are marked in the project tree.",
+                                    |ui| {
+                                        changed |= settings_segmented(
+                                            ui,
+                                            &mut file_icons,
+                                            &[
+                                                (SidebarFileIcons::Standard, "Standard"),
+                                                (SidebarFileIcons::VsCode, "VS Code"),
+                                                (SidebarFileIcons::None, "None"),
+                                            ],
+                                        );
+                                    },
+                                );
+                            });
+                        }
+                        SettingsPage::StudyChat => {
+                            settings_card(ui, |ui| {
+                                let mut enabled = !self.state.hide_study_chat;
+                                settings_row(
+                                    ui,
+                                    "Study chat",
+                                    "Show the chat panel and its actions. Ctrl+Shift+A toggles the panel.",
+                                    |ui| {
+                                        if toggle_switch(ui, &mut enabled)
+                                            .changed()
+                                        {
+                                            self.state.hide_study_chat =
+                                                !enabled;
+                                            changed = true;
+                                        }
+                                    },
+                                );
+                                settings_divider(ui);
+                                settings_row(
+                                    ui,
+                                    "Text size",
+                                    "Message text in the chat panel.",
+                                    |ui| {
+                                        changed |= settings_slider(
+                                            ui,
+                                            &mut chat_font_size,
+                                            11.0..=28.0,
+                                            0.5,
+                                            |value| format!("{value:.1} pt"),
+                                        );
+                                    },
+                                );
+                                settings_divider(ui);
+                                settings_row(
+                                    ui,
+                                    "Confirm before replacing chats",
+                                    "Up to five chats are kept; a sixth replaces the oldest.",
+                                    |ui| {
+                                        changed |= toggle_switch(
+                                            ui,
+                                            &mut self
+                                                .state
+                                                .warn_before_replacing_study_chat,
+                                        )
+                                        .changed();
+                                    },
+                                );
+                            });
+                        }
+                    }
+                                ui.add_space(12.0);
+                            });
+                    },
+                );
             });
+        close |= modal.should_close();
         if set_default_pdf_viewer {
             self.set_default_pdf_viewer();
         }
-        if !open {
+        if close {
             self.show_view_settings = false;
         }
         if changed {
@@ -8074,6 +8243,225 @@ fn mini_mode_icon_button(ui: &mut egui::Ui, icon: ModeControlIcon, help: &str) -
         }
     }
     response.on_hover_text(help)
+}
+
+const SETTINGS_BG: Color32 = Color32::from_rgb(32, 32, 32);
+const SETTINGS_NAV_BG: Color32 = Color32::from_rgb(26, 26, 26);
+const SETTINGS_CARD: Color32 = Color32::from_rgb(42, 42, 42);
+const SETTINGS_OK: Color32 = Color32::from_rgb(120, 200, 140);
+const SETTINGS_ACCENT: Color32 = Color32::from_rgb(120, 180, 255);
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SettingsPage {
+    General,
+    Appearance,
+    StudyChat,
+}
+
+impl SettingsPage {
+    fn label(self) -> &'static str {
+        match self {
+            Self::General => "General",
+            Self::Appearance => "Appearance",
+            Self::StudyChat => "Study chat",
+        }
+    }
+}
+
+fn settings_nav_item(ui: &mut egui::Ui, label: &str, selected: bool) -> Response {
+    let (rect, response) = ui.allocate_exact_size(vec2(ui.available_width(), 34.0), Sense::click());
+    if selected || response.hovered() {
+        ui.painter().rect_filled(
+            rect,
+            CornerRadius::same(7),
+            if selected {
+                Color32::from_rgb(48, 48, 48)
+            } else {
+                Color32::from_rgb(38, 38, 38)
+            },
+        );
+    }
+    if selected {
+        ui.painter().rect_filled(
+            Rect::from_min_size(
+                rect.left_top() + vec2(0.0, 9.0),
+                vec2(3.0, rect.height() - 18.0),
+            ),
+            CornerRadius::same(2),
+            SETTINGS_ACCENT,
+        );
+    }
+    ui.painter().text(
+        rect.left_center() + vec2(14.0, 0.0),
+        Align2::LEFT_CENTER,
+        label,
+        FontId::proportional(14.0),
+        if selected {
+            Color32::from_rgb(245, 245, 245)
+        } else {
+            Color32::from_rgb(190, 190, 190)
+        },
+    );
+    response
+}
+
+fn settings_card(ui: &mut egui::Ui, add_contents: impl FnOnce(&mut egui::Ui)) {
+    Frame::new()
+        .fill(SETTINGS_CARD)
+        .corner_radius(CornerRadius::same(10))
+        .inner_margin(Margin::symmetric(16, 12))
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.spacing_mut().item_spacing.y = 8.0;
+            add_contents(ui);
+        });
+}
+
+fn settings_card_title(ui: &mut egui::Ui, title: &str, description: &str) {
+    ui.label(
+        RichText::new(title)
+            .size(14.0)
+            .strong()
+            .color(Color32::from_rgb(236, 236, 236)),
+    );
+    ui.label(RichText::new(description).size(12.0).color(theme::MUTED));
+}
+
+fn settings_divider(ui: &mut egui::Ui) {
+    let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), 1.0), Sense::hover());
+    ui.painter()
+        .rect_filled(rect, 0.0, Color32::from_rgb(54, 54, 54));
+}
+
+/// A settings row: title and optional description on the left, its control
+/// right-aligned on the same line.
+fn settings_row(
+    ui: &mut egui::Ui,
+    title: &str,
+    description: &str,
+    add_control: impl FnOnce(&mut egui::Ui),
+) {
+    ui.horizontal(|ui| {
+        ui.set_min_height(32.0);
+        let control_width = (ui.available_width() * 0.5).min(300.0);
+        ui.vertical(|ui| {
+            ui.set_width(ui.available_width() - control_width - 12.0);
+            ui.label(
+                RichText::new(title)
+                    .size(13.5)
+                    .color(Color32::from_rgb(230, 230, 230)),
+            );
+            if !description.is_empty() {
+                ui.label(RichText::new(description).size(11.5).color(theme::MUTED));
+            }
+        });
+        ui.with_layout(Layout::right_to_left(Align::Center), add_control);
+    });
+}
+
+/// A slider with a visible track and its value shown to the right. Call it
+/// inside a settings row, whose control area is laid out right-to-left.
+fn settings_slider(
+    ui: &mut egui::Ui,
+    value: &mut f32,
+    range: std::ops::RangeInclusive<f32>,
+    step: f64,
+    format: impl Fn(f32) -> String,
+) -> bool {
+    ui.add_sized(
+        [54.0, 20.0],
+        egui::Label::new(
+            RichText::new(format(*value))
+                .size(12.5)
+                .color(Color32::from_rgb(200, 200, 200)),
+        ),
+    );
+    ui.scope(|ui| {
+        let visuals = ui.visuals_mut();
+        visuals.widgets.inactive.bg_fill = Color32::from_rgb(74, 74, 74);
+        visuals.widgets.inactive.fg_stroke.color = Color32::from_rgb(235, 235, 235);
+        visuals.widgets.hovered.fg_stroke.color = Color32::WHITE;
+        visuals.selection.bg_fill = SETTINGS_ACCENT;
+        visuals.slider_trailing_fill = true;
+        ui.add(
+            egui::Slider::new(value, range)
+                .step_by(step)
+                .show_value(false),
+        )
+        .changed()
+    })
+    .inner
+}
+
+fn toggle_switch(ui: &mut egui::Ui, on: &mut bool) -> Response {
+    let size = vec2(38.0, 20.0);
+    let (rect, mut response) = ui.allocate_exact_size(size, Sense::click());
+    if response.clicked() {
+        *on = !*on;
+        response.mark_changed();
+    }
+    let t = ui.ctx().animate_bool_responsive(response.id, *on);
+    let track = Color32::from_rgb(80, 80, 80).lerp_to_gamma(SETTINGS_ACCENT, t);
+    ui.painter()
+        .rect_filled(rect, CornerRadius::same(10), track);
+    let knob_x = egui::lerp(rect.left() + 10.0..=rect.right() - 10.0, t);
+    ui.painter().circle_filled(
+        pos2(knob_x, rect.center().y),
+        7.0,
+        if *on {
+            Color32::from_rgb(20, 20, 20)
+        } else {
+            Color32::from_rgb(220, 220, 220)
+        },
+    );
+    response
+}
+
+fn settings_segmented<T: Copy + PartialEq>(
+    ui: &mut egui::Ui,
+    value: &mut T,
+    options: &[(T, &str)],
+) -> bool {
+    let mut changed = false;
+    Frame::new()
+        .fill(Color32::from_rgb(30, 30, 30))
+        .corner_radius(CornerRadius::same(8))
+        .inner_margin(Margin::same(3))
+        .show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 2.0;
+                // Inside a right-to-left row, add the options in reverse so
+                // they still read left to right.
+                let reversed = ui.layout().prefer_right_to_left();
+                let ordered: Vec<_> = if reversed {
+                    options.iter().rev().collect()
+                } else {
+                    options.iter().collect()
+                };
+                for (option, label) in ordered {
+                    let selected = *value == *option;
+                    let response = ui.add(
+                        egui::Button::new(RichText::new(*label).size(12.5).color(if selected {
+                            Color32::from_rgb(245, 245, 245)
+                        } else {
+                            Color32::from_rgb(170, 170, 170)
+                        }))
+                        .fill(if selected {
+                            Color32::from_rgb(64, 64, 64)
+                        } else {
+                            Color32::TRANSPARENT
+                        })
+                        .stroke(Stroke::NONE)
+                        .corner_radius(CornerRadius::same(6)),
+                    );
+                    if response.clicked() && !selected {
+                        *value = *option;
+                        changed = true;
+                    }
+                }
+            });
+        });
+    changed
 }
 
 /// Scale a chrome region by its user-adjustable ratio, independent of the
