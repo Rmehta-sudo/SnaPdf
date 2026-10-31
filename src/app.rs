@@ -4341,11 +4341,6 @@ impl SnaPdfApp {
                                 .get(&provider)
                                 .cloned()
                                 .unwrap_or_else(|| "Not signed in".to_owned());
-                            let account_button_label = if account_connected {
-                                elide(&account_name, 16)
-                            } else {
-                                "Sign in".to_owned()
-                            };
                             ui.horizontal(|ui| {
                                 let provider_menu = chat_header_provider_button(
                                     ui,
@@ -4374,69 +4369,14 @@ impl SnaPdfApp {
                                         self.study_chat.visible = false;
                                         self.persist();
                                     }
-                                    if chat_icon_button(
+                                    let more = chat_icon_button(
                                         ui,
-                                        ToolbarIcon::DeleteChat,
-                                        !self.study_chat.busy,
-                                        "Delete this chat",
-                                    )
-                                    .clicked()
-                                    {
-                                        self.delete_active_study_chat();
-                                    }
-                                    if chat_icon_button(
-                                        ui,
-                                        ToolbarIcon::NewChat,
-                                        !self.study_chat.busy,
-                                        "New study chat",
-                                    )
-                                    .clicked()
-                                    {
-                                        self.request_new_study_chat();
-                                    }
-                                    if chat_icon_button(
-                                        ui,
-                                        ToolbarIcon::Rename,
-                                        !self.study_chat.busy,
-                                        "Rename this chat",
-                                    )
-                                    .clicked()
-                                    {
-                                        begin_rename = true;
-                                    }
-                                    let account_menu = ui
-                                        .add(
-                                            egui::Button::new(
-                                                RichText::new(format!(
-                                                    "{}  {}",
-                                                    if account_connected { "●" } else { "○" },
-                                                    account_button_label
-                                                ))
-                                                .size(chat_control_text_size(chat_font_size))
-                                                .color(if account_connected {
-                                                    Color32::from_rgb(193, 239, 227)
-                                                } else {
-                                                    CHAT_TEXT
-                                                }),
-                                            )
-                                            .fill(Color32::from_rgb(31, 31, 31))
-                                            .stroke(Stroke::new(
-                                                1.0,
-                                                if account_connected {
-                                                    Color32::from_rgb(55, 92, 82)
-                                                } else {
-                                                    Color32::from_rgb(55, 55, 55)
-                                                },
-                                            ))
-                                            .corner_radius(CornerRadius::same(12))
-                                            .min_size(vec2(58.0, 23.0)),
-                                        )
-                                        .on_hover_text(format!(
-                                            "{} — {}\nClick for account options",
-                                            provider.label(),
-                                            account_name
-                                        ));
-                                    egui::Popup::menu(&account_menu).show(|ui| {
+                                        ToolbarIcon::More,
+                                        true,
+                                        "Account",
+                                    );
+                                    egui::Popup::menu(&more).show(|ui| {
+                                        ui.set_min_width(220.0);
                                         ui.set_min_width(220.0);
                                         ui.label(
                                             RichText::new(provider.label())
@@ -4509,6 +4449,36 @@ impl SnaPdfApp {
                                             }
                                         }
                                     });
+                                    if chat_icon_button(
+                                        ui,
+                                        ToolbarIcon::NewChat,
+                                        !self.study_chat.busy,
+                                        "New study chat",
+                                    )
+                                    .clicked()
+                                    {
+                                        self.request_new_study_chat();
+                                    }
+                                    if chat_icon_button(
+                                        ui,
+                                        ToolbarIcon::DeleteChat,
+                                        !self.study_chat.busy,
+                                        "Delete this chat",
+                                    )
+                                    .clicked()
+                                    {
+                                        self.delete_active_study_chat();
+                                    }
+                                    if chat_icon_button(
+                                        ui,
+                                        ToolbarIcon::Rename,
+                                        !self.study_chat.busy,
+                                        "Rename this chat",
+                                    )
+                                    .clicked()
+                                    {
+                                        begin_rename = true;
+                                    }
                                 });
                             });
                             if let Some(provider) = chosen_provider {
@@ -4601,6 +4571,12 @@ impl SnaPdfApp {
                                 }
                             }
                         });
+                    let divider = ui.min_rect();
+                    ui.painter().hline(
+                        divider.x_range(),
+                        divider.bottom(),
+                        Stroke::new(1.0, CHAT_DIVIDER),
+                    );
 
                     let connected = self
                         .study_chat
@@ -4694,8 +4670,8 @@ impl SnaPdfApp {
                                         ui.horizontal(|ui| {
                                             for (index, attachment) in self.study_chat.attachments.iter().enumerate() {
                                                 Frame::new()
-                                                    .fill(Color32::from_rgb(36, 36, 36))
-                                                    .stroke(Stroke::new(1.0, Color32::from_rgb(55, 55, 55)))
+                                                    .fill(CHAT_FIELD)
+                                                    .stroke(Stroke::new(1.0, Color32::from_rgb(64, 64, 64)))
                                                     .corner_radius(CornerRadius::same(10))
                                                     .inner_margin(Margin::symmetric(8, 5))
                                                     .show(ui, |ui| {
@@ -4725,8 +4701,8 @@ impl SnaPdfApp {
 
                             let mut send_with_enter = false;
                             Frame::new()
-                                .fill(Color32::from_rgb(35, 35, 35))
-                                .stroke(Stroke::new(1.0, Color32::from_rgb(58, 58, 58)))
+                                .fill(CHAT_FIELD)
+                                .stroke(Stroke::new(1.0, Color32::from_rgb(64, 64, 64)))
                                 .corner_radius(CornerRadius::same(22))
                                 .inner_margin(Margin::symmetric(12, 9))
                                 .show(ui, |ui| {
@@ -8559,15 +8535,18 @@ fn toolbar_divider(ui: &mut egui::Ui) {
 /// buttons, it has no font fallback dependency and therefore cannot turn into a
 /// missing-glyph square on a minimal desktop installation.
 fn chat_icon_button(ui: &mut egui::Ui, icon: ToolbarIcon, enabled: bool, help: &str) -> Response {
-    let (rect, response) = ui.allocate_exact_size(vec2(27.0, 25.0), Sense::click());
-    let color = if enabled {
-        Color32::from_rgb(210, 210, 210)
-    } else {
+    let (rect, response) = ui.allocate_exact_size(vec2(30.0, 28.0), Sense::click());
+    let hovered = enabled && response.hovered();
+    let color = if !enabled {
         Color32::from_rgb(88, 88, 88)
+    } else if hovered {
+        Color32::from_rgb(245, 245, 245)
+    } else {
+        Color32::from_rgb(196, 196, 196)
     };
-    if response.hovered() && enabled {
+    if hovered {
         ui.painter()
-            .rect_filled(rect, CornerRadius::same(5), Color32::from_rgb(48, 48, 48));
+            .rect_filled(rect.shrink(1.0), CornerRadius::same(7), CHAT_HOVER);
     }
     paint_toolbar_icon(ui.painter(), rect.center(), icon, color);
     response.on_hover_text(help)
@@ -8593,9 +8572,13 @@ fn bounded_panel_content<R>(
     add_contents(&mut content)
 }
 
-const CHAT_CANVAS: Color32 = Color32::from_rgb(14, 14, 14);
-const CHAT_HEADER: Color32 = Color32::from_rgb(21, 21, 21);
+const CHAT_CANVAS: Color32 = theme::SIDEBAR_BG;
+const CHAT_HEADER: Color32 = theme::SIDEBAR_BG;
 const CHAT_DIVIDER: Color32 = Color32::from_rgb(48, 48, 48);
+/// Raised surfaces inside the chat panel: composer, chips, prompt bubbles.
+const CHAT_FIELD: Color32 = Color32::from_rgb(46, 46, 46);
+/// Hover highlight for buttons on the panel or inside the composer.
+const CHAT_HOVER: Color32 = Color32::from_rgb(60, 60, 60);
 const CHAT_ACCENT: Color32 = Color32::from_rgb(16, 163, 127);
 const CHAT_TEXT: Color32 = Color32::from_rgb(236, 236, 236);
 const CHAT_MUTED: Color32 = Color32::from_rgb(166, 166, 166);
@@ -8689,7 +8672,9 @@ fn chat_message(ui: &mut egui::Ui, message: &ChatMessage, streaming: bool, text_
     let mut copied = false;
     let available = ui.available_width().max(1.0);
     let edge_margin = 16.0_f32.min(available * 0.06);
-    let readable_width = (available - edge_margin * 2.0).clamp(1.0, 760.0);
+    // Keep a comfortable margin on wide panels without leaving most of the
+    // panel empty: the column grows with the panel beyond a 760 px minimum.
+    let readable_width = (available - edge_margin * 2.0).clamp(1.0, (available * 0.86).max(760.0));
     let leading = ((available - readable_width) * 0.5).max(0.0);
     match message.role {
         ChatRole::User => {
@@ -8699,8 +8684,7 @@ fn chat_message(ui: &mut egui::Ui, message: &ChatMessage, streaming: bool, text_
                 ui.vertical(|ui| {
                     ui.set_width(bubble_width);
                     Frame::new()
-                        .fill(Color32::from_rgb(40, 40, 40))
-                        .stroke(Stroke::new(1.0, Color32::from_rgb(52, 52, 52)))
+                        .fill(CHAT_FIELD)
                         .corner_radius(CornerRadius::same(18))
                         .inner_margin(Margin::symmetric(13, 10))
                         .show(ui, |ui| {
@@ -8852,23 +8836,26 @@ fn chat_message_attachments(ui: &mut egui::Ui, message: &ChatMessage, text_size:
 }
 
 fn chat_copy_button(ui: &mut egui::Ui, help: &str, text_size: f32) -> Response {
-    let (rect, response) = ui.allocate_exact_size(vec2(56.0, 23.0), Sense::click());
-    if response.hovered() {
+    let (rect, response) = ui.allocate_exact_size(vec2(58.0, 24.0), Sense::click());
+    let color = if response.hovered() {
         ui.painter()
-            .rect_filled(rect, CornerRadius::same(6), Color32::from_rgb(58, 58, 58));
-    }
+            .rect_filled(rect, CornerRadius::same(7), CHAT_FIELD);
+        CHAT_TEXT
+    } else {
+        CHAT_MUTED
+    };
     paint_toolbar_icon(
         ui.painter(),
-        pos2(rect.left() + 11.0, rect.center().y),
+        pos2(rect.left() + 12.0, rect.center().y),
         ToolbarIcon::Copy,
-        CHAT_MUTED,
+        color,
     );
     ui.painter().text(
-        pos2(rect.left() + 22.0, rect.center().y),
+        pos2(rect.left() + 23.0, rect.center().y),
         Align2::LEFT_CENTER,
         "Copy",
         FontId::proportional(chat_meta_text_size(text_size)),
-        CHAT_MUTED,
+        color,
     );
     response.on_hover_text(help)
 }
@@ -8961,19 +8948,11 @@ fn chat_action_button(
     help: &str,
     text_size: f32,
 ) -> Response {
-    let (rect, response) = ui.allocate_exact_size(vec2(width, 26.0), Sense::click());
-    let fill = if response.hovered() {
-        Color32::from_rgb(49, 49, 49)
-    } else {
-        Color32::from_rgb(40, 40, 40)
-    };
-    ui.painter().rect_filled(rect, CornerRadius::same(13), fill);
-    ui.painter().rect_stroke(
-        rect,
-        CornerRadius::same(13),
-        Stroke::new(1.0, Color32::from_rgb(64, 64, 64)),
-        StrokeKind::Inside,
-    );
+    let (rect, response) = ui.allocate_exact_size(vec2(width, 28.0), Sense::click());
+    if response.hovered() {
+        ui.painter()
+            .rect_filled(rect, CornerRadius::same(14), CHAT_HOVER);
+    }
     ui.painter().text(
         rect.center(),
         Align2::CENTER_CENTER,
@@ -8994,7 +8973,7 @@ fn chat_history_button(
     let (rect, response) = ui.allocate_exact_size(vec2(width, 27.0), Sense::click());
     if response.hovered() {
         ui.painter()
-            .rect_filled(rect, CornerRadius::same(7), Color32::from_rgb(28, 28, 28));
+            .rect_filled(rect, CornerRadius::same(7), CHAT_FIELD);
     }
     let font = FontId::proportional(chat_control_text_size(text_size));
     let fitted = fitted_chat_control_text(
@@ -9082,7 +9061,9 @@ fn chat_dropdown_button(
     help: &str,
     text_size: f32,
 ) -> Response {
-    let (rect, response) = ui.allocate_exact_size(vec2(width, 26.0), Sense::click());
+    // Neutral pills sit flush with the composer and only light up on hover;
+    // the accent pill (a call to action such as Connect) stays filled.
+    let (rect, response) = ui.allocate_exact_size(vec2(width, 28.0), Sense::click());
     let fill = if accent {
         if response.hovered() {
             Color32::from_rgb(27, 177, 137)
@@ -9090,24 +9071,11 @@ fn chat_dropdown_button(
             CHAT_ACCENT
         }
     } else if response.hovered() {
-        Color32::from_rgb(49, 49, 49)
+        CHAT_HOVER
     } else {
-        Color32::from_rgb(40, 40, 40)
+        Color32::TRANSPARENT
     };
-    ui.painter().rect_filled(rect, CornerRadius::same(13), fill);
-    ui.painter().rect_stroke(
-        rect,
-        CornerRadius::same(13),
-        Stroke::new(
-            1.0,
-            if accent {
-                CHAT_ACCENT
-            } else {
-                Color32::from_rgb(64, 64, 64)
-            },
-        ),
-        StrokeKind::Inside,
-    );
+    ui.painter().rect_filled(rect, CornerRadius::same(14), fill);
     let text_color = if accent { Color32::WHITE } else { CHAT_TEXT };
     let font = FontId::proportional(chat_control_text_size(text_size));
     let fitted_label = fitted_chat_control_text(
@@ -9152,18 +9120,10 @@ fn chat_header_provider_button(
         .x;
     let width = (label_width + 34.0).clamp(92.0, 160.0);
     let (rect, response) = ui.allocate_exact_size(vec2(width, 31.0), Sense::click());
-    let fill = if response.hovered() {
-        Color32::from_rgb(40, 40, 40)
-    } else {
-        Color32::from_rgb(31, 31, 31)
-    };
-    ui.painter().rect_filled(rect, CornerRadius::same(15), fill);
-    ui.painter().rect_stroke(
-        rect,
-        CornerRadius::same(15),
-        Stroke::new(1.0, Color32::from_rgb(57, 57, 57)),
-        StrokeKind::Inside,
-    );
+    if response.hovered() {
+        ui.painter()
+            .rect_filled(rect, CornerRadius::same(8), CHAT_FIELD);
+    }
     ui.painter().text(
         pos2(rect.left() + 13.0, rect.center().y),
         Align2::LEFT_CENTER,
@@ -9305,29 +9265,15 @@ fn render_chat_markdown(ui: &mut egui::Ui, markdown: &str, base_size: f32) {
             continue;
         }
         if let Some((formula, consumed)) = display_math_block(&lines, index) {
-            let response = Frame::new()
-                .inner_margin(Margin {
-                    left: 6,
-                    right: 52,
-                    top: 3,
-                    bottom: 3,
-                })
-                .show(ui, |ui| render_chat_math(ui, &formula, base_size, true));
-            let _ = chat_block_copy_button(ui, response.response.rect, &formula);
+            let rect = render_display_math(ui, &formula, base_size);
+            let _ = chat_block_copy_button(ui, rect, &formula);
             index += consumed;
             ui.add_space(3.0);
             continue;
         }
         if let Some(formula) = display_math_line(trimmed) {
-            let response = Frame::new()
-                .inner_margin(Margin {
-                    left: 6,
-                    right: 52,
-                    top: 3,
-                    bottom: 3,
-                })
-                .show(ui, |ui| render_chat_math(ui, formula, base_size, true));
-            let _ = chat_block_copy_button(ui, response.response.rect, formula);
+            let rect = render_display_math(ui, formula, base_size);
+            let _ = chat_block_copy_button(ui, rect, formula);
             index += 1;
             ui.add_space(3.0);
             continue;
@@ -9629,6 +9575,75 @@ fn render_chat_rich_text(ui: &mut egui::Ui, text: &str, size: f32, color: Color3
 struct CachedChatMath {
     texture: TextureHandle,
     size: egui::Vec2,
+}
+
+/// Remove every `\boxed{…}` wrapper, keeping its contents. Returns `None`
+/// when the formula has no box.
+fn strip_boxed(formula: &str) -> Option<String> {
+    const BOXED: &str = "\\boxed{";
+    if !formula.contains(BOXED) {
+        return None;
+    }
+    let mut output = String::with_capacity(formula.len());
+    let mut rest = formula;
+    while let Some(start) = rest.find(BOXED) {
+        output.push_str(&rest[..start]);
+        let inner = &rest[start + BOXED.len()..];
+        let mut depth = 1usize;
+        let mut end = None;
+        for (offset, character) in inner.char_indices() {
+            match character {
+                '{' => depth += 1,
+                '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        end = Some(offset);
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        let Some(end) = end else {
+            // Unbalanced braces: leave the remainder untouched.
+            output.push_str(&rest[start..]);
+            return Some(output);
+        };
+        output.push_str(&inner[..end]);
+        rest = &inner[end + 1..];
+    }
+    output.push_str(rest);
+    Some(output)
+}
+
+/// Display math, centered. A model's `\boxed{}` final answer is shown as a
+/// softly tinted card instead of LaTeX's hard white frame.
+fn render_display_math(ui: &mut egui::Ui, formula: &str, base_size: f32) -> Rect {
+    let margin = Margin {
+        left: 10,
+        right: 52,
+        top: 6,
+        bottom: 6,
+    };
+    match strip_boxed(formula) {
+        Some(unboxed) => {
+            Frame::new()
+                .fill(Color32::from_rgb(38, 52, 47))
+                .stroke(Stroke::new(1.0, CHAT_ACCENT.gamma_multiply(0.45)))
+                .corner_radius(CornerRadius::same(10))
+                .inner_margin(margin)
+                .show(ui, |ui| render_chat_math(ui, &unboxed, base_size, true))
+                .response
+                .rect
+        }
+        None => {
+            Frame::new()
+                .inner_margin(margin)
+                .show(ui, |ui| render_chat_math(ui, formula, base_size, true))
+                .response
+                .rect
+        }
+    }
 }
 
 fn render_chat_math(ui: &mut egui::Ui, formula: &str, size: f32, display: bool) {
@@ -10229,44 +10244,6 @@ fn paint_toolbar_icon(
             painter.line_segment([center + vec2(4.0, 3.5), center + vec2(8.0, 3.5)], stroke);
             painter.line_segment([center + vec2(6.0, 1.5), center + vec2(6.0, 5.5)], stroke);
         }
-        ToolbarIcon::DeleteChat => {
-            let body = Rect::from_center_size(center + vec2(0.0, 2.0), vec2(10.0, 11.0));
-            painter.rect_stroke(body, 1.5, stroke, StrokeKind::Inside);
-            painter.line_segment(
-                [center + vec2(-6.0, -5.0), center + vec2(6.0, -5.0)],
-                stroke,
-            );
-            painter.line_segment(
-                [center + vec2(-2.5, -7.0), center + vec2(2.5, -7.0)],
-                stroke,
-            );
-            painter.line_segment(
-                [center + vec2(-2.0, -1.0), center + vec2(-2.0, 5.0)],
-                Stroke::new(1.0, color),
-            );
-            painter.line_segment(
-                [center + vec2(2.0, -1.0), center + vec2(2.0, 5.0)],
-                Stroke::new(1.0, color),
-            );
-        }
-        ToolbarIcon::Rename => {
-            let tip = center + vec2(-5.7, 5.7);
-            let end = center + vec2(5.0, -5.0);
-            painter.line_segment([tip, end], Stroke::new(2.4, color));
-            painter.line_segment(
-                [center + vec2(-7.0, 7.0), center + vec2(-3.2, 6.2)],
-                Stroke::new(1.3, color),
-            );
-            painter.add(egui::Shape::convex_polygon(
-                vec![
-                    center + vec2(4.2, -6.0),
-                    center + vec2(6.5, -3.7),
-                    center + vec2(6.8, -6.8),
-                ],
-                color,
-                Stroke::NONE,
-            ));
-        }
         ToolbarIcon::Confirm => {
             painter.line_segment(
                 [center + vec2(-6.0, 0.0), center + vec2(-1.8, 4.3)],
@@ -10348,6 +10325,44 @@ fn paint_toolbar_icon(
                     stroke,
                 );
             }
+        }
+        ToolbarIcon::DeleteChat => {
+            let body = Rect::from_center_size(center + vec2(0.0, 2.0), vec2(10.0, 11.0));
+            painter.rect_stroke(body, 1.5, stroke, StrokeKind::Inside);
+            painter.line_segment(
+                [center + vec2(-6.0, -5.0), center + vec2(6.0, -5.0)],
+                stroke,
+            );
+            painter.line_segment(
+                [center + vec2(-2.5, -7.0), center + vec2(2.5, -7.0)],
+                stroke,
+            );
+            painter.line_segment(
+                [center + vec2(-2.0, -1.0), center + vec2(-2.0, 5.0)],
+                Stroke::new(1.0, color),
+            );
+            painter.line_segment(
+                [center + vec2(2.0, -1.0), center + vec2(2.0, 5.0)],
+                Stroke::new(1.0, color),
+            );
+        }
+        ToolbarIcon::Rename => {
+            let tip = center + vec2(-5.7, 5.7);
+            let end = center + vec2(5.0, -5.0);
+            painter.line_segment([tip, end], Stroke::new(2.4, color));
+            painter.line_segment(
+                [center + vec2(-7.0, 7.0), center + vec2(-3.2, 6.2)],
+                Stroke::new(1.3, color),
+            );
+            painter.add(egui::Shape::convex_polygon(
+                vec![
+                    center + vec2(4.2, -6.0),
+                    center + vec2(6.5, -3.7),
+                    center + vec2(6.8, -6.8),
+                ],
+                color,
+                Stroke::NONE,
+            ));
         }
         ToolbarIcon::Close => {
             painter.line_segment([center + vec2(-4.5, -4.5), center + vec2(4.5, 4.5)], stroke);
@@ -11378,6 +11393,23 @@ mod tests {
             assert_eq!(job.text, "Bold and italic with code and a link");
             assert!(job.sections.len() >= 4);
         });
+    }
+
+    #[test]
+    fn boxed_answers_are_unwrapped_for_the_tinted_card() {
+        assert_eq!(strip_boxed("x^2"), None);
+        assert_eq!(
+            strip_boxed("\\boxed{y'=y,\\qquad z'=z}").as_deref(),
+            Some("y'=y,\\qquad z'=z")
+        );
+        assert_eq!(
+            strip_boxed("x'=a=\\boxed{\\gamma(x-vt)}.").as_deref(),
+            Some("x'=a=\\gamma(x-vt).")
+        );
+        assert_eq!(
+            strip_boxed("\\boxed{\\frac{1}{2}}").as_deref(),
+            Some("\\frac{1}{2}")
+        );
     }
 
     #[test]

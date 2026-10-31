@@ -28,6 +28,13 @@
   </provides>
   <content_rating type="oars-1.1"/>
   <releases>
+    <release version="0.4.3" date="2026-11-01">
+      <description>
+        <p>Restyles Study chat to match the rest of the app: the same gray surfaces, flat header
+        buttons with rename and delete always visible, a wider message column on large panels,
+        and boxed final answers shown as soft highlighted cards.</p>
+      </description>
+    </release>
     <release version="0.4.2" date="2026-11-01">
       <description>
         <p>The Overall interface-size slider in Settings now previews its value while dragging and
