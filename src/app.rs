@@ -592,6 +592,7 @@ pub struct SnaPdfApp {
     pinned_comment: Option<u64>,
     show_view_settings: bool,
     settings_page: SettingsPage,
+    pending_interface_scale: Option<f32>,
     pdf_default_application: Option<String>,
     confirm_save_to_source: bool,
     pending_source_save: Option<(PathBuf, PathBuf)>,
@@ -738,6 +739,7 @@ impl SnaPdfApp {
             pinned_comment: None,
             show_view_settings: false,
             settings_page: SettingsPage::General,
+            pending_interface_scale: None,
             pdf_default_application: None,
             confirm_save_to_source: false,
             pending_source_save: None,
@@ -6118,7 +6120,10 @@ impl SnaPdfApp {
         if !self.show_view_settings {
             return;
         }
-        let mut interface_scale = self.state.ui_scale;
+        // While the Overall slider is being dragged its value is only previewed:
+        // applying it would rescale this panel under the pointer.
+        let mut interface_scale = self.pending_interface_scale.unwrap_or(self.state.ui_scale);
+        let mut overall_dragging = false;
         let mut toolbar_ratio = self.state.chrome_scale_ratio;
         let mut sidebar_ratio = self.state.sidebar_scale_ratio;
         let mut chat_font_size = self.state.chat_font_size;
@@ -6288,7 +6293,7 @@ impl SnaPdfApp {
                                 ] {
                                     settings_divider(ui);
                                     settings_row(ui, label, "", |ui| {
-                                        changed |= settings_slider(
+                                        let response = settings_slider(
                                             ui,
                                             value,
                                             default * 0.5..=default * 2.0,
@@ -6300,6 +6305,9 @@ impl SnaPdfApp {
                                                 )
                                             },
                                         );
+                                        changed |= response.changed();
+                                        overall_dragging |=
+                                            label == "Overall" && response.dragged();
                                     });
                                 }
                                 settings_divider(ui);
@@ -6371,7 +6379,8 @@ impl SnaPdfApp {
                                             11.0..=28.0,
                                             0.5,
                                             |value| format!("{value:.1} pt"),
-                                        );
+                                        )
+                                        .changed();
                                     },
                                 );
                                 settings_divider(ui);
@@ -6400,6 +6409,14 @@ impl SnaPdfApp {
         close |= modal.should_close();
         if set_default_pdf_viewer {
             self.set_default_pdf_viewer();
+        }
+        if overall_dragging {
+            self.pending_interface_scale = Some(interface_scale);
+            interface_scale = self.state.ui_scale;
+            changed = false;
+        } else if self.pending_interface_scale.take().is_some() {
+            // The drag just ended: apply the previewed scale once.
+            changed = true;
         }
         if close {
             self.show_view_settings = false;
@@ -8367,7 +8384,7 @@ fn settings_slider(
     range: std::ops::RangeInclusive<f32>,
     step: f64,
     format: impl Fn(f32) -> String,
-) -> bool {
+) -> Response {
     ui.add_sized(
         [54.0, 20.0],
         egui::Label::new(
@@ -8388,7 +8405,6 @@ fn settings_slider(
                 .step_by(step)
                 .show_value(false),
         )
-        .changed()
     })
     .inner
 }

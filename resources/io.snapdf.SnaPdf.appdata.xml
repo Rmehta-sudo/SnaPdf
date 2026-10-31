@@ -28,6 +28,12 @@
   </provides>
   <content_rating type="oars-1.1"/>
   <releases>
+    <release version="0.4.2" date="2026-11-01">
+      <description>
+        <p>The Overall interface-size slider in Settings now previews its value while dragging and
+        applies it on release, instead of rescaling the Settings panel under the pointer.</p>
+      </description>
+    </release>
     <release version="0.4.1" date="2026-11-01">
       <description>
         <p>Paging quickly through image-heavy PDFs no longer stalls: pages draw a quick preview
