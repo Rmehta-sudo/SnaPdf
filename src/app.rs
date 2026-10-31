@@ -2,6 +2,7 @@ use crate::chat::{
     ChatAttachment, ChatCommand, ChatEvent, ChatMessage, ChatProvider, ChatRole, ChatWorker,
     ReasoningEffort, mime_for_path, model_supports_reasoning_effort,
 };
+use crate::instance::{self, LaunchTarget};
 use crate::model::{
     Annotation, AnnotationKind, AppState, DEFAULT_CHROME_SCALE_RATIO, DEFAULT_SIDEBAR_SCALE_RATIO,
     DEFAULT_UI_SCALE, RecentDocument, SidebarFileIcons, StudyChatSession, is_discoverable_pdf,
@@ -12,6 +13,7 @@ use crate::pdf::{
     LinkTarget, PdfFileSearchMatches, PdfLinkRegion, PdfOutlineItem, PdfSearchMatch, RenderCommand,
     RenderEvent, RenderWorker, TextGlyph, search_pdf_files,
 };
+use crate::update::{self, UpdateEvent, UpdateStatus, UpdateWorker};
 use crate::{storage, theme};
 use anyhow::{Context, Result, anyhow};
 use eframe::egui::{
@@ -37,8 +39,6 @@ const MAX_PENDING_PAGES: usize = 6;
 const PAGE_GAP: f32 = 18.0;
 const KEYBOARD_TAP_SCROLL: f32 = 150.0;
 const WHEEL_SCROLL_MULTIPLIER: f32 = 1.65;
-const DOCUMENT_TOOLBAR_HEIGHT: f32 = 20.8;
-const DOCUMENT_TOOLBAR_OPTICAL_Y: f32 = -2.0;
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 enum RenameTarget {
@@ -350,30 +350,38 @@ struct CachedPage {
     last_used_frame: u64,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-enum LaunchTarget {
-    Pdf(PathBuf),
-    Project(PathBuf),
-}
-
-fn launch_target_from_args(
+fn launch_targets_from_args(
     args: impl IntoIterator<Item = std::ffi::OsString>,
-) -> Option<LaunchTarget> {
-    args.into_iter().find_map(|argument| {
-        let path = PathBuf::from(argument);
-        let path = path.canonicalize().unwrap_or(path);
-        if path.is_dir() {
-            Some(LaunchTarget::Project(path))
-        } else if path.is_file() && is_pdf(&path) {
-            Some(LaunchTarget::Pdf(path))
-        } else {
-            None
-        }
-    })
+) -> Vec<LaunchTarget> {
+    args.into_iter()
+        .filter_map(|argument| {
+            let path = PathBuf::from(argument);
+            let path = path.canonicalize().unwrap_or(path);
+            if path.is_dir() {
+                Some(LaunchTarget::Project(path))
+            } else if path.is_file() && is_pdf(&path) {
+                Some(LaunchTarget::Pdf(path))
+            } else {
+                None
+            }
+        })
+        .collect()
 }
 
 pub fn run() -> Result<()> {
-    let launch_target = launch_target_from_args(std::env::args_os().skip(1));
+    let (flags, args): (Vec<_>, Vec<_>) = std::env::args_os()
+        .skip(1)
+        .partition(|argument| argument == "--new-window");
+    let launch_targets = launch_targets_from_args(args);
+    let socket = instance::socket_path();
+    let listener = if flags.is_empty() {
+        match instance::claim(&socket, &launch_targets) {
+            instance::Claim::Forwarded => return Ok(()),
+            instance::Claim::Primary(listener) => listener,
+        }
+    } else {
+        None
+    };
 
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
@@ -389,7 +397,15 @@ pub fn run() -> Result<()> {
     eframe::run_native(
         "SnaPdf",
         options,
-        Box::new(move |creation| Ok(Box::new(SnaPdfApp::new(creation, launch_target)))),
+        Box::new(move |creation| {
+            let instance = listener.map(|listener| {
+                (
+                    instance::listen(listener, creation.egui_ctx.clone()),
+                    socket,
+                )
+            });
+            Ok(Box::new(SnaPdfApp::new(creation, launch_targets, instance)))
+        }),
     )
     .map_err(|error| anyhow!(error.to_string()))
 }
@@ -468,6 +484,13 @@ fn should_prefer_x11_gestures(
 
 pub struct SnaPdfApp {
     state: AppState,
+    /// Targets forwarded by later launches while this window owns the socket.
+    instance_requests: Option<crossbeam_channel::Receiver<Vec<LaunchTarget>>>,
+    instance_socket: Option<PathBuf>,
+    update_worker: UpdateWorker,
+    update_status: UpdateStatus,
+    /// A newer release was found this session and the prompt is still open.
+    show_update_prompt: bool,
     /// Frozen at startup so clicking a PDF never reshuffles the visible recent list.
     session_recents: Vec<RecentDocument>,
     worker: RenderWorker,
@@ -560,6 +583,8 @@ pub struct SnaPdfApp {
     /// scroll delta that races the ScrollArea's own gesture handling.
     document_scroll_offset: egui::Vec2,
     show_search: bool,
+    /// Focus the search field (selecting any previous query) on the next frame.
+    search_focus_requested: bool,
     print_dialog: Option<PrintDialog>,
     browser_directory: Option<PathBuf>,
     browser_entries: Vec<BrowserEntry>,
@@ -572,22 +597,28 @@ pub struct SnaPdfApp {
 }
 
 impl SnaPdfApp {
-    fn new(creation: &eframe::CreationContext<'_>, launch_target: Option<LaunchTarget>) -> Self {
+    fn new(
+        creation: &eframe::CreationContext<'_>,
+        launch_targets: Vec<LaunchTarget>,
+        instance: Option<(crossbeam_channel::Receiver<Vec<LaunchTarget>>, PathBuf)>,
+    ) -> Self {
         install_unicode_fallback_fonts(&creation.egui_ctx);
         theme::apply(&creation.egui_ctx);
         let mut state = storage::load();
         state.prune_missing();
         state.normalize_recents();
-        let initial_path = match launch_target {
-            Some(LaunchTarget::Pdf(path)) => Some(path),
-            Some(LaunchTarget::Project(root)) => {
-                if state.add_project(root) {
-                    let _ = storage::save(&state);
+        let mut launch_pdfs = Vec::new();
+        for target in launch_targets {
+            match target {
+                LaunchTarget::Pdf(path) => launch_pdfs.push(path),
+                LaunchTarget::Project(root) => {
+                    if state.add_project(root) {
+                        let _ = storage::save(&state);
+                    }
                 }
-                None
             }
-            None => None,
-        };
+        }
+        let initial_path = launch_pdfs.pop();
         if state.study_chats.is_empty() && state.active_study_chat.is_none() {
             state.warn_before_replacing_study_chat = true;
         }
@@ -698,6 +729,7 @@ impl SnaPdfApp {
             pinch_anchor: None,
             document_scroll_offset: egui::Vec2::ZERO,
             show_search: false,
+            search_focus_requested: false,
             print_dialog: None,
             browser_directory: None,
             browser_entries: Vec::new(),
@@ -707,12 +739,197 @@ impl SnaPdfApp {
             pdf_default_application: None,
             confirm_save_to_source: false,
             pending_source_save: None,
+            instance_requests: instance.as_ref().map(|(receiver, _)| receiver.clone()),
+            instance_socket: instance.map(|(_, socket)| socket),
+            update_worker: UpdateWorker::spawn(creation.egui_ctx.clone()),
+            update_status: UpdateStatus::Checking,
+            show_update_prompt: false,
         };
 
+        app.update_worker.check();
+        // Earlier command-line PDFs become background tabs; the last one is shown.
+        for path in launch_pdfs {
+            if path.is_file() && is_pdf(&path) {
+                app.state.record_open(&path);
+            }
+        }
         if let Some(path) = initial_path {
             app.open_document(path);
         }
         app
+    }
+
+    fn receive_update_events(&mut self, ctx: &egui::Context) {
+        while let Ok(event) = self.update_worker.events.try_recv() {
+            match event {
+                UpdateEvent::Checked(Ok(Some(release))) => {
+                    self.show_update_prompt = true;
+                    self.update_status = UpdateStatus::Available(release);
+                }
+                UpdateEvent::Checked(Ok(None)) => self.update_status = UpdateStatus::UpToDate,
+                UpdateEvent::Checked(Err(error)) => {
+                    self.update_status = UpdateStatus::Failed(error);
+                }
+                UpdateEvent::Installed(Ok(())) => self.restart_after_update(ctx),
+                UpdateEvent::Installed(Err(error)) => {
+                    self.update_status = UpdateStatus::Failed(error);
+                }
+            }
+        }
+    }
+
+    fn start_update(&mut self) {
+        let UpdateStatus::Available(release) = self.update_status.clone() else {
+            return;
+        };
+        let Some(target) = update::self_update_target() else {
+            return;
+        };
+        self.update_status = UpdateStatus::Installing(release.clone());
+        self.update_worker.install(release, target);
+    }
+
+    /// Start the freshly installed AppImage and close this window. The socket
+    /// is released first so the new process becomes the primary window
+    /// instead of handing its launch straight back to this one.
+    fn restart_after_update(&mut self, ctx: &egui::Context) {
+        self.persist();
+        if let Some(socket) = self.instance_socket.take() {
+            let _ = fs::remove_file(socket);
+        }
+        match update::relaunch_command().map(|command| Command::new(command).spawn()) {
+            Some(Ok(_)) => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
+            _ => {
+                self.update_status = UpdateStatus::Failed(
+                    "the update is installed; restart SnaPdf to use it".to_owned(),
+                );
+            }
+        }
+    }
+
+    fn update_settings_section(&mut self, ui: &mut egui::Ui) {
+        ui.label(RichText::new("Updates").strong());
+        ui.label(RichText::new(format!("SnaPdf {}", update::CURRENT_VERSION)).size(12.0));
+        let can_self_update = update::self_update_target().is_some();
+        let (message, color) = match &self.update_status {
+            UpdateStatus::Checking => ("Checking for updates…".to_owned(), theme::MUTED),
+            UpdateStatus::UpToDate => (
+                "You're on the latest release.".to_owned(),
+                Color32::from_rgb(120, 200, 140),
+            ),
+            UpdateStatus::Available(release) => (
+                format!("SnaPdf {} is available.", release.version),
+                Color32::from_rgb(255, 196, 92),
+            ),
+            UpdateStatus::Installing(release) => (
+                format!("Downloading SnaPdf {}…", release.version),
+                theme::MUTED,
+            ),
+            UpdateStatus::Failed(error) => (
+                format!("Couldn't update: {error}"),
+                Color32::from_rgb(235, 120, 110),
+            ),
+        };
+        ui.horizontal(|ui| {
+            if matches!(
+                self.update_status,
+                UpdateStatus::Checking | UpdateStatus::Installing(_)
+            ) {
+                ui.spinner();
+            }
+            ui.label(RichText::new(message).size(11.5).color(color));
+        });
+        ui.horizontal(|ui| {
+            let available = matches!(self.update_status, UpdateStatus::Available(_));
+            if available && can_self_update {
+                if ui.button("Update and restart").clicked() {
+                    self.start_update();
+                }
+            } else if let UpdateStatus::Available(release) = &self.update_status
+                && ui.button("Open release page").clicked()
+            {
+                let _ = webbrowser::open(&release.page_url);
+            }
+            if !matches!(
+                self.update_status,
+                UpdateStatus::Checking | UpdateStatus::Installing(_)
+            ) && ui.button("Check again").clicked()
+            {
+                self.update_status = UpdateStatus::Checking;
+                self.update_worker.check();
+            }
+        });
+        if !can_self_update && matches!(self.update_status, UpdateStatus::Available(_)) {
+            ui.label(
+                RichText::new(
+                    "This copy was not installed as the portable AppImage; update it the way you installed it.",
+                )
+                .size(10.5)
+                .color(theme::MUTED),
+            );
+        }
+    }
+
+    fn update_prompt_dialog(&mut self, ctx: &egui::Context) {
+        if !self.show_update_prompt || self.show_view_settings {
+            return;
+        }
+        let UpdateStatus::Available(release) = &self.update_status else {
+            self.show_update_prompt = false;
+            return;
+        };
+        let version = release.version.clone();
+        egui::Window::new("Update available")
+            .collapsible(false)
+            .resizable(false)
+            .anchor(Align2::RIGHT_TOP, vec2(-16.0, 16.0))
+            .show(ctx, |ui| {
+                ui.label(format!(
+                    "SnaPdf {version} is available. You're using {}.",
+                    update::CURRENT_VERSION
+                ));
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    if ui.button("Open settings").clicked() {
+                        self.show_update_prompt = false;
+                        self.pdf_default_application = current_pdf_default_application();
+                        self.show_view_settings = true;
+                    }
+                    if ui.button("Later").clicked() {
+                        self.show_update_prompt = false;
+                    }
+                });
+            });
+    }
+
+    /// Open PDFs and folders that a later `snapdf` launch handed to this window.
+    fn receive_instance_handoffs(&mut self, ctx: &egui::Context) {
+        let Some(receiver) = self.instance_requests.as_ref() else {
+            return;
+        };
+        let batches: Vec<_> = receiver.try_iter().collect();
+        for targets in batches {
+            for target in targets {
+                match target {
+                    LaunchTarget::Pdf(path) => self.open_document(path),
+                    LaunchTarget::Project(root) => {
+                        if self.state.add_project(root.clone()) {
+                            let files = self
+                                .state
+                                .projects
+                                .iter()
+                                .find(|project| project.root == root)
+                                .map(|project| project.pdf_files())
+                                .unwrap_or_default();
+                            self.project_files.insert(root, files);
+                            self.persist();
+                        }
+                    }
+                }
+            }
+            ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
+            ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+        }
     }
 
     fn open_document(&mut self, path: PathBuf) {
@@ -1973,8 +2190,7 @@ impl SnaPdfApp {
             self.select_all_document_text();
         }
         if ctx.input_mut(|input| input.consume_shortcut(&find)) {
-            self.show_search = true;
-            self.sidebar_tab = SidebarTab::Search;
+            self.open_search();
         }
         if ctx.input_mut(|input| input.consume_shortcut(&print)) {
             self.request_print();
@@ -2221,87 +2437,6 @@ impl SnaPdfApp {
         }
     }
 
-    fn navigation_rail(&mut self, root: &mut egui::Ui) {
-        if self.reader_mode || self.presentation_mode {
-            return;
-        }
-        egui::Panel::left("navigation-rail")
-            .resizable(false)
-            .exact_size(48.0)
-            .frame(
-                Frame::new()
-                    .fill(Color32::from_rgb(25, 25, 25))
-                    .inner_margin(Margin::symmetric(4, 10)),
-            )
-            .show(root, |ui| {
-                ui.with_layout(Layout::top_down(Align::Center), |ui| {
-                    let files = rail_button(
-                        ui,
-                        self.sidebar_visible && self.sidebar_tab == SidebarTab::Library,
-                        RailIcon::Files,
-                    )
-                    .on_hover_text("Files")
-                    .clicked();
-                    if files {
-                        if self.sidebar_visible && self.sidebar_tab == SidebarTab::Library {
-                            self.sidebar_visible = false;
-                        } else {
-                            self.sidebar_visible = true;
-                            self.sidebar_tab = SidebarTab::Library;
-                        }
-                    }
-                    let contents = rail_button(
-                        ui,
-                        self.sidebar_visible && self.sidebar_tab == SidebarTab::Contents,
-                        RailIcon::Contents,
-                    )
-                    .on_hover_text("Document outline")
-                    .clicked();
-                    if contents {
-                        if self.sidebar_visible && self.sidebar_tab == SidebarTab::Contents {
-                            self.sidebar_visible = false;
-                        } else {
-                            self.sidebar_visible = true;
-                            self.sidebar_tab = SidebarTab::Contents;
-                        }
-                    }
-                    let search = rail_button(
-                        ui,
-                        self.sidebar_visible && self.sidebar_tab == SidebarTab::Search,
-                        RailIcon::Search,
-                    )
-                    .on_hover_text("Find in document (Ctrl+F)")
-                    .clicked();
-                    if search {
-                        if self.sidebar_visible && self.sidebar_tab == SidebarTab::Search {
-                            self.sidebar_visible = false;
-                            self.show_search = false;
-                        } else {
-                            self.sidebar_visible = true;
-                            self.show_search = true;
-                            self.sidebar_tab = SidebarTab::Search;
-                        }
-                    }
-                    if !self.state.hide_study_chat
-                        && rail_button(ui, self.study_chat.visible, RailIcon::Chat)
-                            .on_hover_text("Study chat")
-                            .clicked()
-                    {
-                        self.study_chat.visible = !self.study_chat.visible;
-                    }
-                });
-                ui.with_layout(Layout::bottom_up(Align::Center), |ui| {
-                    if rail_button(ui, false, RailIcon::Settings)
-                        .on_hover_text("View settings")
-                        .clicked()
-                    {
-                        self.pdf_default_application = current_pdf_default_application();
-                        self.show_view_settings = true;
-                    }
-                });
-            });
-    }
-
     fn sidebar(&mut self, root: &mut egui::Ui) {
         if !self.sidebar_visible || self.reader_mode || self.presentation_mode {
             return;
@@ -2329,31 +2464,57 @@ impl SnaPdfApp {
                         font.size *= explorer_factor;
                     }
                     ui.horizontal(|ui| {
-                        if ui
-                            .button("Open")
-                            .on_hover_text("Open a PDF (Ctrl+O)")
-                            .clicked()
-                        {
-                            self.open_file_dialog();
-                        }
-                        ui.separator();
-                        if ui
-                            .button("+ Project")
-                            .on_hover_text("Add a PDF project folder")
-                            .clicked()
-                        {
-                            self.add_project_dialog();
-                        }
-                        ui.separator();
-                        if ui
-                            .button("Refresh")
-                            .on_hover_text("Rescan project folders")
-                            .clicked()
-                        {
-                            self.refresh_projects();
+                        for (tab, icon, help) in [
+                            (
+                                SidebarTab::Library,
+                                RailIcon::Files,
+                                "Projects and recent PDFs",
+                            ),
+                            (SidebarTab::Contents, RailIcon::Contents, "Document outline"),
+                            (SidebarTab::Search, RailIcon::Search, "Find (Ctrl+F)"),
+                        ] {
+                            if rail_button(ui, self.sidebar_tab == tab, icon)
+                                .on_hover_text(help)
+                                .clicked()
+                            {
+                                if tab == SidebarTab::Search {
+                                    self.open_search();
+                                } else {
+                                    self.sidebar_tab = tab;
+                                    self.show_search = false;
+                                }
+                            }
                         }
                     });
-                    ui.add_space(4.0);
+                    ui.add_space(6.0);
+                    if self.sidebar_tab == SidebarTab::Library {
+                        ui.horizontal(|ui| {
+                            if ui
+                                .button("Open")
+                                .on_hover_text("Open a PDF (Ctrl+O)")
+                                .clicked()
+                            {
+                                self.open_file_dialog();
+                            }
+                            ui.separator();
+                            if ui
+                                .button("+ Project")
+                                .on_hover_text("Add a PDF project folder")
+                                .clicked()
+                            {
+                                self.add_project_dialog();
+                            }
+                            ui.separator();
+                            if ui
+                                .button("Refresh")
+                                .on_hover_text("Rescan project folders")
+                                .clicked()
+                            {
+                                self.refresh_projects();
+                            }
+                        });
+                        ui.add_space(4.0);
+                    }
                     if self.sidebar_tab == SidebarTab::Contents {
                         self.outline_sidebar(ui);
                         return;
@@ -2768,13 +2929,7 @@ impl SnaPdfApp {
                                         &RenameTarget::File(item.path.clone()),
                                         row.rename_rect,
                                     );
-                                    if self.state.display_name(&item.path).chars().count()
-                                        > max_sidebar_label_chars(
-                                            &row.body,
-                                            0.0,
-                                            self.state.sidebar_file_icons,
-                                        )
-                                    {
+                                    if row.truncated {
                                         row.body
                                             .clone()
                                             .on_hover_text(self.state.display_name(&item.path));
@@ -3073,79 +3228,133 @@ impl SnaPdfApp {
         let documents = self.state.open_documents.clone();
         let mut activate = None;
         let mut close = None;
-        ScrollArea::horizontal()
-            .id_salt("document-tabs")
-            .auto_shrink([false, true])
-            .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden)
-            .show(ui, |ui| {
-                ui.horizontal(|ui| {
-                    for path in &documents {
-                        let active = self.current_path.as_deref() == Some(path.as_path());
-                        Frame::new()
-                            .fill(if active {
-                                Color32::from_rgb(50, 53, 58)
-                            } else {
-                                Color32::TRANSPARENT
-                            })
-                            .stroke(if active {
-                                Stroke::new(1.0, Color32::from_rgb(91, 126, 170))
-                            } else {
-                                Stroke::NONE
-                            })
-                            .corner_radius(CornerRadius::same(6))
-                            .inner_margin(Margin::symmetric(6, 1))
-                            .show(ui, |ui| {
-                                ui.horizontal(|ui| {
-                                    if ui
-                                        .add(
-                                            egui::Button::new(
-                                                RichText::new(elide(
-                                                    &self.state.display_name(path),
-                                                    28,
-                                                ))
-                                                .size(11.8 * scale)
-                                                .color(if active {
-                                                    Color32::from_rgb(245, 247, 250)
-                                                } else {
-                                                    theme::MUTED
-                                                }),
-                                            )
-                                            .frame(false),
-                                        )
-                                        .on_hover_text(path.display().to_string())
-                                        .clicked()
-                                    {
-                                        activate = Some(path.clone());
-                                    }
-                                    if ui
-                                        .add(
-                                            egui::Button::new(
-                                                RichText::new("×").size(12.5 * scale),
-                                            )
-                                            .frame(false),
-                                        )
-                                        .on_hover_text("Close tab")
-                                        .clicked()
-                                    {
-                                        close = Some(path.clone());
-                                    }
-                                });
-                            });
+        let tab_height = 32.0 * scale;
+        // Bottom-align so the active tab merges into the address bar and the
+        // strip's buttons sit level with the tab labels.
+        ui.with_layout(Layout::left_to_right(Align::Max), |ui| {
+            ui.spacing_mut().item_spacing.x = 0.0;
+            // Edge keeps its tab actions at the far left of the strip; here that
+            // slot toggles the project/outline sidebar.
+            if chrome_button(ui, ToolbarIcon::Sidebar, false, true, "Toggle sidebar").clicked() {
+                self.sidebar_visible = !self.sidebar_visible;
+            }
+            ui.add_space(6.0 * scale);
+            let new_tab_width = 34.0 * scale;
+            let tab_width = ((ui.available_width() - new_tab_width)
+                / documents.len().max(1) as f32)
+                .clamp(44.0 * scale, 236.0 * scale);
+            {
+                let active_index = documents
+                    .iter()
+                    .position(|path| self.current_path.as_deref() == Some(path.as_path()));
+                for (index, path) in documents.iter().enumerate() {
+                    let active = active_index == Some(index);
+                    let (rect, response) =
+                        ui.allocate_exact_size(vec2(tab_width, tab_height), Sense::click());
+                    let close_rect = Rect::from_center_size(
+                        pos2(rect.right() - 16.0 * scale, rect.center().y),
+                        vec2(20.0, 20.0) * scale,
+                    );
+                    let close_response = ui
+                        .interact(
+                            close_rect,
+                            ui.id().with(("tab-close", index)),
+                            Sense::click(),
+                        )
+                        .on_hover_text("Close tab");
+                    let painter = ui.painter();
+                    if active {
+                        painter.rect_filled(
+                            rect,
+                            CornerRadius {
+                                nw: 8,
+                                ne: 8,
+                                sw: 0,
+                                se: 0,
+                            },
+                            theme::TOOLBAR_BG,
+                        );
+                    } else if response.hovered() || close_response.hovered() {
+                        painter.rect_filled(
+                            rect.shrink2(vec2(2.0, 3.0) * scale),
+                            CornerRadius::same(6),
+                            Color32::from_rgb(40, 40, 40),
+                        );
+                    } else if active_index != Some(index + 1) && index + 1 < documents.len() {
+                        painter.line_segment(
+                            [
+                                pos2(rect.right(), rect.top() + 9.0 * scale),
+                                pos2(rect.right(), rect.bottom() - 9.0 * scale),
+                            ],
+                            Stroke::new(1.0, Color32::from_rgb(64, 64, 64)),
+                        );
                     }
-                    if ui
-                        .add(egui::Button::new(RichText::new("+").size(18.0 * scale)).frame(false))
-                        .on_hover_text("Open PDF")
-                        .clicked()
-                    {
-                        self.open_file_dialog();
+                    let text_left = rect.left() + 12.0 * scale;
+                    let text_width = (close_rect.left() - 4.0 * scale - text_left).max(0.0);
+                    let mut job = egui::text::LayoutJob::single_section(
+                        self.state.display_name(path),
+                        egui::TextFormat {
+                            font_id: FontId::proportional(12.5 * scale),
+                            color: if active {
+                                Color32::from_rgb(240, 240, 240)
+                            } else {
+                                Color32::from_rgb(170, 170, 170)
+                            },
+                            ..Default::default()
+                        },
+                    );
+                    job.wrap = egui::text::TextWrapping {
+                        max_width: text_width,
+                        max_rows: 1,
+                        break_anywhere: true,
+                        overflow_character: Some('…'),
+                    };
+                    let galley = painter.layout_job(job);
+                    painter.galley(
+                        pos2(text_left, rect.center().y - galley.size().y / 2.0),
+                        galley,
+                        Color32::WHITE,
+                    );
+                    if active || response.hovered() || close_response.hovered() {
+                        if close_response.hovered() {
+                            painter.circle_filled(
+                                close_rect.center(),
+                                9.0 * scale,
+                                Color32::from_rgb(64, 64, 64),
+                            );
+                        }
+                        paint_toolbar_icon(
+                            painter,
+                            close_rect.center(),
+                            ToolbarIcon::Close,
+                            Color32::from_rgb(200, 200, 200),
+                        );
                     }
-                });
-            });
+                    if close_response.clicked() || response.middle_clicked() {
+                        close = Some(path.clone());
+                    } else if response.clicked() {
+                        activate = Some(path.clone());
+                    }
+                    response.on_hover_text(path.display().to_string());
+                }
+            }
+            if chrome_button(ui, ToolbarIcon::Plus, false, true, "Open PDF (Ctrl+O)").clicked() {
+                self.open_file_dialog();
+            }
+        });
         if let Some(path) = close {
             self.close_document_tab(&path);
         } else if let Some(path) = activate {
             self.open_document(path);
         }
+    }
+
+    /// Show the search sidebar with the cursor in its field, ready for typing.
+    fn open_search(&mut self) {
+        self.sidebar_visible = true;
+        self.show_search = true;
+        self.sidebar_tab = SidebarTab::Search;
+        self.search_focus_requested = true;
     }
 
     fn search_sidebar(&mut self, ui: &mut egui::Ui) {
@@ -3169,9 +3378,25 @@ impl SnaPdfApp {
             });
         });
         ui.add_space(6.0);
+        let search_field_id = egui::Id::new("sidebar-search-field");
+        if std::mem::take(&mut self.search_focus_requested) {
+            // Select the previous query so typing replaces it, as in a browser.
+            let mut state =
+                egui::TextEdit::load_state(ui.ctx(), search_field_id).unwrap_or_default();
+            state
+                .cursor
+                .set_char_range(Some(egui::text::CCursorRange::two(
+                    egui::text::CCursor::new(0),
+                    egui::text::CCursor::new(self.search_query.chars().count()),
+                )));
+            state.store(ui.ctx(), search_field_id);
+            ui.ctx()
+                .memory_mut(|memory| memory.request_focus(search_field_id));
+        }
         let response = ui.add_sized(
             [ui.available_width(), 32.0],
             egui::TextEdit::singleline(&mut self.search_query)
+                .id(search_field_id)
                 .hint_text("Search PDFs")
                 .margin(Margin::symmetric(8, 6)),
         );
@@ -3357,42 +3582,127 @@ impl SnaPdfApp {
         }
     }
 
+    /// Browser-like chrome modelled on Edge's PDF viewer: a tab strip, an
+    /// address bar holding the path, and one centered document toolbar.
     fn toolbar(&mut self, root: &mut egui::Ui) {
         if !self.toolbar_visible || self.reader_mode || self.presentation_mode {
+            return;
+        }
+        let toolbar_factor = interface_region_scale(self.state.chrome_scale_ratio);
+        egui::Panel::top("tab-strip")
+            .frame(Frame::new().fill(theme::TAB_STRIP_BG).inner_margin(Margin {
+                left: 6,
+                right: 6,
+                top: 5,
+                bottom: 0,
+            }))
+            .show(root, |ui| {
+                apply_region_scale(ui, toolbar_factor);
+                self.document_tabs(ui);
+            });
+
+        egui::Panel::top("address-bar")
+            .frame(Frame::new().fill(theme::TOOLBAR_BG).inner_margin(Margin {
+                left: 8,
+                right: 8,
+                top: 5,
+                bottom: 4,
+            }))
+            .show(root, |ui| {
+                apply_region_scale(ui, toolbar_factor);
+                self.address_bar(ui);
+            });
+
+        if self.current_path.is_none() {
             return;
         }
         egui::Panel::top("toolbar")
             .frame(
                 Frame::new()
-                    .fill(theme::PANEL_BG)
+                    .fill(theme::TOOLBAR_BG)
                     .inner_margin(Margin::symmetric(8, 1)),
             )
             .show(root, |ui| {
-                let toolbar_factor = interface_region_scale(self.state.chrome_scale_ratio);
-                ui.style_mut().spacing.item_spacing *= toolbar_factor;
-                ui.style_mut().spacing.button_padding *= toolbar_factor;
-                ui.style_mut().spacing.interact_size *= toolbar_factor;
-                for font in ui.style_mut().text_styles.values_mut() {
-                    font.size *= toolbar_factor;
+                apply_region_scale(ui, toolbar_factor);
+                let scale = toolbar_visual_scale(ui);
+                let row =
+                    Rect::from_min_size(ui.cursor().min, vec2(ui.available_width(), 26.0 * scale));
+                ui.allocate_rect(row, Sense::hover());
+                let center_width = (300.0 * scale).min(row.width() / 3.0);
+                let center = Rect::from_center_size(row.center(), vec2(center_width, row.height()));
+                let left = Rect::from_min_max(row.min, pos2(center.left(), row.bottom()));
+                let right = Rect::from_min_max(pos2(center.right(), row.top()), row.max);
+                ui.scope_builder(
+                    egui::UiBuilder::new().max_rect(center).layout(
+                        Layout::left_to_right(Align::Center).with_main_align(Align::Center),
+                    ),
+                    |ui| self.toolbar_page_controls(ui),
+                );
+                ui.scope_builder(
+                    egui::UiBuilder::new()
+                        .max_rect(left)
+                        .layout(Layout::left_to_right(Align::Center)),
+                    |ui| {
+                        ScrollArea::horizontal()
+                            .id_salt("viewer-editing-tools-scroll")
+                            .scroll_bar_visibility(
+                                egui::scroll_area::ScrollBarVisibility::AlwaysHidden,
+                            )
+                            .show(ui, |ui| {
+                                ui.allocate_ui_with_layout(
+                                    vec2(ui.available_width(), row.height()),
+                                    Layout::left_to_right(Align::Center),
+                                    |ui| self.toolbar_editing_tools(ui),
+                                );
+                            });
+                    },
+                );
+                ui.scope_builder(
+                    egui::UiBuilder::new()
+                        .max_rect(right)
+                        .layout(Layout::right_to_left(Align::Center)),
+                    |ui| self.toolbar_document_actions(ui),
+                );
+            });
+    }
+
+    fn address_bar(&mut self, ui: &mut egui::Ui) {
+        let scale = toolbar_visual_scale(ui);
+        let breadcrumb_path = self
+            .browser_directory
+            .as_deref()
+            .or(self.current_path.as_deref())
+            .map(Path::to_path_buf);
+        let mut breadcrumb_action = None;
+        ui.horizontal(|ui| {
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                if chrome_button(ui, ToolbarIcon::Settings, false, true, "View settings").clicked()
+                {
+                    self.pdf_default_application = current_pdf_default_application();
+                    self.show_view_settings = true;
                 }
-                ui.add_space(5.0 * toolbar_factor);
-                self.document_tabs(ui);
-                ui.separator();
-                let mut breadcrumb_action = None;
-                let breadcrumb_path = self
-                    .browser_directory
-                    .as_deref()
-                    .or(self.current_path.as_deref())
-                    .map(Path::to_path_buf);
-                ScrollArea::horizontal()
-                    .id_salt("path-actions-scroll")
-                    .auto_shrink([false, true])
-                    .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden)
-                    .scroll_source(egui::scroll_area::ScrollSource::ALL)
+                if !self.state.hide_study_chat
+                    && chrome_button(
+                        ui,
+                        ToolbarIcon::Chat,
+                        self.study_chat.visible,
+                        true,
+                        "Study chat (Ctrl+Shift+A)",
+                    )
+                    .clicked()
+                {
+                    self.study_chat.visible = !self.study_chat.visible;
+                }
+                ui.add_space(4.0 * scale);
+                Frame::new()
+                    .fill(theme::ADDRESS_BG)
+                    .corner_radius(CornerRadius::same(15))
+                    .inner_margin(Margin::symmetric(6, 0))
                     .show(ui, |ui| {
-                        ui.horizontal(|ui| {
-                            breadcrumb_action = path_breadcrumbs(ui, breadcrumb_path.as_deref());
-                            if icon_button(
+                        ui.set_width(ui.available_width());
+                        ui.set_height(28.0 * scale);
+                        ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
+                            if chrome_button(
                                 ui,
                                 ToolbarIcon::Folder,
                                 false,
@@ -3404,330 +3714,288 @@ impl SnaPdfApp {
                             {
                                 self.open_current_directory();
                             }
-                            if self.current_path.is_some() {
-                                ui.add_space(8.0);
-                                ui.separator();
-                                if icon_button(
-                                    ui,
-                                    ToolbarIcon::Export,
-                                    false,
-                                    true,
-                                    "Export annotated copy",
+                            ui.label(RichText::new("File").size(12.5 * scale).color(theme::MUTED));
+                            toolbar_divider(ui);
+                            ScrollArea::horizontal()
+                                .id_salt("path-actions-scroll")
+                                .auto_shrink([false, true])
+                                .scroll_bar_visibility(
+                                    egui::scroll_area::ScrollBarVisibility::AlwaysHidden,
                                 )
-                                .clicked()
-                                {
-                                    self.export_annotated_copy();
-                                }
-                                if icon_button(
-                                    ui,
-                                    ToolbarIcon::Save,
-                                    false,
-                                    !self.current_annotations().is_empty(),
-                                    "Save annotations into this PDF",
-                                )
-                                .clicked()
-                                    && !self.current_annotations().is_empty()
-                                {
-                                    self.confirm_save_to_source = true;
-                                }
-                                if icon_button(
-                                    ui,
-                                    ToolbarIcon::Print,
-                                    false,
-                                    true,
-                                    "Print (Ctrl+P)",
-                                )
-                                .clicked()
-                                {
-                                    self.request_print();
-                                }
-                                if icon_button(
-                                    ui,
-                                    ToolbarIcon::OpenWith,
-                                    false,
-                                    true,
-                                    "Open with another app",
-                                )
-                                .clicked()
-                                    && let Some(path) = self.current_path.clone()
-                                {
-                                    self.request_open_with(path);
-                                }
-                            }
+                                .scroll_source(egui::scroll_area::ScrollSource::ALL)
+                                .show(ui, |ui| {
+                                    ui.horizontal(|ui| {
+                                        ui.spacing_mut().item_spacing.x = 2.0 * scale;
+                                        breadcrumb_action =
+                                            path_breadcrumbs(ui, breadcrumb_path.as_deref());
+                                    });
+                                });
                         });
                     });
-                match breadcrumb_action {
-                    Some(BreadcrumbAction::Browse(path)) => self.open_folder_browser(path),
-                    Some(BreadcrumbAction::Copy(path)) => {
-                        ui.ctx().copy_text(path.display().to_string());
-                        self.status = "Path copied.".to_owned();
-                    }
-                    None => {}
-                }
-                if self.current_path.is_some() {
-                    ui.separator();
-                    ui.scope(|ui| {
-                        let row = Rect::from_min_size(
-                            ui.cursor().min,
-                            vec2(
-                                ui.available_width(),
-                                DOCUMENT_TOOLBAR_HEIGHT * toolbar_factor,
-                            ),
-                        );
-                        ui.allocate_rect(row, Sense::hover());
-                        // A small optical correction keeps both vector icons and text labels
-                        // centered between the separators instead of sitting on the baseline.
-                        let content_row =
-                            row.translate(vec2(0.0, DOCUMENT_TOOLBAR_OPTICAL_Y * toolbar_factor));
-                        let third = row.width() / 3.0;
-                        let left = Rect::from_min_max(
-                            content_row.min,
-                            pos2(content_row.left() + third, content_row.bottom()),
-                        );
-                        let center = Rect::from_min_max(
-                            pos2(content_row.left() + third, content_row.top()),
-                            pos2(content_row.right() - third, content_row.bottom()),
-                        );
-                        let right = Rect::from_min_max(
-                            pos2(content_row.right() - third, content_row.top()),
-                            content_row.max,
-                        );
-                        ui.scope_builder(
-                            egui::UiBuilder::new().max_rect(center).layout(
-                                Layout::left_to_right(Align::Center).with_main_align(Align::Center),
-                            ),
-                            |ui| {
-                                ui.horizontal(|ui| {
-                                    // Document zoom is independent from every interface scale.
-                                    if compact_text_button(ui, "−", "Zoom out (Ctrl+-)").clicked()
-                                    {
-                                        let cursor =
-                                            ui.ctx().input(|input| input.pointer.hover_pos());
-                                        self.apply_pinch_zoom(1.0 / 1.1, cursor, ui.ctx());
-                                    }
-                                    ui.label(
-                                        RichText::new(format!(
-                                            "{}%",
-                                            (self.zoom * 100.0).round() as i32
-                                        ))
-                                        .monospace(),
-                                    );
-                                    if compact_text_button(ui, "+", "Zoom in (Ctrl++)").clicked() {
-                                        let cursor =
-                                            ui.ctx().input(|input| input.pointer.hover_pos());
-                                        self.apply_pinch_zoom(1.1, cursor, ui.ctx());
-                                    }
-                                    ui.add_space(5.0);
-                                    ui.separator();
-                                    ui.add_space(5.0);
-                                    if !self.page_sizes.is_empty() {
-                                        if !self.page_entry_editing {
-                                            self.page_entry = (self.current_page + 1).to_string();
-                                        }
-                                        let response = ui.add_sized(
-                                            [42.0 * toolbar_factor, 20.0 * toolbar_factor],
-                                            egui::TextEdit::singleline(&mut self.page_entry)
-                                                .horizontal_align(Align::Center)
-                                                .margin(Margin::symmetric(4, 2)),
-                                        );
-                                        self.page_entry_editing = response.has_focus();
-                                        if response.changed()
-                                            && let Ok(page) =
-                                                self.page_entry.trim().parse::<usize>()
-                                            && (1..=self.page_sizes.len()).contains(&page)
-                                        {
-                                            self.jump_to_page = Some(page - 1);
-                                        }
-                                        if response.lost_focus()
-                                            && !response.has_focus()
-                                            && !self.page_entry.trim().parse::<usize>().is_ok_and(
-                                                |page| (1..=self.page_sizes.len()).contains(&page),
-                                            )
-                                        {
-                                            self.page_entry = (self.current_page + 1).to_string();
-                                        }
-                                        ui.label(
-                                            RichText::new(format!("of {}", self.page_sizes.len()))
-                                                .color(theme::MUTED),
-                                        );
-                                    }
-                                });
-                            },
-                        );
-                        ui.scope_builder(
-                            egui::UiBuilder::new()
-                                .max_rect(left)
-                                .layout(Layout::left_to_right(Align::Center)),
-                            |ui| {
-                                ScrollArea::horizontal()
-                                    .id_salt("viewer-editing-tools-scroll")
-                                    .scroll_bar_visibility(
-                                        egui::scroll_area::ScrollBarVisibility::AlwaysHidden,
-                                    )
-                                    .show(ui, |ui| {
-                                        ui.horizontal(|ui| {
-                                            tool_icon_button(
-                                                ui,
-                                                &mut self.tool_mode,
-                                                ToolMode::Highlight,
-                                                ToolbarIcon::Highlight,
-                                                "Highlight text",
-                                            );
-                                            tool_icon_button(
-                                                ui,
-                                                &mut self.tool_mode,
-                                                ToolMode::Pen,
-                                                ToolbarIcon::Pen,
-                                                "Draw",
-                                            );
-                                            tool_icon_button(
-                                                ui,
-                                                &mut self.tool_mode,
-                                                ToolMode::Eraser,
-                                                ToolbarIcon::Eraser,
-                                                "Erase annotations",
-                                            );
-                                            tool_icon_button(
-                                                ui,
-                                                &mut self.tool_mode,
-                                                ToolMode::Note,
-                                                ToolbarIcon::Comment,
-                                                "Add comment",
-                                            );
-                                            ui.menu_button("···", |ui| {
-                                                tool_button(
-                                                    ui,
-                                                    &mut self.tool_mode,
-                                                    ToolMode::TextBox,
-                                                    "Text box",
-                                                    "Place editable text directly on the page",
-                                                );
-                                                tool_button(
-                                                    ui,
-                                                    &mut self.tool_mode,
-                                                    ToolMode::Rectangle,
-                                                    "Rectangle",
-                                                    "Drag a rectangle",
-                                                );
-                                                tool_button(
-                                                    ui,
-                                                    &mut self.tool_mode,
-                                                    ToolMode::Ellipse,
-                                                    "Ellipse",
-                                                    "Drag an ellipse",
-                                                );
-                                                tool_button(
-                                                    ui,
-                                                    &mut self.tool_mode,
-                                                    ToolMode::Signature,
-                                                    "Signature",
-                                                    "Draw a signature with a black pen",
-                                                );
-                                                tool_button(
-                                                    ui,
-                                                    &mut self.tool_mode,
-                                                    ToolMode::Stamp,
-                                                    "Stamp",
-                                                    "Place a custom text stamp",
-                                                );
-                                                tool_button(
-                                                    ui,
-                                                    &mut self.tool_mode,
-                                                    ToolMode::Attachment,
-                                                    "Attach file",
-                                                    "Attach a local file reference to the page",
-                                                );
-                                            });
-                                            tool_icon_button(
-                                                ui,
-                                                &mut self.tool_mode,
-                                                ToolMode::Ocr,
-                                                ToolbarIcon::Ocr,
-                                                "Snip OCR",
-                                            );
-                                            tool_icon_button(
-                                                ui,
-                                                &mut self.tool_mode,
-                                                ToolMode::MathOcr,
-                                                ToolbarIcon::Math,
-                                                "Math OCR (experimental)",
-                                            );
-                                            if icon_button(
-                                                ui,
-                                                ToolbarIcon::Undo,
-                                                false,
-                                                !self.annotation_undo.is_empty(),
-                                                "Undo",
-                                            )
-                                            .clicked()
-                                            {
-                                                self.undo_annotation();
-                                            }
-                                            if icon_button(
-                                                ui,
-                                                ToolbarIcon::Redo,
-                                                false,
-                                                !self.annotation_redo.is_empty(),
-                                                "Redo",
-                                            )
-                                            .clicked()
-                                            {
-                                                self.redo_annotation();
-                                            }
-                                            ui.separator();
-                                            ui.scope(|ui| {
-                                                ui.spacing_mut().interact_size = vec2(18.0, 18.0);
-                                                ui.color_edit_button_srgba(
-                                                    &mut self.annotation_color,
-                                                );
-                                            });
-                                        });
-                                    });
-                            },
-                        );
-                        ui.scope_builder(
-                            egui::UiBuilder::new()
-                                .max_rect(right)
-                                .layout(Layout::right_to_left(Align::Center)),
-                            |ui| {
-                                if icon_button(
-                                    ui,
-                                    ToolbarIcon::Reader,
-                                    false,
-                                    true,
-                                    "Reader mode — hide the sidebar and toolbar",
-                                )
-                                .clicked()
-                                {
-                                    self.set_reader_mode(ui.ctx(), true);
-                                }
-                                if icon_button(
-                                    ui,
-                                    ToolbarIcon::Present,
-                                    false,
-                                    true,
-                                    "Presentation mode — full screen",
-                                )
-                                .clicked()
-                                {
-                                    self.set_presentation_mode(ui.ctx(), true);
-                                }
-                                if icon_button(
-                                    ui,
-                                    ToolbarIcon::CollapseToolbar,
-                                    false,
-                                    true,
-                                    "Hide toolbar",
-                                )
-                                .clicked()
-                                {
-                                    self.toolbar_visible = false;
-                                }
-                            },
-                        );
-                    });
-                }
             });
+        });
+        match breadcrumb_action {
+            Some(BreadcrumbAction::Browse(path)) => self.open_folder_browser(path),
+            Some(BreadcrumbAction::Copy(path)) => {
+                ui.ctx().copy_text(path.display().to_string());
+                self.status = "Path copied.".to_owned();
+            }
+            None => {}
+        }
+    }
+
+    fn toolbar_page_controls(&mut self, ui: &mut egui::Ui) {
+        let scale = toolbar_visual_scale(ui);
+        ui.spacing_mut().item_spacing.x = 2.0 * scale;
+        // Document zoom is independent from every interface scale.
+        if chrome_button(ui, ToolbarIcon::ZoomOut, false, true, "Zoom out (Ctrl+-)").clicked() {
+            let cursor = ui.ctx().input(|input| input.pointer.hover_pos());
+            self.apply_pinch_zoom(1.0 / 1.1, cursor, ui.ctx());
+        }
+        if chrome_button(ui, ToolbarIcon::ZoomIn, false, true, "Zoom in (Ctrl++)").clicked() {
+            let cursor = ui.ctx().input(|input| input.pointer.hover_pos());
+            self.apply_pinch_zoom(1.1, cursor, ui.ctx());
+        }
+        if chrome_button(
+            ui,
+            ToolbarIcon::FitWidth,
+            false,
+            true,
+            &format!("Fit to width (now {}%)", (self.zoom * 100.0).round() as i32),
+        )
+        .clicked()
+        {
+            self.fit_width_requested = true;
+        }
+        toolbar_divider(ui);
+        if self.page_sizes.is_empty() {
+            return;
+        }
+        if !self.page_entry_editing {
+            self.page_entry = (self.current_page + 1).to_string();
+        }
+        let response = ui.add_sized(
+            [38.0 * scale, 22.0 * scale],
+            egui::TextEdit::singleline(&mut self.page_entry)
+                .horizontal_align(Align::Center)
+                .vertical_align(Align::Center)
+                .margin(Margin::symmetric(4, 2)),
+        );
+        self.page_entry_editing = response.has_focus();
+        if response.changed()
+            && let Ok(page) = self.page_entry.trim().parse::<usize>()
+            && (1..=self.page_sizes.len()).contains(&page)
+        {
+            self.jump_to_page = Some(page - 1);
+        }
+        if response.lost_focus()
+            && !response.has_focus()
+            && !self
+                .page_entry
+                .trim()
+                .parse::<usize>()
+                .is_ok_and(|page| (1..=self.page_sizes.len()).contains(&page))
+        {
+            self.page_entry = (self.current_page + 1).to_string();
+        }
+        ui.add_space(4.0 * scale);
+        ui.label(
+            RichText::new(format!("of {}", self.page_sizes.len()))
+                .size(13.0 * scale)
+                .color(theme::MUTED),
+        );
+    }
+
+    fn toolbar_editing_tools(&mut self, ui: &mut egui::Ui) {
+        let scale = toolbar_visual_scale(ui);
+        ui.spacing_mut().item_spacing.x = 2.0 * scale;
+        toolbar_tool_button(
+            ui,
+            &mut self.tool_mode,
+            ToolMode::Highlight,
+            ToolbarIcon::Highlight,
+            "Highlight text",
+        );
+        toolbar_tool_button(
+            ui,
+            &mut self.tool_mode,
+            ToolMode::Pen,
+            ToolbarIcon::Pen,
+            "Draw",
+        );
+        toolbar_tool_button(
+            ui,
+            &mut self.tool_mode,
+            ToolMode::Eraser,
+            ToolbarIcon::Eraser,
+            "Erase annotations",
+        );
+        toolbar_tool_button(
+            ui,
+            &mut self.tool_mode,
+            ToolMode::Note,
+            ToolbarIcon::Comment,
+            "Add comment",
+        );
+        let more_tools = chrome_button(
+            ui,
+            ToolbarIcon::More,
+            matches!(
+                self.tool_mode,
+                ToolMode::TextBox
+                    | ToolMode::Rectangle
+                    | ToolMode::Ellipse
+                    | ToolMode::Signature
+                    | ToolMode::Stamp
+                    | ToolMode::Attachment
+            ),
+            true,
+            "More annotation tools",
+        );
+        egui::Popup::menu(&more_tools).show(|ui| {
+            for (mode, label, help) in [
+                (
+                    ToolMode::TextBox,
+                    "Text box",
+                    "Place editable text directly on the page",
+                ),
+                (ToolMode::Rectangle, "Rectangle", "Drag a rectangle"),
+                (ToolMode::Ellipse, "Ellipse", "Drag an ellipse"),
+                (
+                    ToolMode::Signature,
+                    "Signature",
+                    "Draw a signature with a black pen",
+                ),
+                (ToolMode::Stamp, "Stamp", "Place a custom text stamp"),
+                (
+                    ToolMode::Attachment,
+                    "Attach file",
+                    "Attach a local file reference to the page",
+                ),
+            ] {
+                tool_button(ui, &mut self.tool_mode, mode, label, help);
+            }
+        });
+        ui.scope(|ui| {
+            ui.spacing_mut().interact_size = vec2(16.0, 16.0) * scale;
+            ui.color_edit_button_srgba(&mut self.annotation_color)
+                .on_hover_text("Annotation color");
+        });
+        toolbar_divider(ui);
+        toolbar_tool_button(
+            ui,
+            &mut self.tool_mode,
+            ToolMode::Ocr,
+            ToolbarIcon::Ocr,
+            "Snip OCR",
+        );
+        toolbar_tool_button(
+            ui,
+            &mut self.tool_mode,
+            ToolMode::MathOcr,
+            ToolbarIcon::Math,
+            "Math OCR (experimental)",
+        );
+        toolbar_divider(ui);
+        if chrome_button(
+            ui,
+            ToolbarIcon::Undo,
+            false,
+            !self.annotation_undo.is_empty(),
+            "Undo",
+        )
+        .clicked()
+        {
+            self.undo_annotation();
+        }
+        if chrome_button(
+            ui,
+            ToolbarIcon::Redo,
+            false,
+            !self.annotation_redo.is_empty(),
+            "Redo",
+        )
+        .clicked()
+        {
+            self.redo_annotation();
+        }
+    }
+
+    /// Right-hand toolbar cluster, laid out right-to-left.
+    fn toolbar_document_actions(&mut self, ui: &mut egui::Ui) {
+        let scale = toolbar_visual_scale(ui);
+        ui.spacing_mut().item_spacing.x = 2.0 * scale;
+        let more = chrome_button(ui, ToolbarIcon::More, false, true, "More actions");
+        egui::Popup::menu(&more).show(|ui| {
+            if ui.button("Open with another app…").clicked()
+                && let Some(path) = self.current_path.clone()
+            {
+                self.request_open_with(path);
+            }
+            if ui.button("Hide toolbar").clicked() {
+                self.toolbar_visible = false;
+            }
+        });
+        if chrome_button(
+            ui,
+            ToolbarIcon::Present,
+            false,
+            true,
+            "Presentation mode — full screen",
+        )
+        .clicked()
+        {
+            self.set_presentation_mode(ui.ctx(), true);
+        }
+        if chrome_button(
+            ui,
+            ToolbarIcon::Reader,
+            false,
+            true,
+            "Reader mode — hide the sidebar and toolbar",
+        )
+        .clicked()
+        {
+            self.set_reader_mode(ui.ctx(), true);
+        }
+        toolbar_divider(ui);
+        if chrome_button(
+            ui,
+            ToolbarIcon::Export,
+            false,
+            true,
+            "Save annotated copy as…",
+        )
+        .clicked()
+        {
+            self.export_annotated_copy();
+        }
+        let has_annotations = !self.current_annotations().is_empty();
+        if chrome_button(
+            ui,
+            ToolbarIcon::Save,
+            false,
+            has_annotations,
+            "Save annotations into this PDF",
+        )
+        .clicked()
+            && has_annotations
+        {
+            self.confirm_save_to_source = true;
+        }
+        if chrome_button(ui, ToolbarIcon::Print, false, true, "Print (Ctrl+P)").clicked() {
+            self.request_print();
+        }
+        toolbar_divider(ui);
+        let searching = self.sidebar_visible && self.sidebar_tab == SidebarTab::Search;
+        if chrome_button(ui, ToolbarIcon::Search, searching, true, "Find (Ctrl+F)").clicked() {
+            if searching {
+                self.sidebar_visible = false;
+                self.show_search = false;
+            } else {
+                self.open_search();
+            }
+        }
     }
 
     fn add_chat_attachment(&mut self, path: PathBuf) {
@@ -5811,6 +6079,10 @@ impl SnaPdfApp {
             .resizable(false)
             .default_width(300.0)
             .show(ctx, |ui| {
+                self.update_settings_section(ui);
+                ui.add_space(8.0);
+                ui.separator();
+                ui.add_space(4.0);
                 ui.label(RichText::new("Interface scale").strong());
                 ui.label(
                     RichText::new(
@@ -6458,9 +6730,7 @@ impl SnaPdfApp {
                 }
                 ui.add_space(7.0);
                 if action_frame(ui, "Search", "Ctrl+F").clicked() {
-                    self.sidebar_visible = true;
-                    self.show_search = true;
-                    self.sidebar_tab = SidebarTab::Search;
+                    self.open_search();
                 }
                 ui.add_space(7.0);
                 if action_frame(ui, "Study chat", "Ctrl+Shift+A").clicked() {
@@ -6482,15 +6752,18 @@ impl SnaPdfApp {
 impl eframe::App for SnaPdfApp {
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.frame_number = self.frame_number.wrapping_add(1);
+        self.receive_instance_handoffs(ctx);
+        self.receive_update_events(ctx);
         self.handle_events(ctx);
         self.keyboard_shortcuts(ctx);
         self.dropped_files(ctx);
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
-        self.navigation_rail(ui);
-        self.sidebar(ui);
+        // Top chrome first so the tab strip and toolbar span the full width,
+        // with the sidebar sitting beneath them like Edge's contents pane.
         self.toolbar(ui);
+        self.sidebar(ui);
         self.study_chat_panel(ui);
         self.viewer(ui);
         self.mode_controls(ui.ctx());
@@ -6504,12 +6777,16 @@ impl eframe::App for SnaPdfApp {
         self.gemini_key_dialog(ui.ctx());
         self.open_with_dialog(ui.ctx());
         self.print_dialog(ui.ctx());
+        self.update_prompt_dialog(ui.ctx());
     }
 
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
         let _ = self.worker.commands.send(RenderCommand::Shutdown);
         let _ = self.ocr_worker.commands.send(OcrCommand::Shutdown);
         let _ = self.chat_worker.commands.send(ChatCommand::Shutdown);
+        if let Some(socket) = self.instance_socket.as_ref() {
+            let _ = fs::remove_file(socket);
+        }
         self.persist();
     }
 }
@@ -6526,12 +6803,11 @@ enum RailIcon {
     Files,
     Contents,
     Search,
-    Chat,
-    Settings,
 }
 
 fn rail_button(ui: &mut egui::Ui, selected: bool, icon: RailIcon) -> Response {
-    let (rect, response) = ui.allocate_exact_size(vec2(38.0, 38.0), Sense::click());
+    let scale = sidebar_visual_scale(ui);
+    let (rect, response) = ui.allocate_exact_size(vec2(34.0, 30.0) * scale, Sense::click());
     if selected || response.hovered() {
         ui.painter().rect_filled(
             rect,
@@ -6578,25 +6854,6 @@ fn rail_button(ui: &mut egui::Ui, selected: bool, icon: RailIcon) -> Response {
                 Stroke::new(1.6, color),
             );
         }
-        RailIcon::Chat => {
-            let bubble = Rect::from_center_size(center - vec2(0.0, 1.0), vec2(17.0, 13.0));
-            ui.painter()
-                .rect_stroke(bubble, 4.0, Stroke::new(1.5, color), StrokeKind::Inside);
-            ui.painter().line_segment(
-                [
-                    bubble.left_bottom() + vec2(5.0, 0.0),
-                    bubble.left_bottom() + vec2(2.0, 4.0),
-                ],
-                Stroke::new(1.5, color),
-            );
-            for x in [-4.0, 0.0, 4.0] {
-                ui.painter()
-                    .circle_filled(center + vec2(x, -1.0), 1.0, color);
-            }
-        }
-        RailIcon::Settings => {
-            paint_toolbar_icon(ui.painter(), center, ToolbarIcon::Settings, color)
-        }
     }
     response
 }
@@ -6605,6 +6862,8 @@ struct SidebarRowResponse {
     body: Response,
     options: Response,
     rename_rect: Rect,
+    /// The label was elided, so callers should offer the full name on hover.
+    truncated: bool,
 }
 
 fn rename_row_id(target: &RenameTarget) -> egui::Id {
@@ -6738,9 +6997,7 @@ fn render_pdf_tree(
             file_icons,
         );
         register_rename_row(ui, &RenameTarget::File(path.clone()), row.rename_rect);
-        if label.chars().count()
-            > max_sidebar_label_chars(&row.body, 24.0 + depth as f32 * 14.0, file_icons)
-        {
+        if row.truncated {
             row.body.clone().on_hover_text(label.clone());
         }
         if row.body.clicked() && !row.options.clicked() {
@@ -6820,27 +7077,31 @@ fn directory_row(
         Stroke::new(1.3 * scale, muted),
     ));
     paint_folder_icon(ui.painter(), pos2(x + 19.0 * scale, y), muted, scale);
-    ui.painter().text(
-        pos2(x + 32.0 * scale, y),
-        Align2::LEFT_CENTER,
-        elide(
-            name,
-            ((rect.right() - x - 38.0 * scale) / (7.0 * scale)).max(5.0) as usize,
-        ),
-        FontId::proportional(13.0 * scale),
-        Color32::from_rgb(202, 202, 202),
-    );
-    ui.painter().text(
+    let count_rect = ui.painter().text(
         pos2(rect.right() - 7.0 * scale, y),
         Align2::RIGHT_CENTER,
         count.to_string(),
         FontId::proportional(10.5 * scale),
         theme::MUTED,
     );
+    let label_right = if response.hovered() {
+        rect.right() - 34.0 * scale
+    } else {
+        count_rect.left() - 8.0 * scale
+    };
+    let truncated = paint_elided_label(
+        ui.painter(),
+        pos2(x + 32.0 * scale, y),
+        name,
+        label_right - (x + 32.0 * scale),
+        FontId::proportional(13.0 * scale),
+        Color32::from_rgb(202, 202, 202),
+    );
     let options = sidebar_options_button(ui, rect, &response);
     SidebarRowResponse {
         body: response,
         options,
+        truncated,
         rename_rect: Rect::from_min_max(
             pos2(x + 31.0 * scale, rect.top() + 2.0 * scale),
             pos2(rect.right() - 35.0 * scale, rect.bottom() - 2.0 * scale),
@@ -6893,19 +7154,19 @@ fn project_header(
         scale,
     );
 
-    let count_text = count.to_string();
-    painter.text(
+    let count_rect = painter.text(
         pos2(rect.right() - 34.0 * scale, center_y),
         Align2::RIGHT_CENTER,
-        &count_text,
+        count.to_string(),
         FontId::proportional(11.0 * scale),
         theme::MUTED,
     );
-    let max_chars = ((rect.width() - 112.0 * scale) / (7.2 * scale)).max(4.0) as usize;
-    painter.text(
-        pos2(rect.left() + 51.0 * scale, center_y),
-        Align2::LEFT_CENTER,
-        elide(name, max_chars),
+    let text_left = rect.left() + 51.0 * scale;
+    let truncated = paint_elided_label(
+        painter,
+        pos2(text_left, center_y),
+        name,
+        count_rect.left() - 8.0 * scale - text_left,
         FontId::proportional(14.0 * scale),
         Color32::from_rgb(218, 220, 225),
     );
@@ -6913,6 +7174,7 @@ fn project_header(
     SidebarRowResponse {
         body: response,
         options,
+        truncated,
         rename_rect: Rect::from_min_max(
             pos2(rect.left() + 48.0 * scale, rect.top() + 4.0 * scale),
             pos2(rect.right() - 52.0 * scale, rect.bottom() - 4.0 * scale),
@@ -6965,11 +7227,13 @@ fn nav_row(
         }
     }
     let text_left = rect.left() + (indent + if show_icon { 28.0 } else { 8.0 }) * scale;
-    let max_chars = ((rect.right() - text_left - 32.0 * scale) / (7.0 * scale)).max(4.0) as usize;
-    painter.text(
+    // The options button only appears on hover, so only then give up its space.
+    let reserved = if response.hovered() { 32.0 } else { 6.0 } * scale;
+    let truncated = paint_elided_label(
+        painter,
         pos2(text_left, rect.center().y),
-        Align2::LEFT_CENTER,
-        elide(label, max_chars),
+        label,
+        rect.right() - reserved - text_left,
         FontId::proportional(13.5 * scale),
         if selected {
             Color32::WHITE
@@ -6981,31 +7245,12 @@ fn nav_row(
     SidebarRowResponse {
         body: response,
         options,
+        truncated,
         rename_rect: Rect::from_min_max(
             pos2(text_left, rect.top() + 3.0 * scale),
             pos2(rect.right() - 33.0 * scale, rect.bottom() - 3.0 * scale),
         ),
     }
-}
-
-fn max_sidebar_label_chars(
-    response: &Response,
-    indent: f32,
-    file_icons: SidebarFileIcons,
-) -> usize {
-    let scale = sidebar_visual_scale_from_response(response);
-    let text_left = response.rect.left()
-        + indent * scale
-        + if file_icons == SidebarFileIcons::None {
-            8.0 * scale
-        } else {
-            28.0 * scale
-        };
-    ((response.rect.right() - text_left - 32.0 * scale) / (7.0 * scale)).max(4.0) as usize
-}
-
-fn sidebar_visual_scale_from_response(response: &Response) -> f32 {
-    (response.rect.height() / 34.0).clamp(0.1, 4.0)
 }
 
 fn sidebar_options_button(ui: &mut egui::Ui, row_rect: Rect, row: &Response) -> Response {
@@ -7352,6 +7597,41 @@ fn collapsible_section_header(
     } else {
         "Expand recents"
     })
+}
+
+/// Paint a one-line label left-aligned at `left_center`, using the whole
+/// `max_width` and eliding with "…" only when the measured text overflows.
+/// Returns whether the label was elided.
+fn paint_elided_label(
+    painter: &egui::Painter,
+    left_center: egui::Pos2,
+    text: &str,
+    max_width: f32,
+    font_id: FontId,
+    color: Color32,
+) -> bool {
+    let mut job = egui::text::LayoutJob::single_section(
+        text.to_owned(),
+        egui::TextFormat {
+            font_id,
+            color,
+            ..Default::default()
+        },
+    );
+    job.wrap = egui::text::TextWrapping {
+        max_width: max_width.max(0.0),
+        max_rows: 1,
+        break_anywhere: true,
+        overflow_character: Some('…'),
+    };
+    let galley = painter.layout_job(job);
+    let elided = galley.elided;
+    painter.galley(
+        pos2(left_center.x, left_center.y - galley.size().y / 2.0),
+        galley,
+        color,
+    );
+    elided
 }
 
 fn elide(text: &str, max_chars: usize) -> String {
@@ -7729,10 +8009,8 @@ enum ToolbarIcon {
     Print,
     Export,
     Save,
-    OpenWith,
     Folder,
     Settings,
-    CollapseToolbar,
     Reader,
     Present,
     Attach,
@@ -7744,6 +8022,14 @@ enum ToolbarIcon {
     Confirm,
     Copy,
     Close,
+    Sidebar,
+    Search,
+    Chat,
+    More,
+    Plus,
+    ZoomIn,
+    ZoomOut,
+    FitWidth,
 }
 
 #[derive(Clone, Copy)]
@@ -7790,16 +8076,54 @@ fn mini_mode_icon_button(ui: &mut egui::Ui, icon: ModeControlIcon, help: &str) -
     response.on_hover_text(help)
 }
 
-fn compact_text_button(ui: &mut egui::Ui, text: &str, help: &str) -> Response {
-    let scale = toolbar_visual_scale(ui);
-    ui.add_sized(
-        [22.0 * scale, 20.0 * scale],
-        egui::Button::new(RichText::new(text).size(13.0 * scale)).frame(false),
-    )
-    .on_hover_text(help)
+/// Scale a chrome region by its user-adjustable ratio, independent of the
+/// overall interface zoom.
+fn apply_region_scale(ui: &mut egui::Ui, factor: f32) {
+    ui.style_mut().spacing.item_spacing *= factor;
+    ui.style_mut().spacing.button_padding *= factor;
+    ui.style_mut().spacing.interact_size *= factor;
+    for font in ui.style_mut().text_styles.values_mut() {
+        font.size *= factor;
+    }
 }
 
-fn tool_icon_button(
+/// Square, flat Edge-style toolbar button: no frame at rest, a soft rounded
+/// fill on hover and a stronger one when the control is toggled on.
+fn chrome_button(
+    ui: &mut egui::Ui,
+    icon: ToolbarIcon,
+    selected: bool,
+    enabled: bool,
+    help: &str,
+) -> Response {
+    let scale = toolbar_visual_scale(ui);
+    // Shorter rows, such as the document toolbar, get proportionally shorter buttons.
+    let height = (30.0 * scale).min(ui.max_rect().height());
+    let (rect, response) = ui.allocate_exact_size(vec2(32.0 * scale, height), Sense::click());
+    let hovered = enabled && response.hovered();
+    if selected || hovered {
+        ui.painter().rect_filled(
+            rect.shrink(1.0),
+            CornerRadius::same(6),
+            if selected {
+                Color32::from_rgb(64, 64, 64)
+            } else {
+                Color32::from_rgb(54, 54, 54)
+            },
+        );
+    }
+    let color = if !enabled {
+        Color32::from_rgb(92, 92, 92)
+    } else if selected || hovered {
+        Color32::from_rgb(240, 240, 240)
+    } else {
+        Color32::from_rgb(206, 206, 206)
+    };
+    paint_toolbar_icon(ui.painter(), rect.center(), icon, color);
+    response.on_hover_text(help)
+}
+
+fn toolbar_tool_button(
     ui: &mut egui::Ui,
     mode: &mut ToolMode,
     value: ToolMode,
@@ -7807,39 +8131,24 @@ fn tool_icon_button(
     help: &str,
 ) -> Response {
     let selected = *mode == value;
-    let response = icon_button(ui, icon, selected, true, help);
+    let response = chrome_button(ui, icon, selected, true, help);
     if response.clicked() {
         *mode = if selected { ToolMode::Select } else { value };
     }
     response
 }
 
-fn icon_button(
-    ui: &mut egui::Ui,
-    icon: ToolbarIcon,
-    selected: bool,
-    enabled: bool,
-    help: &str,
-) -> Response {
-    let (rect, response) = ui.allocate_exact_size(vec2(24.0, 20.0), Sense::click());
-    if selected || response.hovered() {
-        ui.painter().rect_filled(
-            rect,
-            CornerRadius::same(5),
-            if selected {
-                Color32::from_rgb(65, 65, 65)
-            } else {
-                Color32::from_rgb(45, 45, 45)
-            },
-        );
-    }
-    let color = if enabled {
-        Color32::from_rgb(205, 205, 205)
-    } else {
-        Color32::from_rgb(88, 88, 88)
-    };
-    paint_toolbar_icon(ui.painter(), rect.center(), icon, color);
-    response.on_hover_text(help)
+fn toolbar_divider(ui: &mut egui::Ui) {
+    let scale = toolbar_visual_scale(ui);
+    let height = (30.0 * scale).min(ui.max_rect().height());
+    let (rect, _) = ui.allocate_exact_size(vec2(11.0 * scale, height), Sense::hover());
+    ui.painter().line_segment(
+        [
+            pos2(rect.center().x, rect.top() + 7.0 * scale),
+            pos2(rect.center().x, rect.bottom() - 7.0 * scale),
+        ],
+        Stroke::new(1.0, Color32::from_rgb(70, 70, 70)),
+    );
 }
 
 /// A compact icon-only action for the Study chat composer. Unlike text or emoji
@@ -9397,17 +9706,6 @@ fn paint_toolbar_icon(
                 StrokeKind::Inside,
             );
         }
-        ToolbarIcon::OpenWith => {
-            painter.rect_stroke(
-                Rect::from_center_size(center + vec2(-2.0, 2.0), vec2(12.0, 12.0)),
-                2.0,
-                stroke,
-                StrokeKind::Inside,
-            );
-            painter.line_segment([center + vec2(0.0, 0.0), center + vec2(7.0, -7.0)], stroke);
-            painter.line_segment([center + vec2(7.0, -7.0), center + vec2(3.0, -7.0)], stroke);
-            painter.line_segment([center + vec2(7.0, -7.0), center + vec2(7.0, -3.0)], stroke);
-        }
         ToolbarIcon::Folder => {
             let body = Rect::from_min_max(center + vec2(-8.0, -3.0), center + vec2(8.0, 6.0));
             painter.rect_stroke(body, 2.0, stroke, StrokeKind::Inside);
@@ -9435,18 +9733,6 @@ fn paint_toolbar_icon(
             painter.circle_filled(center, 4.35, theme::PANEL_BG);
             painter.circle_stroke(center, 4.35, Stroke::new(1.05, color));
             painter.circle_filled(center, 1.5, color);
-        }
-        ToolbarIcon::CollapseToolbar => {
-            painter.line_segment([center + vec2(-7.0, 5.0), center + vec2(7.0, 5.0)], stroke);
-            painter.add(egui::Shape::convex_polygon(
-                vec![
-                    center + vec2(-4.0, 0.0),
-                    center + vec2(4.0, 0.0),
-                    center + vec2(0.0, -4.5),
-                ],
-                color,
-                Stroke::NONE,
-            ));
         }
         ToolbarIcon::Reader => {
             let page = Rect::from_center_size(center, vec2(12.0, 15.0));
@@ -9602,6 +9888,62 @@ fn paint_toolbar_icon(
                 [center + vec2(-4.5, -5.5), center + vec2(-4.5, 3.5)],
                 Stroke::new(1.2, color),
             );
+        }
+        ToolbarIcon::Sidebar => {
+            let frame = Rect::from_center_size(center, vec2(16.0, 13.0));
+            painter.rect_stroke(frame, 2.0, stroke, StrokeKind::Inside);
+            painter.line_segment(
+                [
+                    pos2(frame.left() + 5.5, frame.top()),
+                    pos2(frame.left() + 5.5, frame.bottom()),
+                ],
+                stroke,
+            );
+        }
+        ToolbarIcon::Search => {
+            painter.circle_stroke(center + vec2(-1.5, -1.5), 5.0, stroke);
+            painter.line_segment([center + vec2(2.2, 2.2), center + vec2(6.5, 6.5)], stroke);
+        }
+        ToolbarIcon::Chat => {
+            let bubble = Rect::from_center_size(center - vec2(0.0, 1.0), vec2(15.0, 11.0));
+            painter.rect_stroke(bubble, 3.5, stroke, StrokeKind::Inside);
+            painter.line_segment(
+                [
+                    bubble.left_bottom() + vec2(4.0, 0.0),
+                    bubble.left_bottom() + vec2(2.0, 3.5),
+                ],
+                stroke,
+            );
+            for x in [-3.5, 0.0, 3.5] {
+                painter.circle_filled(center + vec2(x, -1.0), 0.9, color);
+            }
+        }
+        ToolbarIcon::More => {
+            for x in [-5.0, 0.0, 5.0] {
+                painter.circle_filled(center + vec2(x, 0.0), 1.3, color);
+            }
+        }
+        ToolbarIcon::Plus | ToolbarIcon::ZoomIn => {
+            painter.line_segment([center + vec2(-5.5, 0.0), center + vec2(5.5, 0.0)], stroke);
+            painter.line_segment([center + vec2(0.0, -5.5), center + vec2(0.0, 5.5)], stroke);
+        }
+        ToolbarIcon::ZoomOut => {
+            painter.line_segment([center + vec2(-5.5, 0.0), center + vec2(5.5, 0.0)], stroke);
+        }
+        ToolbarIcon::FitWidth => {
+            let page = Rect::from_center_size(center, vec2(16.0, 12.0));
+            painter.rect_stroke(page, 1.5, stroke, StrokeKind::Inside);
+            for (tip, dir) in [(page.left() + 3.0, 1.0), (page.right() - 3.0, -1.0)] {
+                painter.line_segment([pos2(tip, center.y), pos2(center.x, center.y)], stroke);
+                painter.line_segment(
+                    [pos2(tip, center.y), pos2(tip + 2.5 * dir, center.y - 2.5)],
+                    stroke,
+                );
+                painter.line_segment(
+                    [pos2(tip, center.y), pos2(tip + 2.5 * dir, center.y + 2.5)],
+                    stroke,
+                );
+            }
         }
         ToolbarIcon::Close => {
             painter.line_segment([center + vec2(-4.5, -4.5), center + vec2(4.5, 4.5)], stroke);
@@ -10480,8 +10822,8 @@ mod tests {
     fn dot_cli_argument_resolves_to_the_current_directory_project() {
         let expected = std::env::current_dir().unwrap().canonicalize().unwrap();
         assert_eq!(
-            launch_target_from_args([std::ffi::OsString::from(".")]),
-            Some(LaunchTarget::Project(expected))
+            launch_targets_from_args([std::ffi::OsString::from(".")]),
+            vec![LaunchTarget::Project(expected)]
         );
     }
 

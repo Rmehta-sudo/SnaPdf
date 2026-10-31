@@ -89,7 +89,12 @@ This downloads the OCR runtime into `~/.local/share/snapdf/ocr`; the OCR models 
 
 ### Updating or uninstalling SnaPdf
 
-If SnaPdf was installed with the curl installer, close the running app and run the same installer
+SnaPdf checks for a newer release when it starts and shows a prompt when one is available.
+**Settings → Updates** always shows whether you are on the latest release; for the portable
+AppImage, **Update and restart** downloads the new release, verifies its checksum, replaces the
+installed AppImage, and reopens SnaPdf.
+
+You can also update from the terminal: close the running app and run the curl installer
 again. It automatically resolves the newest GitHub release, verifies its checksum, replaces only
 the installed AppImage, and preserves projects, annotations, chats, settings, credentials, and OCR
 data:

@@ -5,6 +5,9 @@ use eframe::egui::{
 
 pub const SIDEBAR_BG: Color32 = Color32::from_rgb(35, 35, 35);
 pub const CANVAS_BG: Color32 = Color32::from_rgb(30, 30, 30);
+pub const TAB_STRIP_BG: Color32 = Color32::from_rgb(24, 24, 24);
+pub const TOOLBAR_BG: Color32 = Color32::from_rgb(43, 43, 43);
+pub const ADDRESS_BG: Color32 = Color32::from_rgb(31, 31, 31);
 pub const PANEL_BG: Color32 = Color32::from_rgb(29, 29, 29);
 pub const ACCENT: Color32 = Color32::from_rgb(105, 105, 105);
 pub const MUTED: Color32 = Color32::from_rgb(154, 154, 154);

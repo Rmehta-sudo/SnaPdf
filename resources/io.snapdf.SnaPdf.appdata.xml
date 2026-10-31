@@ -28,6 +28,17 @@
   </provides>
   <content_rating type="oars-1.1"/>
   <releases>
+    <release version="0.4.0" date="2026-11-01">
+      <description>
+        <p>Opening a PDF while SnaPdf is running now adds a tab to the existing window instead
+        of starting another one.</p>
+        <p>Adopts a minimal, browser-style layout: a full-width tab strip, an address bar with the
+        file path, and a single centered document toolbar. Ctrl+F focuses the search field
+        immediately, and sidebar names use all of the available width.</p>
+        <p>Settings shows whether a newer release exists and can update the portable AppImage in
+        place and restart; a prompt appears when an update is available.</p>
+      </description>
+    </release>
     <release version="0.3.5" date="2026-10-18">
       <description>
         <p>Refreshes the Ubuntu/GNOME desktop icon and icon cache whenever the AppImage registers
