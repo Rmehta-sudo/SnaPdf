@@ -28,6 +28,15 @@
   </provides>
   <content_rating type="oars-1.1"/>
   <releases>
+    <release version="0.4.4" date="2026-11-04">
+      <description>
+        <p>New app icon: a colourful camera shutter with a page at its centre.</p>
+        <p>Larger interface text and controls by default, a clearer split between the sidebar and
+        the reading area, flat sidebar actions with an Add folder button when no projects exist,
+        drawn OCR and math tool icons, a round annotation colour swatch with presets, and a single
+        blue accent for active tools and focus.</p>
+      </description>
+    </release>
     <release version="0.4.3" date="2026-11-01">
       <description>
         <p>Restyles Study chat to match the rest of the app: the same gray surfaces, flat header

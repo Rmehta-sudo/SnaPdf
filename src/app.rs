@@ -2504,6 +2504,7 @@ impl SnaPdfApp {
                     for font in ui.style_mut().text_styles.values_mut() {
                         font.size *= explorer_factor;
                     }
+                    let mut actions_inline = false;
                     ui.horizontal(|ui| {
                         for (tab, icon, help) in [
                             (
@@ -2526,36 +2527,88 @@ impl SnaPdfApp {
                                 }
                             }
                         }
+                        // Library actions share the tab row when there is room
+                        // and move to their own row in a narrow sidebar.
+                        actions_inline = self.sidebar_tab == SidebarTab::Library
+                            && ui.available_width() >= 3.0 * 36.0 * sidebar_visual_scale(ui);
+                        if actions_inline {
+                            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                if chrome_button(
+                                    ui,
+                                    ToolbarIcon::Refresh,
+                                    false,
+                                    true,
+                                    "Rescan project folders",
+                                )
+                                .clicked()
+                                {
+                                    self.refresh_projects();
+                                }
+                                if chrome_button(
+                                    ui,
+                                    ToolbarIcon::FolderPlus,
+                                    false,
+                                    true,
+                                    "Add a project folder",
+                                )
+                                .clicked()
+                                {
+                                    self.add_project_dialog();
+                                }
+                                if chrome_button(
+                                    ui,
+                                    ToolbarIcon::OpenFile,
+                                    false,
+                                    true,
+                                    "Open a PDF (Ctrl+O)",
+                                )
+                                .clicked()
+                                {
+                                    self.open_file_dialog();
+                                }
+                            });
+                        }
                     });
-                    ui.add_space(6.0);
-                    if self.sidebar_tab == SidebarTab::Library {
+                    if self.sidebar_tab == SidebarTab::Library && !actions_inline {
                         ui.horizontal(|ui| {
-                            if ui
-                                .button("Open")
-                                .on_hover_text("Open a PDF (Ctrl+O)")
+                            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                if chrome_button(
+                                    ui,
+                                    ToolbarIcon::Refresh,
+                                    false,
+                                    true,
+                                    "Rescan project folders",
+                                )
                                 .clicked()
-                            {
-                                self.open_file_dialog();
-                            }
-                            ui.separator();
-                            if ui
-                                .button("+ Project")
-                                .on_hover_text("Add a PDF project folder")
+                                {
+                                    self.refresh_projects();
+                                }
+                                if chrome_button(
+                                    ui,
+                                    ToolbarIcon::FolderPlus,
+                                    false,
+                                    true,
+                                    "Add a project folder",
+                                )
                                 .clicked()
-                            {
-                                self.add_project_dialog();
-                            }
-                            ui.separator();
-                            if ui
-                                .button("Refresh")
-                                .on_hover_text("Rescan project folders")
+                                {
+                                    self.add_project_dialog();
+                                }
+                                if chrome_button(
+                                    ui,
+                                    ToolbarIcon::OpenFile,
+                                    false,
+                                    true,
+                                    "Open a PDF (Ctrl+O)",
+                                )
                                 .clicked()
-                            {
-                                self.refresh_projects();
-                            }
+                                {
+                                    self.open_file_dialog();
+                                }
+                            });
                         });
-                        ui.add_space(4.0);
                     }
+                    ui.add_space(6.0);
                     if self.sidebar_tab == SidebarTab::Contents {
                         self.outline_sidebar(ui);
                         return;
@@ -2816,11 +2869,27 @@ impl SnaPdfApp {
                                 ui.add_space(6.0);
                                 ui.label(
                                     RichText::new(
-                                        "Add a course or research folder. Only PDFs are shown.",
+                                        "Add a course or research folder to browse its PDFs.",
                                     )
                                     .color(theme::MUTED)
                                     .size(13.0 * explorer_factor),
                                 );
+                                ui.add_space(6.0);
+                                if ui
+                                    .add(
+                                        egui::Button::new(
+                                            RichText::new("Add folder")
+                                                .size(13.5 * explorer_factor)
+                                                .color(theme::ON_ACCENT),
+                                        )
+                                        .fill(theme::ACCENT_BLUE)
+                                        .corner_radius(CornerRadius::same(7)),
+                                    )
+                                    .clicked()
+                                {
+                                    self.add_project_dialog();
+                                }
+                                ui.add_space(4.0);
                             }
 
                             for index in 0..self.state.projects.len() {
@@ -3917,11 +3986,7 @@ impl SnaPdfApp {
                 tool_button(ui, &mut self.tool_mode, mode, label, help);
             }
         });
-        ui.scope(|ui| {
-            ui.spacing_mut().interact_size = vec2(16.0, 16.0) * scale;
-            ui.color_edit_button_srgba(&mut self.annotation_color)
-                .on_hover_text("Annotation color");
-        });
+        annotation_color_dot(ui, &mut self.annotation_color);
         toolbar_divider(ui);
         toolbar_tool_button(
             ui,
@@ -8192,6 +8257,9 @@ enum ToolbarIcon {
     ZoomIn,
     ZoomOut,
     FitWidth,
+    Refresh,
+    FolderPlus,
+    OpenFile,
 }
 
 #[derive(Clone, Copy)]
@@ -8486,7 +8554,7 @@ fn chrome_button(
             rect.shrink(1.0),
             CornerRadius::same(6),
             if selected {
-                Color32::from_rgb(64, 64, 64)
+                theme::ACCENT_BLUE.gamma_multiply(0.28)
             } else {
                 Color32::from_rgb(54, 54, 54)
             },
@@ -8494,7 +8562,9 @@ fn chrome_button(
     }
     let color = if !enabled {
         Color32::from_rgb(92, 92, 92)
-    } else if selected || hovered {
+    } else if selected {
+        theme::ACCENT_BLUE_TEXT
+    } else if hovered {
         Color32::from_rgb(240, 240, 240)
     } else {
         Color32::from_rgb(206, 206, 206)
@@ -8516,6 +8586,56 @@ fn toolbar_tool_button(
         *mode = if selected { ToolMode::Select } else { value };
     }
     response
+}
+
+/// The annotation colour as a round swatch with presets and a full picker.
+fn annotation_color_dot(ui: &mut egui::Ui, color: &mut Color32) {
+    let scale = toolbar_visual_scale(ui);
+    let height = (30.0 * scale).min(ui.max_rect().height());
+    let (rect, response) = ui.allocate_exact_size(vec2(28.0 * scale, height), Sense::click());
+    if response.hovered() {
+        ui.painter().rect_filled(
+            rect.shrink(1.0),
+            CornerRadius::same(6),
+            Color32::from_rgb(54, 54, 54),
+        );
+    }
+    ui.painter().circle(
+        rect.center(),
+        6.5 * scale,
+        *color,
+        Stroke::new(1.5, Color32::from_rgb(230, 230, 230)),
+    );
+    let response = response.on_hover_text("Annotation colour");
+    egui::Popup::menu(&response).show(|ui| {
+        ui.horizontal(|ui| {
+            for preset in [
+                Color32::from_rgb(255, 211, 74),
+                Color32::from_rgb(120, 220, 120),
+                Color32::from_rgb(110, 190, 255),
+                Color32::from_rgb(255, 140, 190),
+                Color32::from_rgb(255, 120, 90),
+                Color32::from_rgb(190, 150, 255),
+            ] {
+                let (dot, clicked) = ui.allocate_exact_size(vec2(22.0, 22.0), Sense::click());
+                ui.painter().circle(
+                    dot.center(),
+                    8.0,
+                    preset,
+                    if preset == *color {
+                        Stroke::new(2.0, Color32::WHITE)
+                    } else {
+                        Stroke::NONE
+                    },
+                );
+                if clicked.clicked() {
+                    *color = preset;
+                }
+            }
+        });
+        ui.add_space(4.0);
+        egui::color_picker::color_picker_color32(ui, color, egui::color_picker::Alpha::Opaque);
+    });
 }
 
 fn toolbar_divider(ui: &mut egui::Ui) {
@@ -8576,9 +8696,9 @@ const CHAT_CANVAS: Color32 = theme::SIDEBAR_BG;
 const CHAT_HEADER: Color32 = theme::SIDEBAR_BG;
 const CHAT_DIVIDER: Color32 = Color32::from_rgb(48, 48, 48);
 /// Raised surfaces inside the chat panel: composer, chips, prompt bubbles.
-const CHAT_FIELD: Color32 = Color32::from_rgb(46, 46, 46);
+const CHAT_FIELD: Color32 = Color32::from_rgb(52, 52, 52);
 /// Hover highlight for buttons on the panel or inside the composer.
-const CHAT_HOVER: Color32 = Color32::from_rgb(60, 60, 60);
+const CHAT_HOVER: Color32 = Color32::from_rgb(66, 66, 66);
 const CHAT_ACCENT: Color32 = Color32::from_rgb(16, 163, 127);
 const CHAT_TEXT: Color32 = Color32::from_rgb(236, 236, 236);
 const CHAT_MUTED: Color32 = Color32::from_rgb(166, 166, 166);
@@ -10031,22 +10151,66 @@ fn paint_toolbar_icon(
             }
         }
         ToolbarIcon::Ocr => {
-            painter.text(
-                center,
-                Align2::CENTER_CENTER,
-                "OCR",
-                FontId::monospace(8.5),
-                color,
-            );
+            // Snip frame: four corner brackets around a scanned text line.
+            for (x, y) in [(-1.0, -1.0), (1.0, -1.0), (1.0, 1.0), (-1.0, 1.0)] {
+                let corner = center + vec2(7.0 * x, 6.0 * y);
+                painter.line_segment([corner, corner - vec2(4.0 * x, 0.0)], stroke);
+                painter.line_segment([corner, corner - vec2(0.0, 4.0 * y)], stroke);
+            }
+            painter.line_segment([center + vec2(-3.5, 0.0), center + vec2(3.5, 0.0)], stroke);
         }
         ToolbarIcon::Math => {
-            painter.text(
-                center,
-                Align2::CENTER_CENTER,
-                "fx",
-                FontId::proportional(11.0),
-                color,
-            );
+            // Square-root sign over an x.
+            painter.add(egui::Shape::line(
+                vec![
+                    center + vec2(-8.0, 1.0),
+                    center + vec2(-5.5, 0.0),
+                    center + vec2(-3.0, 6.0),
+                    center + vec2(0.5, -7.0),
+                    center + vec2(8.0, -7.0),
+                ],
+                stroke,
+            ));
+            painter.line_segment([center + vec2(2.0, -2.5), center + vec2(7.0, 3.5)], stroke);
+            painter.line_segment([center + vec2(7.0, -2.5), center + vec2(2.0, 3.5)], stroke);
+        }
+        ToolbarIcon::Refresh => {
+            let radius = 6.0;
+            let points: Vec<_> = (0..=20)
+                .map(|step| {
+                    let angle = -0.6 + step as f32 / 20.0 * 5.0;
+                    center + vec2(angle.cos(), angle.sin()) * radius
+                })
+                .collect();
+            let tip = *points.last().expect("arc has points");
+            painter.add(egui::Shape::line(points, stroke));
+            painter.line_segment([tip, tip + vec2(0.5, -4.0)], stroke);
+            painter.line_segment([tip, tip + vec2(4.0, 0.5)], stroke);
+        }
+        ToolbarIcon::FolderPlus => {
+            paint_folder_icon(painter, center + vec2(-1.5, 0.5), color, 0.95);
+            let plus = center + vec2(6.5, 5.0);
+            painter.circle_filled(plus, 4.6, theme::SIDEBAR_BG);
+            painter.line_segment([plus - vec2(3.0, 0.0), plus + vec2(3.0, 0.0)], stroke);
+            painter.line_segment([plus - vec2(0.0, 3.0), plus + vec2(0.0, 3.0)], stroke);
+        }
+        ToolbarIcon::OpenFile => {
+            let page = Rect::from_center_size(center + vec2(-1.5, 0.0), vec2(11.0, 14.0));
+            painter.add(egui::Shape::closed_line(
+                vec![
+                    page.left_top(),
+                    page.right_top() - vec2(3.5, 0.0),
+                    page.right_top() + vec2(0.0, 3.5),
+                    page.right_bottom(),
+                    page.left_bottom(),
+                ],
+                stroke,
+            ));
+            let arrow = center + vec2(6.0, 2.0);
+            painter.circle_filled(arrow, 4.8, theme::SIDEBAR_BG);
+            painter.line_segment([arrow + vec2(0.0, 3.5), arrow - vec2(0.0, 3.5)], stroke);
+            painter.line_segment([arrow - vec2(0.0, 3.5), arrow + vec2(-2.8, -0.8)], stroke);
+            painter.line_segment([arrow - vec2(0.0, 3.5), arrow + vec2(2.8, -0.8)], stroke);
         }
         ToolbarIcon::Undo | ToolbarIcon::Redo => {
             let flip = if matches!(icon, ToolbarIcon::Undo) {
@@ -10435,9 +10599,13 @@ fn path_breadcrumbs(ui: &mut egui::Ui, path: Option<&Path>) -> Option<Breadcrumb
 }
 
 const BASE_INTERFACE_REGION_SCALE: f32 = 0.6;
+/// Every interface size setting is rendered this much larger. The original
+/// 100% read too small on typical laptop screens; this keeps saved settings
+/// and their percentages while enlarging text and controls uniformly.
+const INTERFACE_ZOOM_BOOST: f32 = 1.15;
 
 fn interface_zoom(interface_scale: f32) -> f32 {
-    (interface_scale * BASE_INTERFACE_REGION_SCALE).clamp(0.28, 5.0)
+    (interface_scale * BASE_INTERFACE_REGION_SCALE * INTERFACE_ZOOM_BOOST).clamp(0.28, 5.0)
 }
 
 fn interface_region_scale(region_scale: f32) -> f32 {
@@ -11733,10 +11901,11 @@ mod tests {
     #[test]
     fn interface_regions_keep_independent_effective_scales() {
         let overall = interface_zoom(1.0);
-        assert!((overall - BASE_INTERFACE_REGION_SCALE).abs() < f32::EPSILON);
-        assert!((overall * interface_region_scale(0.4) - 0.4).abs() < 0.0001);
-        assert!((overall * interface_region_scale(0.8) - 0.8).abs() < 0.0001);
-        assert!((interface_zoom(1.25) - 0.75).abs() < 0.0001);
+        let boost = INTERFACE_ZOOM_BOOST;
+        assert!((overall - BASE_INTERFACE_REGION_SCALE * boost).abs() < 0.0001);
+        assert!((overall * interface_region_scale(0.4) - 0.4 * boost).abs() < 0.0001);
+        assert!((overall * interface_region_scale(0.8) - 0.8 * boost).abs() < 0.0001);
+        assert!((interface_zoom(1.25) - 0.75 * boost).abs() < 0.0001);
         assert_eq!(normalized_scale_percent(1.6, DEFAULT_UI_SCALE), 100);
         assert_eq!(normalized_scale_percent(3.2, DEFAULT_UI_SCALE), 200);
         assert_eq!(
