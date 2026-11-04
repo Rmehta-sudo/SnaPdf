@@ -28,6 +28,14 @@
   </provides>
   <content_rating type="oars-1.1"/>
   <releases>
+    <release version="0.4.6" date="2026-11-05">
+      <description>
+        <p>Choose how the file path is shown: the full path bar under the tabs (default) or a
+        compact folder button in the toolbar that gives the page more room. Switch in Settings,
+        collapse the bar with its chevron, or expand it again from the compact button. Study chat
+        and Settings now sit at the right end of the tab strip.</p>
+      </description>
+    </release>
     <release version="0.4.5" date="2026-11-05">
       <description>
         <p>Annotations saved or exported by SnaPdf now appear correctly in other PDF viewers,

@@ -5,8 +5,8 @@ use crate::chat::{
 use crate::instance::{self, LaunchTarget};
 use crate::model::{
     Annotation, AnnotationKind, AppState, DEFAULT_CHROME_SCALE_RATIO, DEFAULT_SIDEBAR_SCALE_RATIO,
-    DEFAULT_UI_SCALE, RecentDocument, SidebarFileIcons, StudyChatSession, is_discoverable_pdf,
-    is_pdf,
+    DEFAULT_UI_SCALE, PathBarStyle, RecentDocument, SidebarFileIcons, StudyChatSession,
+    is_discoverable_pdf, is_pdf,
 };
 use crate::ocr::{OcrCommand, OcrEvent, OcrWorker};
 use crate::pdf::{
@@ -3581,7 +3581,8 @@ impl SnaPdfApp {
                 self.sidebar_visible = !self.sidebar_visible;
             }
             ui.add_space(6.0 * scale);
-            let new_tab_width = 34.0 * scale;
+            let corner_buttons = if self.state.hide_study_chat { 1.0 } else { 2.0 };
+            let new_tab_width = 34.0 * scale + corner_buttons * 32.0 * scale + 12.0 * scale;
             let tab_width = ((ui.available_width() - new_tab_width)
                 / documents.len().max(1) as f32)
                 .clamp(44.0 * scale, 236.0 * scale);
@@ -3683,6 +3684,30 @@ impl SnaPdfApp {
             if chrome_button(ui, ToolbarIcon::Plus, false, true, "Open PDF (Ctrl+O)").clicked() {
                 self.open_file_dialog();
             }
+            // Window-level actions live in the strip's right corner, as in Edge.
+            ui.with_layout(Layout::right_to_left(Align::Max), |ui| {
+                if chrome_button(ui, ToolbarIcon::Settings, false, true, "Settings").clicked() {
+                    self.pdf_default_application = current_pdf_default_application();
+                    self.show_view_settings = true;
+                }
+                if !self.state.hide_study_chat
+                    && chrome_button(
+                        ui,
+                        ToolbarIcon::Chat,
+                        self.study_chat.visible,
+                        true,
+                        // While the panel is open, the tooltip would cover its header.
+                        if self.study_chat.visible {
+                            ""
+                        } else {
+                            "Study chat (Ctrl+Shift+A)"
+                        },
+                    )
+                    .clicked()
+                {
+                    self.study_chat.visible = !self.study_chat.visible;
+                }
+            });
         });
         if let Some(path) = close {
             self.close_document_tab(&path);
@@ -3943,17 +3968,19 @@ impl SnaPdfApp {
                 self.document_tabs(ui);
             });
 
-        egui::Panel::top("address-bar")
-            .frame(Frame::new().fill(theme::TOOLBAR_BG).inner_margin(Margin {
-                left: 8,
-                right: 8,
-                top: 5,
-                bottom: 4,
-            }))
-            .show(root, |ui| {
-                apply_region_scale(ui, toolbar_factor);
-                self.address_bar(ui);
-            });
+        if self.state.path_bar == PathBarStyle::Bar {
+            egui::Panel::top("address-bar")
+                .frame(Frame::new().fill(theme::TOOLBAR_BG).inner_margin(Margin {
+                    left: 8,
+                    right: 8,
+                    top: 5,
+                    bottom: 4,
+                }))
+                .show(root, |ui| {
+                    apply_region_scale(ui, toolbar_factor);
+                    self.address_bar(ui);
+                });
+        }
 
         if self.current_path.is_none() {
             return;
@@ -3994,7 +4021,13 @@ impl SnaPdfApp {
                                 ui.allocate_ui_with_layout(
                                     vec2(ui.available_width(), row.height()),
                                     Layout::left_to_right(Align::Center),
-                                    |ui| self.toolbar_editing_tools(ui),
+                                    |ui| {
+                                        if self.state.path_bar == PathBarStyle::InToolbar {
+                                            self.path_crumb(ui);
+                                            toolbar_divider(ui);
+                                        }
+                                        self.toolbar_editing_tools(ui);
+                                    },
                                 );
                             });
                     },
@@ -4008,6 +4041,8 @@ impl SnaPdfApp {
             });
     }
 
+    /// The full-width path row: every folder is clickable, the file name
+    /// copies the path, and the chevron collapses it into the toolbar.
     fn address_bar(&mut self, ui: &mut egui::Ui) {
         let scale = toolbar_visual_scale(ui);
         let breadcrumb_path = self
@@ -4018,27 +4053,17 @@ impl SnaPdfApp {
         let mut breadcrumb_action = None;
         ui.horizontal(|ui| {
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                if chrome_button(ui, ToolbarIcon::Settings, false, true, "View settings").clicked()
+                if chrome_button(
+                    ui,
+                    ToolbarIcon::CollapseUp,
+                    false,
+                    true,
+                    "Collapse the path into the toolbar",
+                )
+                .clicked()
                 {
-                    self.pdf_default_application = current_pdf_default_application();
-                    self.show_view_settings = true;
-                }
-                if !self.state.hide_study_chat
-                    && chrome_button(
-                        ui,
-                        ToolbarIcon::Chat,
-                        self.study_chat.visible,
-                        true,
-                        // While the panel is open, the tooltip would cover its header.
-                        if self.study_chat.visible {
-                            ""
-                        } else {
-                            "Study chat (Ctrl+Shift+A)"
-                        },
-                    )
-                    .clicked()
-                {
-                    self.study_chat.visible = !self.study_chat.visible;
+                    self.state.path_bar = PathBarStyle::InToolbar;
+                    self.persist();
                 }
                 ui.add_space(4.0 * scale);
                 Frame::new()
@@ -4091,6 +4116,132 @@ impl SnaPdfApp {
         }
     }
 
+    /// The document's folder as a compact crumb at the left of the toolbar.
+    /// Its menu holds the full clickable path, copying and Files.
+    fn path_crumb(&mut self, ui: &mut egui::Ui) {
+        let Some(path) = self
+            .browser_directory
+            .clone()
+            .or_else(|| self.current_path.clone())
+        else {
+            return;
+        };
+        let folder = if path.is_dir() {
+            path.clone()
+        } else {
+            path.parent().map(Path::to_path_buf).unwrap_or_default()
+        };
+        let names: Vec<String> = folder
+            .components()
+            .filter_map(|component| match component {
+                std::path::Component::Normal(name) => Some(name.to_string_lossy().into_owned()),
+                _ => None,
+            })
+            .collect();
+        let tail = names[names.len().saturating_sub(2)..].join(" / ");
+        let label = if names.len() > 2 {
+            format!("… / {tail}")
+        } else {
+            tail
+        };
+
+        let scale = toolbar_visual_scale(ui);
+        let font = FontId::proportional(12.5 * scale);
+        let text_width = ui
+            .painter()
+            .layout_no_wrap(label.clone(), font.clone(), theme::MUTED)
+            .size()
+            .x
+            .min(190.0 * scale);
+        let height = (30.0 * scale).min(ui.max_rect().height());
+        let (rect, response) =
+            ui.allocate_exact_size(vec2(text_width + 44.0 * scale, height), Sense::click());
+        let hovered = response.hovered();
+        if hovered {
+            ui.painter().rect_filled(
+                rect.shrink(1.0),
+                CornerRadius::same(6),
+                Color32::from_rgb(54, 54, 54),
+            );
+        }
+        let color = if hovered {
+            Color32::from_rgb(235, 235, 235)
+        } else {
+            Color32::from_rgb(200, 200, 200)
+        };
+        paint_folder_icon(
+            ui.painter(),
+            pos2(rect.left() + 13.0 * scale, rect.center().y),
+            color,
+            0.9 * scale,
+        );
+        paint_elided_label(
+            ui.painter(),
+            pos2(rect.left() + 25.0 * scale, rect.center().y),
+            &label,
+            text_width,
+            font,
+            color,
+        );
+        let chevron = pos2(rect.right() - 10.0 * scale, rect.center().y + 1.0);
+        ui.painter().add(egui::Shape::convex_polygon(
+            vec![
+                chevron + vec2(-3.5, -2.0) * scale,
+                chevron + vec2(3.5, -2.0) * scale,
+                chevron + vec2(0.0, 2.5) * scale,
+            ],
+            color,
+            Stroke::NONE,
+        ));
+        let response = response.on_hover_text(path.display().to_string());
+
+        let mut action = None;
+        let mut show_in_files = false;
+        egui::Popup::menu(&response).show(|ui| {
+            ui.set_min_width(280.0);
+            let mut cumulative = PathBuf::from("/");
+            for (depth, name) in names.iter().enumerate() {
+                cumulative.push(name);
+                let clicked = ui
+                    .horizontal(|ui| {
+                        ui.add_space(depth.min(10) as f32 * 10.0);
+                        ui.selectable_label(cumulative == folder, name.as_str())
+                            .on_hover_text("Browse PDFs in this folder")
+                            .clicked()
+                    })
+                    .inner;
+                if clicked {
+                    action = Some(BreadcrumbAction::Browse(cumulative.clone()));
+                    ui.close();
+                }
+            }
+            ui.separator();
+            if ui.button("Copy full path").clicked() {
+                action = Some(BreadcrumbAction::Copy(path.clone()));
+                ui.close();
+            }
+            if ui.button("Show in Files").clicked() {
+                show_in_files = true;
+                ui.close();
+            }
+            if ui.button("Show the full path bar").clicked() {
+                self.state.path_bar = PathBarStyle::Bar;
+                self.persist();
+                ui.close();
+            }
+        });
+        match action {
+            Some(BreadcrumbAction::Browse(directory)) => self.open_folder_browser(directory),
+            Some(BreadcrumbAction::Copy(path)) => {
+                ui.ctx().copy_text(path.display().to_string());
+                self.status = "Path copied.".to_owned();
+            }
+            None => {}
+        }
+        if show_in_files {
+            self.open_current_directory();
+        }
+    }
     fn toolbar_page_controls(&mut self, ui: &mut egui::Ui) {
         let scale = toolbar_visual_scale(ui);
         ui.spacing_mut().item_spacing.x = 2.0 * scale;
@@ -6399,6 +6550,7 @@ impl SnaPdfApp {
         let mut sidebar_ratio = self.state.sidebar_scale_ratio;
         let mut chat_font_size = self.state.chat_font_size;
         let mut file_icons = self.state.sidebar_file_icons;
+        let mut path_bar = self.state.path_bar;
         let mut changed = false;
         let mut set_default_pdf_viewer = false;
         let mut close = false;
@@ -6605,6 +6757,22 @@ impl SnaPdfApp {
                             settings_card(ui, |ui| {
                                 settings_row(
                                     ui,
+                                    "File path",
+                                    "A full path bar under the tabs, or a compact folder button in the toolbar.",
+                                    |ui| {
+                                        changed |= settings_segmented(
+                                            ui,
+                                            &mut path_bar,
+                                            &[
+                                                (PathBarStyle::Bar, "Path bar"),
+                                                (PathBarStyle::InToolbar, "In toolbar"),
+                                            ],
+                                        );
+                                    },
+                                );
+                                settings_divider(ui);
+                                settings_row(
+                                    ui,
                                     "PDF icons in explorer",
                                     "How PDFs are marked in the project tree.",
                                     |ui| {
@@ -6706,6 +6874,7 @@ impl SnaPdfApp {
             self.state.sidebar_scale_ratio = sidebar_ratio;
             self.state.chat_font_size = chat_font_size;
             self.state.sidebar_file_icons = file_icons;
+            self.state.path_bar = path_bar;
             self.state.sidebar_file_icons_initialized = true;
             if self.state.hide_study_chat {
                 self.study_chat.visible = false;
@@ -8428,6 +8597,7 @@ enum ToolbarIcon {
     Export,
     Save,
     Folder,
+    CollapseUp,
     Settings,
     Reader,
     Present,
@@ -10542,19 +10712,6 @@ fn paint_toolbar_icon(
                 StrokeKind::Inside,
             );
         }
-        ToolbarIcon::Folder => {
-            let body = Rect::from_min_max(center + vec2(-8.0, -3.0), center + vec2(8.0, 6.0));
-            painter.rect_stroke(body, 2.0, stroke, StrokeKind::Inside);
-            painter.line_segment(
-                [center + vec2(-7.0, -3.0), center + vec2(-4.0, -6.0)],
-                stroke,
-            );
-            painter.line_segment(
-                [center + vec2(-4.0, -6.0), center + vec2(1.0, -6.0)],
-                stroke,
-            );
-            painter.line_segment([center + vec2(1.0, -6.0), center + vec2(3.0, -3.0)], stroke);
-        }
         ToolbarIcon::Settings => {
             // A continuous toothed cog reads as Settings at small sizes more
             // clearly than the previous sunburst of disconnected lines.
@@ -10879,6 +11036,23 @@ fn paint_toolbar_icon(
                 Stroke::NONE,
             ));
         }
+        ToolbarIcon::Folder => {
+            let body = Rect::from_min_max(center + vec2(-8.0, -3.0), center + vec2(8.0, 6.0));
+            painter.rect_stroke(body, 2.0, stroke, StrokeKind::Inside);
+            painter.line_segment(
+                [center + vec2(-7.0, -3.0), center + vec2(-4.0, -6.0)],
+                stroke,
+            );
+            painter.line_segment(
+                [center + vec2(-4.0, -6.0), center + vec2(1.0, -6.0)],
+                stroke,
+            );
+            painter.line_segment([center + vec2(1.0, -6.0), center + vec2(3.0, -3.0)], stroke);
+        }
+        ToolbarIcon::CollapseUp => {
+            painter.line_segment([center + vec2(-5.0, 2.5), center + vec2(0.0, -2.5)], stroke);
+            painter.line_segment([center + vec2(0.0, -2.5), center + vec2(5.0, 2.5)], stroke);
+        }
         ToolbarIcon::Close => {
             painter.line_segment([center + vec2(-4.5, -4.5), center + vec2(4.5, 4.5)], stroke);
             painter.line_segment([center + vec2(4.5, -4.5), center + vec2(-4.5, 4.5)], stroke);
@@ -10893,6 +11067,12 @@ fn png_from_rgb(width: usize, height: usize, rgb: Vec<u8>) -> Result<Vec<u8>> {
     image::DynamicImage::ImageRgb8(image).write_to(&mut bytes, image::ImageFormat::Png)?;
     Ok(bytes.into_inner())
 }
+
+const BASE_INTERFACE_REGION_SCALE: f32 = 0.6;
+/// Every interface size setting is rendered this much larger. The original
+/// 100% read too small on typical laptop screens; this keeps saved settings
+/// and their percentages while enlarging text and controls uniformly.
+const INTERFACE_ZOOM_BOOST: f32 = 1.15;
 
 fn path_breadcrumbs(ui: &mut egui::Ui, path: Option<&Path>) -> Option<BreadcrumbAction> {
     let scale = toolbar_visual_scale(ui);
@@ -10948,12 +11128,6 @@ fn path_breadcrumbs(ui: &mut egui::Ui, path: Option<&Path>) -> Option<Breadcrumb
     }
     action
 }
-
-const BASE_INTERFACE_REGION_SCALE: f32 = 0.6;
-/// Every interface size setting is rendered this much larger. The original
-/// 100% read too small on typical laptop screens; this keeps saved settings
-/// and their percentages while enlarging text and controls uniformly.
-const INTERFACE_ZOOM_BOOST: f32 = 1.15;
 
 fn interface_zoom(interface_scale: f32) -> f32 {
     (interface_scale * BASE_INTERFACE_REGION_SCALE * INTERFACE_ZOOM_BOOST).clamp(0.28, 5.0)

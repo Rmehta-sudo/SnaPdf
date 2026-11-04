@@ -47,6 +47,9 @@ pub struct AppState {
     /// Visual treatment for PDF entries in the sidebar.
     #[serde(default)]
     pub sidebar_file_icons: SidebarFileIcons,
+    /// Where the open file's folder path is shown.
+    #[serde(default)]
+    pub path_bar: PathBarStyle,
     /// One-time migration marker for the icon preference introduced after 0.1.0.
     #[serde(default)]
     pub sidebar_file_icons_initialized: bool,
@@ -85,6 +88,15 @@ pub struct StudyChatSession {
     pub messages: HashMap<ChatProvider, Vec<ChatMessage>>,
     #[serde(default)]
     pub last_opened: u64,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub enum PathBarStyle {
+    /// A full-width row under the tabs with the whole clickable path.
+    #[default]
+    Bar,
+    /// A compact folder button at the start of the toolbar.
+    InToolbar,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
@@ -499,6 +511,7 @@ mod tests {
         assert!((state.chat_font_size - 14.0).abs() < f32::EPSILON);
         assert_eq!(state.chat_reasoning_effort, ReasoningEffort::Medium);
         assert_eq!(state.sidebar_file_icons, SidebarFileIcons::None);
+        assert_eq!(state.path_bar, PathBarStyle::Bar);
     }
 
     #[test]
