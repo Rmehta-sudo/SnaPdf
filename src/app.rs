@@ -34,6 +34,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use walkdir::WalkDir;
 
 const MAX_TEXTURES: usize = 10;
+const PAGE_ENTRY_ID: &str = "toolbar-page-entry";
 const MAX_TEXTURE_BYTES: usize = 256 * 1024 * 1024;
 const MAX_PENDING_PAGES: usize = 16;
 const PAGE_GAP: f32 = 18.0;
@@ -306,6 +307,46 @@ struct TextDraft {
 struct ExternalApp {
     name: String,
     desktop_file: PathBuf,
+}
+
+struct PasswordPrompt {
+    path: PathBuf,
+    input: String,
+    /// The previous attempt was rejected.
+    incorrect: bool,
+    focus_requested: bool,
+}
+
+/// Queue `path` with CUPS and describe the result. `lp` only copies the job
+/// into the spooler, so waiting for it is quick and lets real errors (no
+/// printer, bad page range) reach the user instead of a false "submitted".
+fn send_to_printer(path: &Path, dialog: &PrintDialog) -> String {
+    let mut command = Command::new("lp");
+    if !dialog.printer.trim().is_empty() {
+        command.arg("-d").arg(dialog.printer.trim());
+    }
+    command
+        .arg("-n")
+        .arg(dialog.copies.clamp(1, 99).to_string());
+    if !dialog.page_range.trim().is_empty() {
+        command.arg("-P").arg(dialog.page_range.trim());
+    }
+    command.arg(path);
+    match command.output() {
+        Ok(output) if output.status.success() => {
+            let detail = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+            if detail.is_empty() {
+                "Sent to the printer.".to_owned()
+            } else {
+                format!("Sent to the printer ({detail}).")
+            }
+        }
+        Ok(output) => format!(
+            "Printing failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ),
+        Err(error) => format!("Could not start printing (is CUPS installed?): {error}"),
+    }
 }
 
 struct PrintDialog {
@@ -592,6 +633,11 @@ pub struct SnaPdfApp {
     pinned_comment: Option<u64>,
     show_view_settings: bool,
     settings_page: SettingsPage,
+    /// Passwords for encrypted PDFs, kept only for this session.
+    document_passwords: HashMap<PathBuf, String>,
+    /// An annotated copy being prepared for printing, and the print settings.
+    pending_print: Option<(PathBuf, PrintDialog)>,
+    password_prompt: Option<PasswordPrompt>,
     pending_interface_scale: Option<f32>,
     pdf_default_application: Option<String>,
     confirm_save_to_source: bool,
@@ -739,6 +785,9 @@ impl SnaPdfApp {
             pinned_comment: None,
             show_view_settings: false,
             settings_page: SettingsPage::General,
+            document_passwords: HashMap::new(),
+            pending_print: None,
+            password_prompt: None,
             pending_interface_scale: None,
             pdf_default_application: None,
             confirm_save_to_source: false,
@@ -775,6 +824,8 @@ impl SnaPdfApp {
                     self.update_status = UpdateStatus::Failed(error);
                 }
                 UpdateEvent::Installed(Ok(())) => self.restart_after_update(ctx),
+                // A cancelled download already put the status back to Available.
+                UpdateEvent::Installed(Err(error)) if error == update::CANCELLED => {}
                 UpdateEvent::Installed(Err(error)) => {
                     self.update_status = UpdateStatus::Failed(error);
                 }
@@ -824,10 +875,24 @@ impl SnaPdfApp {
                 format!("Version {} is available.", release.version),
                 Color32::from_rgb(255, 196, 92),
             ),
-            UpdateStatus::Installing(release) => (
-                format!("Downloading version {}…", release.version),
-                theme::MUTED,
-            ),
+            UpdateStatus::Installing(release) => {
+                let (done, total) = self.update_worker.progress.bytes();
+                let megabytes = |bytes: u64| bytes as f64 / 1_048_576.0;
+                let detail = if total > 0 {
+                    format!(
+                        "{:.1} of {:.1} MB ({}%)",
+                        megabytes(done),
+                        megabytes(total),
+                        done * 100 / total
+                    )
+                } else {
+                    format!("{:.1} MB", megabytes(done))
+                };
+                (
+                    format!("Downloading version {}: {detail}", release.version),
+                    theme::MUTED,
+                )
+            }
             UpdateStatus::Failed(error) => (
                 format!("Couldn't update: {error}"),
                 Color32::from_rgb(235, 120, 110),
@@ -835,6 +900,7 @@ impl SnaPdfApp {
         };
         let mut start_update = false;
         let mut check = false;
+        let mut cancel = false;
         settings_card(ui, |ui| {
             ui.horizontal(|ui| {
                 ui.vertical(|ui| {
@@ -871,6 +937,11 @@ impl SnaPdfApp {
                                 start_update = true;
                             }
                         }
+                        UpdateStatus::Installing(_) => {
+                            if ui.button("Cancel").clicked() {
+                                cancel = true;
+                            }
+                        }
                         _ if !busy => {
                             if ui.button("Check for updates").clicked() {
                                 check = true;
@@ -893,9 +964,71 @@ impl SnaPdfApp {
         if start_update {
             self.start_update();
         }
+        if cancel && let UpdateStatus::Installing(release) = self.update_status.clone() {
+            self.update_worker.progress.cancel();
+            self.update_status = UpdateStatus::Available(release);
+        }
         if check {
             self.update_status = UpdateStatus::Checking;
             self.update_worker.check();
+        }
+    }
+
+    fn password_dialog(&mut self, ctx: &egui::Context) {
+        let Some(prompt) = self.password_prompt.as_mut() else {
+            return;
+        };
+        let mut submit = false;
+        let mut cancel = false;
+        let path = prompt.path.clone();
+        cancel |= modal_dialog(
+            ctx,
+            "pdf-password",
+            "Password required",
+            380.0,
+            false,
+            |ui| {
+                dialog_text(
+                    ui,
+                    format!(
+                        "{} is protected. Enter its password to open it.",
+                        file_name(&path)
+                    ),
+                );
+                let response = ui.add_sized(
+                    [ui.available_width(), 32.0],
+                    egui::TextEdit::singleline(&mut prompt.input)
+                        .password(true)
+                        .hint_text("Password")
+                        .vertical_align(Align::Center)
+                        .margin(Margin::symmetric(10, 6)),
+                );
+                if std::mem::take(&mut prompt.focus_requested) {
+                    response.request_focus();
+                }
+                if prompt.incorrect {
+                    ui.label(
+                        RichText::new("That password didn't work. Try again.")
+                            .size(12.5)
+                            .color(Color32::from_rgb(235, 120, 110)),
+                    );
+                }
+                submit = response.lost_focus() && ui.input(|input| input.key_pressed(Key::Enter));
+                dialog_actions(ui, |ui| {
+                    submit |= primary_button(ui, "Open", !prompt.input.is_empty()).clicked();
+                    cancel |= secondary_button(ui, "Cancel").clicked();
+                });
+            },
+        );
+        if submit && !prompt.input.is_empty() {
+            let prompt = self.password_prompt.take().expect("prompt is open");
+            self.document_passwords
+                .insert(prompt.path.clone(), prompt.input);
+            self.open_document(prompt.path);
+        } else if cancel {
+            let prompt = self.password_prompt.take().expect("prompt is open");
+            self.document_passwords.remove(&prompt.path);
+            self.close_document_tab(&prompt.path);
         }
     }
 
@@ -908,31 +1041,42 @@ impl SnaPdfApp {
             return;
         };
         let version = release.version.clone();
+        let mut open_settings = false;
+        let mut later = false;
+        // A corner notice rather than a modal: an update should never block reading.
         egui::Window::new("Update available")
+            .id(egui::Id::new("update-prompt"))
+            .title_bar(false)
             .collapsible(false)
             .resizable(false)
-            .anchor(Align2::RIGHT_TOP, vec2(-16.0, 16.0))
+            .order(egui::Order::Foreground)
+            .anchor(Align2::RIGHT_TOP, vec2(-16.0, 110.0))
+            .frame(dialog_frame())
             .show(ctx, |ui| {
-                ui.label(format!(
-                    "SnaPdf {version} is available. You're using {}.",
-                    update::CURRENT_VERSION
-                ));
-                ui.add_space(6.0);
-                ui.horizontal(|ui| {
-                    if ui.button("Open settings").clicked() {
-                        self.show_update_prompt = false;
-                        self.pdf_default_application = current_pdf_default_application();
-                        self.settings_page = SettingsPage::General;
-                        self.show_view_settings = true;
-                    }
-                    if ui.button("Later").clicked() {
-                        self.show_update_prompt = false;
-                    }
+                ui.set_width(300.0);
+                later |= dialog_header(ui, "Update available");
+                dialog_text(
+                    ui,
+                    format!(
+                        "SnaPdf {version} is out. You're on {}.",
+                        update::CURRENT_VERSION
+                    ),
+                );
+                dialog_actions(ui, |ui| {
+                    open_settings = primary_button(ui, "Update", true).clicked();
+                    later |= secondary_button(ui, "Later").clicked();
                 });
             });
+        if open_settings {
+            self.show_update_prompt = false;
+            self.pdf_default_application = current_pdf_default_application();
+            self.settings_page = SettingsPage::General;
+            self.show_view_settings = true;
+        } else if later {
+            self.show_update_prompt = false;
+        }
     }
 
-    /// Open PDFs and folders that a later `snapdf` launch handed to this window.
     fn receive_instance_handoffs(&mut self, ctx: &egui::Context) {
         let Some(receiver) = self.instance_requests.as_ref() else {
             return;
@@ -1014,9 +1158,11 @@ impl SnaPdfApp {
         self.status = format!("Opening {}...", file_name(&path));
         self.state.record_open(&path);
         let _ = storage::save(&self.state);
+        let password = self.document_passwords.get(&path).cloned();
         let _ = self.worker.commands.send(RenderCommand::Open {
             path,
             generation: self.generation,
+            password,
         });
     }
 
@@ -1159,30 +1305,32 @@ impl SnaPdfApp {
     }
 
     fn submit_print(&mut self) {
-        let (Some(path), Some(dialog)) = (self.current_path.clone(), self.print_dialog.as_ref())
+        let (Some(path), Some(dialog)) = (self.current_path.clone(), self.print_dialog.take())
         else {
             return;
         };
-        let mut command = Command::new("lp");
-        if !dialog.printer.trim().is_empty() {
-            command.arg("-d").arg(dialog.printer.trim());
+        let annotations = self.current_annotations().to_vec();
+        if annotations.is_empty() {
+            self.status = send_to_printer(&path, &dialog);
+            return;
         }
-        command
-            .arg("-n")
-            .arg(dialog.copies.clamp(1, 99).to_string());
-        if !dialog.page_range.trim().is_empty() {
-            command.arg("-P").arg(dialog.page_range.trim());
-        }
-        command.arg(&path);
-        match command.spawn() {
-            Ok(_) => {
-                self.status = "Print job submitted.".to_owned();
-                self.print_dialog = None;
-            }
-            Err(error) => {
-                self.status = format!("Could not start printing: {error}");
-            }
-        }
+        // Print what the reader sees: render the annotations into a temporary
+        // copy first, then hand that copy to CUPS.
+        let temporary = std::env::temp_dir().join(format!(
+            "snapdf-print-{}-{}.pdf",
+            std::process::id(),
+            unix_timestamp()
+        ));
+        self.status = "Preparing the annotated copy for printing...".to_owned();
+        let password = self.document_passwords.get(&path).cloned();
+        let _ = self.worker.commands.send(RenderCommand::ExportAnnotated {
+            source: path,
+            password,
+            destination: temporary.clone(),
+            annotations,
+            generation: self.generation,
+        });
+        self.pending_print = Some((temporary, dialog));
     }
 
     fn export_annotated_copy(&mut self) {
@@ -1203,8 +1351,10 @@ impl SnaPdfApp {
         };
         self.status = "Exporting annotated copy...".to_owned();
         let annotations = self.current_annotations().to_vec();
+        let password = self.document_passwords.get(&source).cloned();
         let _ = self.worker.commands.send(RenderCommand::ExportAnnotated {
             source,
+            password,
             destination,
             annotations,
             generation: self.generation,
@@ -1219,6 +1369,13 @@ impl SnaPdfApp {
             .file_name()
             .and_then(|name| name.to_str())
             .unwrap_or("document.pdf");
+        if self.document_passwords.contains_key(&source) {
+            // Rewriting the file could drop its encryption; keep it intact.
+            self.status =
+                "Saving into a password-protected PDF isn't supported. Export an annotated copy instead."
+                    .to_owned();
+            return;
+        }
         let temporary =
             source.with_file_name(format!(".{name}.snapdf-saving-{}.pdf", std::process::id()));
         let annotations = self.current_annotations().to_vec();
@@ -1226,6 +1383,7 @@ impl SnaPdfApp {
         self.status = "Writing annotations into the PDF...".to_owned();
         let _ = self.worker.commands.send(RenderCommand::ExportAnnotated {
             source,
+            password: None,
             destination: temporary,
             annotations,
             generation: self.generation,
@@ -1559,6 +1717,14 @@ impl SnaPdfApp {
                     exported,
                     skipped,
                 } if generation == self.generation => {
+                    if let Some((temporary, dialog)) = self
+                        .pending_print
+                        .take_if(|(temporary, _)| *temporary == destination)
+                    {
+                        self.status = send_to_printer(&temporary, &dialog);
+                        let _ = fs::remove_file(temporary);
+                        continue;
+                    }
                     let source_save = self
                         .pending_source_save
                         .take()
@@ -1659,11 +1825,27 @@ impl SnaPdfApp {
                         };
                     }
                 }
+                RenderEvent::PasswordRequired {
+                    path,
+                    generation,
+                    incorrect,
+                } if generation == self.generation => {
+                    self.status = format!("{} is password-protected.", file_name(&path));
+                    self.password_prompt = Some(PasswordPrompt {
+                        path,
+                        input: String::new(),
+                        incorrect,
+                        focus_requested: true,
+                    });
+                }
                 RenderEvent::Error {
                     generation,
                     message,
                 } if generation == 0 || generation == self.generation => {
                     if let Some((temporary, _)) = self.pending_source_save.take() {
+                        let _ = fs::remove_file(temporary);
+                    }
+                    if let Some((temporary, _)) = self.pending_print.take() {
                         let _ = fs::remove_file(temporary);
                     }
                     self.status = message;
@@ -2107,7 +2289,11 @@ impl SnaPdfApp {
         let open = KeyboardShortcut::new(Modifiers::CTRL, Key::O);
         let new_project_prefix = KeyboardShortcut::new(Modifiers::CTRL, Key::K);
         let zoom_in = KeyboardShortcut::new(Modifiers::CTRL, Key::Plus);
+        // On most layouts "+" needs Shift, so Ctrl+= is the key people press.
+        let zoom_in_equals = KeyboardShortcut::new(Modifiers::CTRL, Key::Equals);
         let zoom_out = KeyboardShortcut::new(Modifiers::CTRL, Key::Minus);
+        let fit_width = KeyboardShortcut::new(Modifiers::CTRL, Key::Num0);
+        let go_to_page = KeyboardShortcut::new(Modifiers::CTRL, Key::G);
         let copy = KeyboardShortcut::new(Modifiers::CTRL, Key::C);
         let select_all = KeyboardShortcut::new(Modifiers::CTRL, Key::A);
         let find = KeyboardShortcut::new(Modifiers::CTRL, Key::F);
@@ -2127,11 +2313,14 @@ impl SnaPdfApp {
                         input.consume_key(Modifiers::NONE, Key::Escape),
                         input.consume_key(Modifiers::NONE, Key::Backspace)
                             || input.consume_key(Modifiers::NONE, Key::ArrowLeft)
+                            || input.consume_key(Modifiers::NONE, Key::PageUp)
                             || input.consume_key(Modifiers::NONE, Key::K),
+                        // Presentation clickers send Page Down / Page Up.
                         input.consume_key(Modifiers::NONE, Key::Space)
                             || input.consume_key(Modifiers::NONE, Key::ArrowRight)
+                            || input.consume_key(Modifiers::NONE, Key::PageDown)
                             || input.consume_key(Modifiers::NONE, Key::J),
-                        input.consume_shortcut(&zoom_in),
+                        input.consume_shortcut(&zoom_in) || input.consume_shortcut(&zoom_in_equals),
                         input.consume_shortcut(&zoom_out),
                     )
                 });
@@ -2199,9 +2388,52 @@ impl SnaPdfApp {
         {
             self.project_shortcut_armed_until = None;
         }
-        if ctx.input_mut(|input| input.consume_shortcut(&zoom_in)) {
+        if ctx.input_mut(|input| {
+            input.consume_shortcut(&zoom_in) || input.consume_shortcut(&zoom_in_equals)
+        }) {
             let cursor = ctx.input(|input| input.pointer.hover_pos());
             self.apply_pinch_zoom(1.1, cursor, ctx);
+        }
+        if ctx.input_mut(|input| input.consume_shortcut(&fit_width)) {
+            self.fit_width_requested = true;
+        }
+        if !self.page_sizes.is_empty() && ctx.input_mut(|input| input.consume_shortcut(&go_to_page))
+        {
+            // Focus the page box with its number selected, ready to type over.
+            let id = egui::Id::new(PAGE_ENTRY_ID);
+            let mut state = egui::TextEdit::load_state(ctx, id).unwrap_or_default();
+            state
+                .cursor
+                .set_char_range(Some(egui::text::CCursorRange::two(
+                    egui::text::CCursor::new(0),
+                    egui::text::CCursor::new(self.page_entry.chars().count()),
+                )));
+            state.store(ctx, id);
+            ctx.memory_mut(|memory| memory.request_focus(id));
+        }
+        // Page Up/Down and Home/End move by page unless a text field has focus.
+        if !self.page_sizes.is_empty() && !ctx.egui_wants_keyboard_input() {
+            let last = self.page_sizes.len() - 1;
+            let target = ctx.input_mut(|input| {
+                if input.consume_key(Modifiers::NONE, Key::PageDown) {
+                    Some((self.current_page + 1).min(last))
+                } else if input.consume_key(Modifiers::NONE, Key::PageUp) {
+                    Some(self.current_page.saturating_sub(1))
+                } else if input.consume_key(Modifiers::NONE, Key::Home)
+                    || input.consume_key(Modifiers::CTRL, Key::Home)
+                {
+                    Some(0)
+                } else if input.consume_key(Modifiers::NONE, Key::End)
+                    || input.consume_key(Modifiers::CTRL, Key::End)
+                {
+                    Some(last)
+                } else {
+                    None
+                }
+            });
+            if let Some(page) = target {
+                self.jump_to_page = Some(page);
+            }
         }
         if ctx.input_mut(|input| input.consume_shortcut(&zoom_out)) {
             let cursor = ctx.input(|input| input.pointer.hover_pos());
@@ -3797,7 +4029,12 @@ impl SnaPdfApp {
                         ToolbarIcon::Chat,
                         self.study_chat.visible,
                         true,
-                        "Study chat (Ctrl+Shift+A)",
+                        // While the panel is open, the tooltip would cover its header.
+                        if self.study_chat.visible {
+                            ""
+                        } else {
+                            "Study chat (Ctrl+Shift+A)"
+                        },
                     )
                     .clicked()
                 {
@@ -3887,6 +4124,7 @@ impl SnaPdfApp {
         let response = ui.add_sized(
             [38.0 * scale, 22.0 * scale],
             egui::TextEdit::singleline(&mut self.page_entry)
+                .id(egui::Id::new(PAGE_ENTRY_ID))
                 .horizontal_align(Align::Center)
                 .vertical_align(Align::Center)
                 .margin(Margin::symmetric(4, 2)),
@@ -4272,10 +4510,14 @@ impl SnaPdfApp {
                 .clone();
             let reasoning_supported = provider == ChatProvider::ChatGpt
                 && model_supports_reasoning_effort(&selected_model);
-            let model_text = if selected_model.is_empty() {
+            // Models are listed only after sign-in; before that a permanent
+            // "Loading…" would look stuck.
+            let model_text = if !selected_model.is_empty() {
+                selected_model.as_str()
+            } else if connected {
                 "Loading…"
             } else {
-                selected_model.as_str()
+                "Model"
             };
             let (model_width, thinking_width, spacer) =
                 chat_model_control_widths(ui.available_width(), reasoning_supported);
@@ -6080,55 +6322,43 @@ impl SnaPdfApp {
         };
         let editing = draft.annotation_id.is_some();
         let mut save = false;
-        let mut open = true;
-        let mut window = egui::Window::new(if editing {
-            "Edit comment"
-        } else {
-            "Add comment"
-        })
-        .open(&mut open)
-        .collapsible(false)
-        .resizable(false)
-        .default_width(300.0);
-        if let Some(anchor) = draft.screen_anchor {
-            window = window.current_pos(anchor + vec2(18.0, -24.0));
-        } else {
-            window = window.anchor(Align2::CENTER_CENTER, vec2(0.0, -40.0));
-        }
-        window.show(ctx, |ui| {
-            let editor = ui.add_sized(
-                [ui.available_width(), 76.0],
-                egui::TextEdit::multiline(&mut draft.text)
-                    .hint_text("Write a comment...")
-                    .desired_rows(3),
-            );
-            let enter_to_save = editor.has_focus()
-                && ui.input(|input| input.key_pressed(Key::Enter) && !input.modifiers.shift);
-            if enter_to_save && !draft.text.trim().is_empty() {
-                save = true;
-            }
-            ui.horizontal(|ui| {
-                ui.label(
-                    RichText::new("Shift+Enter for a new line")
-                        .size(10.5)
-                        .color(theme::MUTED),
+        let close = popover_dialog(
+            ctx,
+            "note-dialog",
+            if editing {
+                "Edit comment"
+            } else {
+                "Add comment"
+            },
+            draft.screen_anchor.map(|anchor| anchor + vec2(18.0, -24.0)),
+            320.0,
+            |ui| {
+                let editor = ui.add_sized(
+                    [ui.available_width(), 84.0],
+                    egui::TextEdit::multiline(&mut draft.text)
+                        .hint_text("Write a comment")
+                        .desired_rows(3)
+                        .margin(Margin::symmetric(10, 8)),
                 );
-                if ui
-                    .add_enabled(
-                        !draft.text.trim().is_empty(),
-                        egui::Button::new(if editing {
-                            "Save changes"
-                        } else {
-                            "Add comment"
-                        }),
-                    )
-                    .clicked()
-                {
+                let enter_to_save = editor.has_focus()
+                    && ui.input(|input| input.key_pressed(Key::Enter) && !input.modifiers.shift);
+                if enter_to_save && !draft.text.trim().is_empty() {
                     save = true;
                 }
-            });
-        });
-        if !open {
+                ui.horizontal(|ui| {
+                    dialog_hint(ui, "Shift+Enter for a new line");
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        save |= primary_button(
+                            ui,
+                            if editing { "Save" } else { "Add" },
+                            !draft.text.trim().is_empty(),
+                        )
+                        .clicked();
+                    });
+                });
+            },
+        );
+        if close {
             self.note_draft = None;
         }
         if save && let Some(draft) = self.note_draft.take() {
@@ -6514,30 +6744,28 @@ impl SnaPdfApp {
         if !self.study_chat.pending_replacement_warning {
             return;
         }
-        let mut open = true;
         let mut replace = false;
         let mut cancel = false;
         let mut do_not_show_again = false;
-        egui::Window::new("Replace oldest chat?")
-            .open(&mut open)
-            .collapsible(false)
-            .resizable(false)
-            .default_width(330.0)
-            .show(ctx, |ui| {
-                ui.label("Study chat keeps up to five conversations. Starting another will replace the least recently opened chat.");
-                ui.add_space(8.0);
-                ui.checkbox(&mut do_not_show_again, "Do not show this warning again");
-                ui.add_space(8.0);
-                ui.horizontal(|ui| {
-                    if ui.button("Cancel").clicked() {
-                        cancel = true;
-                    }
-                    if ui.button("Replace oldest").clicked() {
-                        replace = true;
-                    }
+        let close = modal_dialog(
+            ctx,
+            "replace-chat",
+            "Replace oldest chat?",
+            380.0,
+            true,
+            |ui| {
+                dialog_text(
+                    ui,
+                    "Study chat keeps up to five conversations. Starting another replaces the one you opened least recently.",
+                );
+                ui.checkbox(&mut do_not_show_again, "Don't ask again");
+                dialog_actions(ui, |ui| {
+                    replace = primary_button(ui, "Replace oldest", true).clicked();
+                    cancel = secondary_button(ui, "Cancel").clicked();
                 });
-            });
-        if !open || cancel {
+            },
+        );
+        if close || cancel {
             self.study_chat.pending_replacement_warning = false;
         }
         if replace {
@@ -6552,35 +6780,30 @@ impl SnaPdfApp {
         if !self.confirm_save_to_source {
             return;
         }
-        let mut open = true;
         let mut save = false;
         let mut cancel = false;
-        egui::Window::new("Save annotations to PDF?")
-            .open(&mut open)
-            .collapsible(false)
-            .resizable(false)
-            .default_width(360.0)
-            .show(ctx, |ui| {
-                ui.label("This writes SnaPdf annotations into the PDF on disk so other viewers can see them.");
-                ui.add_space(6.0);
-                ui.label(
-                    RichText::new(
-                        "A timestamped recovery backup will be kept in the hidden .snapdf-backups folder.",
-                    )
-                        .size(11.5)
-                        .color(theme::MUTED),
+        let close = modal_dialog(
+            ctx,
+            "save-to-source",
+            "Save annotations into this PDF?",
+            400.0,
+            true,
+            |ui| {
+                dialog_text(
+                    ui,
+                    "Your annotations are written into the file on disk, so other PDF viewers show them too.",
                 );
-                ui.add_space(10.0);
-                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    if ui.button("Save to PDF").clicked() {
-                        save = true;
-                    }
-                    if ui.button("Cancel").clicked() {
-                        cancel = true;
-                    }
+                dialog_hint(
+                    ui,
+                    "A timestamped backup of the original is kept in the hidden .snapdf-backups folder.",
+                );
+                dialog_actions(ui, |ui| {
+                    save = primary_button(ui, "Save to PDF", true).clicked();
+                    cancel = secondary_button(ui, "Cancel").clicked();
                 });
-            });
-        if !open || cancel {
+            },
+        );
+        if close || cancel {
             self.confirm_save_to_source = false;
         }
         if save {
@@ -6593,65 +6816,51 @@ impl SnaPdfApp {
         let Some(popup) = self.ocr_popup.as_mut() else {
             return;
         };
-        let mut open = true;
         let mut add_to_chat = None;
-        egui::Window::new("Snip OCR")
-            .open(&mut open)
-            .anchor(Align2::CENTER_CENTER, vec2(0.0, 0.0))
-            .collapsible(false)
-            .resizable(false)
-            .fixed_size(vec2(560.0, 350.0))
-            .show(ctx, |ui| {
-                ui.horizontal(|ui| {
-                    if popup.busy {
-                        ui.spinner();
-                    }
-                    ui.label(RichText::new(&popup.detail).size(12.0).color(theme::MUTED));
-                });
-                ui.add_space(6.0);
-                // A fixed scroll region keeps the action row in view even when
-                // OCR returns several pages of text.
-                ui.allocate_ui_with_layout(
-                    vec2(ui.available_width(), 230.0),
-                    Layout::top_down(Align::Min),
-                    |ui| {
-                        ScrollArea::vertical()
-                            .id_salt("ocr-result-text-scroll")
-                            .show(ui, |ui| {
-                                ui.add(
-                                    egui::TextEdit::multiline(&mut popup.text)
-                                        .desired_width(ui.available_width())
-                                        .desired_rows(12)
-                                        .hint_text("Recognized text will appear here..."),
-                                );
-                            });
-                    },
-                );
-                ui.horizontal(|ui| {
-                    if ui
-                        .add_enabled(!popup.text.is_empty(), egui::Button::new("Copy text"))
-                        .clicked()
-                    {
-                        ctx.copy_text(popup.text.clone());
-                        popup.detail = "Copied to clipboard.".to_owned();
-                    }
-                    if !self.state.hide_study_chat
-                        && ui
-                            .add_enabled(
-                                !popup.text.is_empty(),
-                                egui::Button::new("Add to study chat"),
-                            )
-                            .clicked()
-                    {
-                        add_to_chat = Some(popup.text.clone());
-                    }
-                    ui.label(
-                        RichText::new("Nothing is copied automatically.")
-                            .size(11.0)
-                            .color(theme::MUTED),
-                    );
-                });
+        let hide_chat = self.state.hide_study_chat;
+        let close = modal_dialog(ctx, "ocr-result", "Recognized text", 560.0, true, |ui| {
+            ui.horizontal(|ui| {
+                if popup.busy {
+                    ui.spinner();
+                }
+                dialog_hint(ui, popup.detail.clone());
             });
+            // A fixed scroll region keeps the actions in view even when OCR
+            // returns several pages of text.
+            ui.allocate_ui_with_layout(
+                vec2(ui.available_width(), 240.0),
+                Layout::top_down(Align::Min),
+                |ui| {
+                    ScrollArea::vertical()
+                        .id_salt("ocr-result-text-scroll")
+                        .show(ui, |ui| {
+                            ui.add(
+                                egui::TextEdit::multiline(&mut popup.text)
+                                    .desired_width(ui.available_width())
+                                    .desired_rows(12)
+                                    .margin(Margin::symmetric(10, 8))
+                                    .hint_text("Recognized text appears here"),
+                            );
+                        });
+                },
+            );
+            dialog_actions(ui, |ui| {
+                if primary_button(ui, "Copy text", !popup.text.is_empty()).clicked() {
+                    ctx.copy_text(popup.text.clone());
+                    popup.detail = "Copied to the clipboard.".to_owned();
+                }
+                if !hide_chat
+                    && ui
+                        .add_enabled_ui(!popup.text.is_empty(), |ui| {
+                            secondary_button(ui, "Ask in study chat")
+                        })
+                        .inner
+                        .clicked()
+                {
+                    add_to_chat = Some(popup.text.clone());
+                }
+            });
+        });
         if let Some(text) = add_to_chat {
             self.study_chat
                 .attachments
@@ -6662,7 +6871,7 @@ impl SnaPdfApp {
             self.ocr_popup = None;
             return;
         }
-        if !open {
+        if close {
             self.ocr_popup = None;
         }
     }
@@ -6671,49 +6880,34 @@ impl SnaPdfApp {
         if !self.study_chat.show_gemini_key {
             return;
         }
-        let mut open = true;
         let mut connect = false;
-        egui::Window::new("Connect Gemini")
-            .open(&mut open)
-            .collapsible(false)
-            .resizable(false)
-            .default_width(380.0)
-            .show(ctx, |ui| {
-                ui.label("Paste an API key from Google AI Studio.");
-                ui.label(
-                    RichText::new("The key is stored locally in SnaPdf's private credentials file and sent only to Google's Gemini API.")
-                        .size(11.0)
-                        .color(theme::MUTED),
-                );
-                ui.add_space(7.0);
-                let response = ui.add_sized(
-                    [ui.available_width(), 28.0],
-                    egui::TextEdit::singleline(&mut self.study_chat.gemini_key)
-                        .password(true)
-                        .hint_text("Gemini API key"),
-                );
-                if response.lost_focus() && ui.input(|input| input.key_pressed(Key::Enter)) {
-                    connect = true;
+        let close = modal_dialog(ctx, "gemini-key", "Connect Gemini", 420.0, false, |ui| {
+            dialog_text(ui, "Paste an API key from Google AI Studio.");
+            let response = ui.add_sized(
+                [ui.available_width(), 32.0],
+                egui::TextEdit::singleline(&mut self.study_chat.gemini_key)
+                    .password(true)
+                    .hint_text("Gemini API key")
+                    .vertical_align(Align::Center)
+                    .margin(Margin::symmetric(10, 6)),
+            );
+            if response.lost_focus() && ui.input(|input| input.key_pressed(Key::Enter)) {
+                connect = true;
+            }
+            dialog_hint(
+                ui,
+                "The key is stored only in SnaPdf's private credentials file and sent only to Google's Gemini API.",
+            );
+            dialog_actions(ui, |ui| {
+                connect |=
+                    primary_button(ui, "Connect", !self.study_chat.gemini_key.trim().is_empty())
+                        .clicked();
+                if secondary_button(ui, "Get a key").clicked() {
+                    let _ = webbrowser::open("https://aistudio.google.com/app/apikey");
                 }
-                ui.add_space(7.0);
-                ui.horizontal(|ui| {
-                    if ui.button("Open Google AI Studio").clicked() {
-                        let _ = webbrowser::open("https://aistudio.google.com/app/apikey");
-                    }
-                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        if ui
-                            .add_enabled(
-                                !self.study_chat.gemini_key.trim().is_empty(),
-                                egui::Button::new("Connect"),
-                            )
-                            .clicked()
-                        {
-                            connect = true;
-                        }
-                    });
-                });
             });
-        if connect {
+        });
+        if connect && !self.study_chat.gemini_key.trim().is_empty() {
             let key = std::mem::take(&mut self.study_chat.gemini_key);
             self.study_chat.status = "Checking Gemini connection…".to_owned();
             let _ = self
@@ -6721,7 +6915,7 @@ impl SnaPdfApp {
                 .commands
                 .send(ChatCommand::ConnectGemini { api_key: key });
             self.study_chat.show_gemini_key = false;
-        } else if !open {
+        } else if close {
             self.study_chat.show_gemini_key = false;
         }
     }
@@ -6730,37 +6924,43 @@ impl SnaPdfApp {
         let Some(draft) = self.text_draft.as_mut() else {
             return;
         };
-        let mut open = true;
         let mut save = false;
-        egui::Window::new(if draft.stamp {
-            "Add stamp"
-        } else {
-            "Add text box"
-        })
-        .open(&mut open)
-        .anchor(Align2::CENTER_CENTER, vec2(0.0, -40.0))
-        .collapsible(false)
-        .resizable(true)
-        .default_width(380.0)
-        .show(ctx, |ui| {
-            ui.add_sized(
-                [ui.available_width(), if draft.stamp { 34.0 } else { 120.0 }],
-                if draft.stamp {
-                    egui::TextEdit::singleline(&mut draft.text).hint_text("Stamp text")
-                } else {
-                    egui::TextEdit::multiline(&mut draft.text).hint_text("Text")
-                },
-            );
-            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                if ui
-                    .add_enabled(!draft.text.trim().is_empty(), egui::Button::new("Add"))
-                    .clicked()
+        let mut cancel = false;
+        let stamp = draft.stamp;
+        let close = modal_dialog(
+            ctx,
+            "text-annotation",
+            if stamp { "Add stamp" } else { "Add text box" },
+            400.0,
+            false,
+            |ui| {
+                let editor = ui.add_sized(
+                    [ui.available_width(), if stamp { 32.0 } else { 120.0 }],
+                    if stamp {
+                        egui::TextEdit::singleline(&mut draft.text)
+                            .hint_text("Stamp text, for example APPROVED")
+                            .vertical_align(Align::Center)
+                            .margin(Margin::symmetric(10, 6))
+                    } else {
+                        egui::TextEdit::multiline(&mut draft.text)
+                            .hint_text("Text to place on the page")
+                            .margin(Margin::symmetric(10, 8))
+                    },
+                );
+                if editor.lost_focus()
+                    && stamp
+                    && ui.input(|input| input.key_pressed(Key::Enter))
+                    && !draft.text.trim().is_empty()
                 {
                     save = true;
                 }
-            });
-        });
-        if !open {
+                dialog_actions(ui, |ui| {
+                    save |= primary_button(ui, "Add", !draft.text.trim().is_empty()).clicked();
+                    cancel = secondary_button(ui, "Cancel").clicked();
+                });
+            },
+        );
+        if close || cancel {
             self.text_draft = None;
         } else if save && let Some(draft) = self.text_draft.take() {
             let color = [
@@ -6798,47 +6998,40 @@ impl SnaPdfApp {
         };
         let apps = self.external_apps.clone();
         let mut selected = None;
-        let mut open = true;
-        egui::Window::new("Open with")
-            .open(&mut open)
-            .anchor(Align2::CENTER_CENTER, vec2(0.0, -30.0))
-            .collapsible(false)
-            .resizable(false)
-            .default_width(390.0)
-            .show(ctx, |ui| {
-                ui.label(
-                    RichText::new(file_name(&path))
-                        .size(13.5)
-                        .strong()
-                        .color(Color32::from_rgb(224, 226, 231)),
-                );
-                ui.label(
-                    RichText::new("Choose another application registered for PDF files.")
-                        .size(11.5)
-                        .color(theme::MUTED),
-                );
-                ui.add_space(8.0);
-                for app in &apps {
-                    if ui
-                        .add_sized(
-                            [ui.available_width(), 34.0],
-                            egui::Button::new(RichText::new(&app.name).size(13.5)).frame(false),
-                        )
-                        .clicked()
-                    {
-                        selected = Some(app.clone());
-                    }
-                }
-                if let Some(error) = &self.open_with_error {
-                    ui.add_space(6.0);
-                    ui.label(
-                        RichText::new(error)
-                            .size(11.5)
-                            .color(Color32::from_rgb(233, 126, 132)),
+        let close = modal_dialog(ctx, "open-with", "Open with", 400.0, true, |ui| {
+            dialog_hint(ui, format!("Open {} in another PDF app.", file_name(&path)));
+            ui.add_space(2.0);
+            for app in &apps {
+                let (rect, response) =
+                    ui.allocate_exact_size(vec2(ui.available_width(), 40.0), Sense::click());
+                if response.hovered() {
+                    ui.painter().rect_filled(
+                        rect,
+                        CornerRadius::same(8),
+                        Color32::from_rgb(48, 48, 48),
                     );
                 }
-            });
-        if !open {
+                paint_vscode_pdf_icon(ui.painter(), rect.left_center() + vec2(18.0, 0.0), 1.1);
+                ui.painter().text(
+                    rect.left_center() + vec2(40.0, 0.0),
+                    Align2::LEFT_CENTER,
+                    &app.name,
+                    FontId::proportional(14.0),
+                    Color32::from_rgb(228, 228, 228),
+                );
+                if response.clicked() {
+                    selected = Some(app.clone());
+                }
+            }
+            if let Some(error) = &self.open_with_error {
+                ui.label(
+                    RichText::new(error)
+                        .size(12.5)
+                        .color(Color32::from_rgb(235, 120, 110)),
+                );
+            }
+        });
+        if close {
             self.open_with_path = None;
         } else if let Some(app) = selected {
             self.launch_external_app(&app, &path);
@@ -6849,69 +7042,51 @@ impl SnaPdfApp {
         let Some(dialog) = self.print_dialog.as_mut() else {
             return;
         };
-        let mut open = true;
         let mut submit = false;
-        egui::Window::new("Print PDF")
-            .open(&mut open)
-            .anchor(Align2::CENTER_CENTER, vec2(0.0, -30.0))
-            .collapsible(false)
-            .resizable(false)
-            .default_width(420.0)
-            .show(ctx, |ui| {
-                if dialog.printers.is_empty() {
-                    ui.label(
-                        RichText::new(
-                            "No printer was reported by CUPS. You can still submit to the system default printer.",
-                        )
-                        .color(theme::MUTED),
-                    );
-                } else {
-                    ui.label(RichText::new("Printer").size(11.0).color(theme::MUTED));
-                    egui::ComboBox::from_id_salt("printer-picker")
-                        .selected_text(if dialog.printer.is_empty() {
-                            "System default"
-                        } else {
-                            &dialog.printer
-                        })
-                        .width(ui.available_width())
-                        .show_ui(ui, |ui| {
-                            for printer in &dialog.printers {
-                                ui.selectable_value(
-                                    &mut dialog.printer,
-                                    printer.clone(),
-                                    printer,
-                                );
-                            }
-                        });
-                }
-                ui.add_space(8.0);
-                ui.label(
-                    RichText::new("Pages (optional, for example 1-4,7)")
-                        .size(11.0)
-                        .color(theme::MUTED),
+        let mut cancel = false;
+        let close = modal_dialog(ctx, "print", "Print", 420.0, false, |ui| {
+            dialog_field_label(ui, "Printer");
+            if dialog.printers.is_empty() {
+                dialog_hint(
+                    ui,
+                    "No printers were found. The job goes to the system default printer.",
                 );
-                ui.add_sized(
-                    [ui.available_width(), 30.0],
-                    egui::TextEdit::singleline(&mut dialog.page_range),
-                );
-                ui.add_space(8.0);
-                ui.horizontal(|ui| {
-                    ui.label("Copies");
-                    ui.add(egui::DragValue::new(&mut dialog.copies).range(1..=99));
-                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        if ui.button("Print").clicked() {
-                            submit = true;
+            } else {
+                egui::ComboBox::from_id_salt("printer-picker")
+                    .selected_text(if dialog.printer.is_empty() {
+                        "System default"
+                    } else {
+                        &dialog.printer
+                    })
+                    .width(ui.available_width())
+                    .height(240.0)
+                    .show_ui(ui, |ui| {
+                        for printer in &dialog.printers {
+                            ui.selectable_value(&mut dialog.printer, printer.clone(), printer);
                         }
                     });
-                });
-                ui.add_space(4.0);
-                ui.label(
-                    RichText::new("Printing starts only after you click Print.")
-                        .size(11.0)
-                        .color(theme::MUTED),
-                );
+            }
+            ui.add_space(4.0);
+            dialog_field_label(ui, "Pages");
+            ui.add_sized(
+                [ui.available_width(), 32.0],
+                egui::TextEdit::singleline(&mut dialog.page_range)
+                    .hint_text("All pages, or a range like 1-4, 7")
+                    .vertical_align(Align::Center)
+                    .margin(Margin::symmetric(10, 6)),
+            );
+            ui.add_space(4.0);
+            ui.horizontal(|ui| {
+                dialog_field_label(ui, "Copies");
+                ui.add(egui::DragValue::new(&mut dialog.copies).range(1..=99));
             });
-        if !open {
+            dialog_hint(ui, "Annotations are printed with the page.");
+            dialog_actions(ui, |ui| {
+                submit = primary_button(ui, "Print", true).clicked();
+                cancel = secondary_button(ui, "Cancel").clicked();
+            });
+        });
+        if close || cancel {
             self.print_dialog = None;
         } else if submit {
             self.submit_print();
@@ -7005,6 +7180,7 @@ impl eframe::App for SnaPdfApp {
         self.open_with_dialog(ui.ctx());
         self.print_dialog(ui.ctx());
         self.update_prompt_dialog(ui.ctx());
+        self.password_dialog(ui.ctx());
     }
 
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
@@ -7146,6 +7322,14 @@ fn build_pdf_tree(root: &Path, files: &[PathBuf]) -> PdfTreeNode {
     tree
 }
 
+/// Item counts and other sidebar metadata: quieter than names, still legible.
+const SIDEBAR_COUNT: Color32 = Color32::from_rgb(172, 172, 172);
+
+/// Left offset of a project-tree row; shallow steps keep deep files readable.
+fn tree_indent(depth: usize) -> f32 {
+    8.0 + depth as f32 * 12.0
+}
+
 #[allow(clippy::too_many_arguments)]
 fn render_pdf_tree(
     ui: &mut egui::Ui,
@@ -7168,7 +7352,7 @@ fn render_pdf_tree(
             &child.name,
             pdf_tree_count(child),
             !is_collapsed,
-            24.0 + depth as f32 * 14.0,
+            tree_indent(depth),
         );
         row.body
             .clone()
@@ -7220,7 +7404,14 @@ fn render_pdf_tree(
             &label,
             selected,
             NavIcon::File,
-            24.0 + depth as f32 * 14.0,
+            // Line file names up with the names of sibling folders, which sit
+            // after a chevron and folder icon.
+            tree_indent(depth)
+                + if file_icons == SidebarFileIcons::None {
+                    24.0
+                } else {
+                    6.0
+                },
             file_icons,
         );
         register_rename_row(ui, &RenameTarget::File(path.clone()), row.rename_rect);
@@ -7308,8 +7499,8 @@ fn directory_row(
         pos2(rect.right() - 7.0 * scale, y),
         Align2::RIGHT_CENTER,
         count.to_string(),
-        FontId::proportional(10.5 * scale),
-        theme::MUTED,
+        FontId::proportional(11.5 * scale),
+        SIDEBAR_COUNT,
     );
     let label_right = if response.hovered() {
         rect.right() - 34.0 * scale
@@ -7322,7 +7513,7 @@ fn directory_row(
         name,
         label_right - (x + 32.0 * scale),
         FontId::proportional(13.0 * scale),
-        Color32::from_rgb(202, 202, 202),
+        Color32::from_rgb(232, 232, 232),
     );
     let options = sidebar_options_button(ui, rect, &response);
     SidebarRowResponse {
@@ -7385,8 +7576,8 @@ fn project_header(
         pos2(rect.right() - 34.0 * scale, center_y),
         Align2::RIGHT_CENTER,
         count.to_string(),
-        FontId::proportional(11.0 * scale),
-        theme::MUTED,
+        FontId::proportional(12.0 * scale),
+        SIDEBAR_COUNT,
     );
     let text_left = rect.left() + 51.0 * scale;
     let truncated = paint_elided_label(
@@ -7465,7 +7656,7 @@ fn nav_row(
         if selected {
             Color32::WHITE
         } else {
-            Color32::from_rgb(211, 212, 217)
+            Color32::from_rgb(194, 196, 200)
         },
     );
     let options = sidebar_options_button(ui, rect, &response);
@@ -7721,15 +7912,15 @@ fn sidebar_section_header(ui: &mut egui::Ui, title: &str, subtitle: &str, accent
         pos2(rect.left(), rect.center().y),
         Align2::LEFT_CENTER,
         title,
-        FontId::proportional(11.5 * scale),
+        FontId::proportional(12.0 * scale),
         accent,
     );
     ui.painter().text(
         pos2(rect.right(), rect.center().y),
         Align2::RIGHT_CENTER,
         subtitle,
-        FontId::proportional(10.5 * scale),
-        theme::MUTED,
+        FontId::proportional(11.5 * scale),
+        SIDEBAR_COUNT,
     );
     ui.painter().line_segment(
         [
@@ -8524,6 +8715,160 @@ fn settings_segmented<T: Copy + PartialEq>(
     changed
 }
 
+/// Shared surface for every dialog: the Settings panel's colour, corners
+/// and shadow.
+fn dialog_frame() -> Frame {
+    Frame::new()
+        .fill(SETTINGS_BG)
+        .stroke(Stroke::new(1.0, Color32::from_rgb(58, 58, 58)))
+        .corner_radius(CornerRadius::same(12))
+        .shadow(egui::Shadow {
+            offset: [0, 10],
+            blur: 32,
+            spread: 0,
+            color: Color32::from_black_alpha(140),
+        })
+        .inner_margin(Margin {
+            left: 20,
+            right: 14,
+            top: 12,
+            bottom: 18,
+        })
+}
+
+/// Title row with a close button. Returns true when × was clicked.
+fn dialog_header(ui: &mut egui::Ui, title: &str) -> bool {
+    ui.horizontal(|ui| {
+        ui.label(
+            RichText::new(title)
+                .size(16.0)
+                .strong()
+                .color(Color32::from_rgb(240, 240, 240)),
+        );
+        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+            chrome_button(ui, ToolbarIcon::Close, false, true, "Close (Esc)").clicked()
+        })
+        .inner
+    })
+    .inner
+}
+
+/// A centred dialog over the dimmed app. Returns true when it should close:
+/// ×, Esc, or a click outside when `dismiss_on_backdrop` (left off for
+/// dialogs holding typed text, so a stray click never discards it).
+fn modal_dialog(
+    ctx: &egui::Context,
+    id: &str,
+    title: &str,
+    width: f32,
+    dismiss_on_backdrop: bool,
+    add_body: impl FnOnce(&mut egui::Ui),
+) -> bool {
+    let mut close = false;
+    let response = egui::Modal::new(egui::Id::new(id))
+        .backdrop_color(Color32::from_black_alpha(130))
+        .frame(dialog_frame())
+        .show(ctx, |ui| {
+            ui.set_width(width);
+            close |= dialog_header(ui, title);
+            ui.add_space(4.0);
+            ui.spacing_mut().item_spacing.y = 8.0;
+            add_body(ui);
+        });
+    let escape = response.is_top_modal
+        && !response.any_popup_open
+        && ctx.input_mut(|input| input.consume_key(Modifiers::NONE, Key::Escape));
+    close || escape || (dismiss_on_backdrop && response.backdrop_response.clicked())
+}
+
+/// A dialog that floats beside what it edits, without dimming the app.
+/// Returns true on × or Esc.
+fn popover_dialog(
+    ctx: &egui::Context,
+    id: &str,
+    title: &str,
+    position: Option<egui::Pos2>,
+    width: f32,
+    add_body: impl FnOnce(&mut egui::Ui),
+) -> bool {
+    let mut close = false;
+    let mut window = egui::Window::new(title)
+        .id(egui::Id::new(id))
+        .title_bar(false)
+        .collapsible(false)
+        .resizable(false)
+        .order(egui::Order::Foreground)
+        .frame(dialog_frame());
+    window = match position {
+        Some(position) => window.current_pos(position),
+        None => window.anchor(Align2::CENTER_CENTER, vec2(0.0, -40.0)),
+    };
+    window.show(ctx, |ui| {
+        ui.set_width(width);
+        close |= dialog_header(ui, title);
+        ui.add_space(4.0);
+        ui.spacing_mut().item_spacing.y = 8.0;
+        add_body(ui);
+    });
+    close || ctx.input_mut(|input| input.consume_key(Modifiers::NONE, Key::Escape))
+}
+
+fn dialog_text(ui: &mut egui::Ui, text: impl Into<String>) {
+    ui.label(
+        RichText::new(text.into())
+            .size(13.5)
+            .color(Color32::from_rgb(214, 214, 214)),
+    );
+}
+
+fn dialog_hint(ui: &mut egui::Ui, text: impl Into<String>) {
+    ui.label(RichText::new(text.into()).size(12.0).color(theme::MUTED));
+}
+
+fn dialog_field_label(ui: &mut egui::Ui, text: &str) {
+    ui.label(
+        RichText::new(text)
+            .size(12.5)
+            .color(Color32::from_rgb(200, 200, 200)),
+    );
+}
+
+/// Right-aligned action row. Add the primary action first: it lands
+/// rightmost, with secondary actions to its left.
+fn dialog_actions(ui: &mut egui::Ui, add_actions: impl FnOnce(&mut egui::Ui)) {
+    ui.add_space(6.0);
+    ui.allocate_ui_with_layout(
+        vec2(ui.available_width(), 34.0),
+        Layout::right_to_left(Align::Center),
+        add_actions,
+    );
+}
+
+fn primary_button(ui: &mut egui::Ui, label: &str, enabled: bool) -> Response {
+    ui.add_enabled(
+        enabled,
+        egui::Button::new(RichText::new(label).size(13.5).color(theme::ON_ACCENT))
+            .fill(theme::ACCENT_BLUE)
+            .stroke(Stroke::NONE)
+            .corner_radius(CornerRadius::same(8))
+            .min_size(vec2(84.0, 32.0)),
+    )
+}
+
+fn secondary_button(ui: &mut egui::Ui, label: &str) -> Response {
+    ui.add(
+        egui::Button::new(
+            RichText::new(label)
+                .size(13.5)
+                .color(Color32::from_rgb(225, 225, 225)),
+        )
+        .fill(Color32::from_rgb(52, 52, 52))
+        .stroke(Stroke::NONE)
+        .corner_radius(CornerRadius::same(8))
+        .min_size(vec2(76.0, 32.0)),
+    )
+}
+
 /// Scale a chrome region by its user-adjustable ratio, independent of the
 /// overall interface zoom.
 fn apply_region_scale(ui: &mut egui::Ui, factor: f32) {
@@ -8567,10 +8912,14 @@ fn chrome_button(
     } else if hovered {
         Color32::from_rgb(240, 240, 240)
     } else {
-        Color32::from_rgb(206, 206, 206)
+        Color32::from_rgb(222, 222, 222)
     };
     paint_toolbar_icon(ui.painter(), rect.center(), icon, color);
-    response.on_hover_text(help)
+    if help.is_empty() {
+        response
+    } else {
+        response.on_hover_text(help)
+    }
 }
 
 fn toolbar_tool_button(
@@ -9090,25 +9439,31 @@ fn chat_history_button(
     help: &str,
     text_size: f32,
 ) -> Response {
-    let (rect, response) = ui.allocate_exact_size(vec2(width, 27.0), Sense::click());
-    if response.hovered() {
-        ui.painter()
-            .rect_filled(rect, CornerRadius::same(7), CHAT_FIELD);
-    }
+    // A visible dropdown so it reads as the conversation switcher, not a caption.
+    let (rect, response) = ui.allocate_exact_size(vec2(width, 30.0), Sense::click());
+    ui.painter().rect_filled(
+        rect,
+        CornerRadius::same(8),
+        if response.hovered() {
+            CHAT_HOVER
+        } else {
+            CHAT_FIELD
+        },
+    );
     let font = FontId::proportional(chat_control_text_size(text_size));
     let fitted = fitted_chat_control_text(
         ui.painter(),
         label,
         &font,
-        CHAT_MUTED,
-        (width - 30.0).max(0.0),
+        CHAT_TEXT,
+        (width - 40.0).max(0.0),
     );
     ui.painter().text(
-        pos2(rect.left() + 4.0, rect.center().y),
+        pos2(rect.left() + 12.0, rect.center().y),
         Align2::LEFT_CENTER,
         fitted,
         font,
-        CHAT_MUTED,
+        CHAT_TEXT,
     );
     let center = pos2(rect.right() - 11.0, rect.center().y + 1.0);
     ui.painter().add(egui::Shape::convex_polygon(
@@ -10060,82 +10415,8 @@ fn paint_toolbar_icon(
     icon: ToolbarIcon,
     color: Color32,
 ) {
-    let stroke = Stroke::new(1.45, color);
+    let stroke = Stroke::new(1.6, color);
     match icon {
-        ToolbarIcon::Highlight => {
-            // Conventional chisel-tip highlighter with a bright ink edge.
-            let body = vec![
-                center + vec2(-6.5, 3.0),
-                center + vec2(1.5, -5.0),
-                center + vec2(6.5, 0.0),
-                center + vec2(-1.5, 8.0),
-            ];
-            painter.add(egui::Shape::convex_polygon(
-                body.clone(),
-                Color32::from_rgb(224, 224, 224),
-                Stroke::new(1.1, Color32::from_rgb(34, 34, 34)),
-            ));
-            painter.line_segment(
-                [center + vec2(-4.3, 5.0), center + vec2(3.8, -3.1)],
-                Stroke::new(1.25, Color32::from_rgb(105, 105, 105)),
-            );
-            painter.line_segment(
-                [center + vec2(-7.0, 8.0), center + vec2(7.0, 8.0)],
-                Stroke::new(2.7, Color32::from_rgb(255, 211, 59)),
-            );
-        }
-        ToolbarIcon::Pen => {
-            // Fountain-pen nib rather than a generic diagonal slash.
-            let nib = vec![
-                center + vec2(-6.5, 6.5),
-                center + vec2(-2.5, -6.0),
-                center + vec2(6.0, 2.5),
-            ];
-            painter.add(egui::Shape::convex_polygon(nib, color, Stroke::NONE));
-            painter.line_segment(
-                [center + vec2(-4.5, 4.5), center + vec2(3.0, -3.0)],
-                Stroke::new(1.15, Color32::from_rgb(46, 46, 46)),
-            );
-            painter.circle_filled(
-                center + vec2(-3.8, 3.8),
-                1.15,
-                Color32::from_rgb(46, 46, 46),
-            );
-        }
-        ToolbarIcon::Eraser => {
-            let white_half = vec![
-                center + vec2(-7.0, 1.0),
-                center + vec2(-2.0, -6.0),
-                center + vec2(2.2, -1.8),
-                center + vec2(-2.8, 6.2),
-            ];
-            let dark_half = vec![
-                center + vec2(2.2, -1.8),
-                center + vec2(7.0, 2.9),
-                center + vec2(1.8, 7.0),
-                center + vec2(-2.8, 6.2),
-            ];
-            painter.add(egui::Shape::convex_polygon(
-                white_half,
-                Color32::from_rgb(238, 238, 238),
-                Stroke::NONE,
-            ));
-            painter.add(egui::Shape::convex_polygon(
-                dark_half,
-                Color32::from_rgb(196, 201, 208),
-                Stroke::NONE,
-            ));
-            painter.add(egui::Shape::closed_line(
-                vec![
-                    center + vec2(-7.0, 1.5),
-                    center + vec2(-2.0, -6.0),
-                    center + vec2(7.0, 2.5),
-                    center + vec2(2.0, 7.0),
-                    center + vec2(-7.0, 1.5),
-                ],
-                Stroke::new(1.0, color.gamma_multiply(0.7)),
-            ));
-        }
         ToolbarIcon::Comment => {
             let bubble = Rect::from_center_size(center - vec2(0.0, 1.5), vec2(15.0, 11.0));
             painter.rect_stroke(bubble, 3.5, stroke, StrokeKind::Inside);
@@ -10239,34 +10520,6 @@ fn paint_toolbar_icon(
                 Stroke::NONE,
             ));
         }
-        ToolbarIcon::Print => {
-            painter.rect_stroke(
-                Rect::from_center_size(center + vec2(0.0, -4.0), vec2(11.0, 8.0)),
-                0.0,
-                stroke,
-                StrokeKind::Inside,
-            );
-            painter.rect_stroke(
-                Rect::from_center_size(center + vec2(0.0, 4.0), vec2(15.0, 8.0)),
-                2.0,
-                stroke,
-                StrokeKind::Inside,
-            );
-        }
-        ToolbarIcon::Export => {
-            painter.rect_stroke(
-                Rect::from_center_size(center + vec2(0.0, 3.0), vec2(13.0, 10.0)),
-                1.0,
-                stroke,
-                StrokeKind::Inside,
-            );
-            painter.line_segment([center + vec2(0.0, 3.0), center + vec2(0.0, -7.0)], stroke);
-            painter.line_segment(
-                [center + vec2(0.0, -7.0), center + vec2(-3.0, -4.0)],
-                stroke,
-            );
-            painter.line_segment([center + vec2(0.0, -7.0), center + vec2(3.0, -4.0)], stroke);
-        }
         ToolbarIcon::Save => {
             let body = Rect::from_center_size(center, vec2(14.0, 14.0));
             painter.rect_stroke(body, 1.0, stroke, StrokeKind::Inside);
@@ -10316,30 +10569,6 @@ fn paint_toolbar_icon(
             painter.circle_filled(center, 4.35, theme::PANEL_BG);
             painter.circle_stroke(center, 4.35, Stroke::new(1.05, color));
             painter.circle_filled(center, 1.5, color);
-        }
-        ToolbarIcon::Reader => {
-            let page = Rect::from_center_size(center, vec2(12.0, 15.0));
-            painter.rect_stroke(page, 1.0, stroke, StrokeKind::Inside);
-            painter.line_segment(
-                [
-                    page.left_top() + vec2(3.0, 4.0),
-                    page.right_top() + vec2(-3.0, 4.0),
-                ],
-                Stroke::new(1.1, color),
-            );
-            painter.line_segment(
-                [
-                    page.left_top() + vec2(3.0, 8.0),
-                    page.right_top() + vec2(-3.0, 8.0),
-                ],
-                Stroke::new(1.1, color),
-            );
-        }
-        ToolbarIcon::Present => {
-            let screen = Rect::from_center_size(center, vec2(15.0, 11.0));
-            painter.rect_stroke(screen, 1.0, stroke, StrokeKind::Inside);
-            painter.line_segment([center + vec2(-3.0, 7.0), center + vec2(3.0, 7.0)], stroke);
-            painter.line_segment([center + vec2(0.0, 4.0), center + vec2(0.0, 7.0)], stroke);
         }
         ToolbarIcon::Attach => {
             // Paperclip: two nested open curves, drawn as lines so it remains
@@ -10523,6 +10752,128 @@ fn paint_toolbar_icon(
                     center + vec2(4.2, -6.0),
                     center + vec2(6.5, -3.7),
                     center + vec2(6.8, -6.8),
+                ],
+                color,
+                Stroke::NONE,
+            ));
+        }
+        ToolbarIcon::Highlight => {
+            // Outline marker over a yellow stroke; the colour is the cue.
+            painter.add(egui::Shape::closed_line(
+                vec![
+                    center + vec2(-6.0, 3.0),
+                    center + vec2(1.0, -4.0),
+                    center + vec2(5.0, 0.0),
+                    center + vec2(-2.0, 7.0),
+                ],
+                stroke,
+            ));
+            painter.add(egui::Shape::closed_line(
+                vec![
+                    center + vec2(1.0, -4.0),
+                    center + vec2(3.5, -6.5),
+                    center + vec2(7.5, -2.5),
+                    center + vec2(5.0, 0.0),
+                ],
+                stroke,
+            ));
+            painter.line_segment(
+                [center + vec2(-7.5, 8.5), center + vec2(1.5, 8.5)],
+                Stroke::new(2.4, Color32::from_rgb(255, 211, 59)),
+            );
+        }
+        ToolbarIcon::Pen => {
+            painter.add(egui::Shape::closed_line(
+                vec![
+                    center + vec2(-7.0, 7.0),
+                    center + vec2(-6.3, 2.1),
+                    center + vec2(2.9, -7.1),
+                    center + vec2(7.1, -2.9),
+                    center + vec2(-2.1, 6.3),
+                ],
+                stroke,
+            ));
+            painter.line_segment([center + vec2(-6.3, 2.1), center + vec2(-2.1, 6.3)], stroke);
+            painter.line_segment([center + vec2(1.5, -5.7), center + vec2(5.7, -1.5)], stroke);
+        }
+        ToolbarIcon::Eraser => {
+            painter.add(egui::Shape::closed_line(
+                vec![
+                    center + vec2(-7.8, 3.1),
+                    center + vec2(2.1, -6.8),
+                    center + vec2(7.8, -1.1),
+                    center + vec2(-2.1, 8.8),
+                ],
+                stroke,
+            ));
+            painter.line_segment([center + vec2(-3.8, -0.8), center + vec2(1.8, 4.8)], stroke);
+        }
+        ToolbarIcon::Print => {
+            // Printer: paper feeding in on top, body, printed sheet below.
+            painter.add(egui::Shape::line(
+                vec![
+                    center + vec2(-4.5, -3.0),
+                    center + vec2(-4.5, -8.0),
+                    center + vec2(4.5, -8.0),
+                    center + vec2(4.5, -3.0),
+                ],
+                stroke,
+            ));
+            painter.rect_stroke(
+                Rect::from_min_max(center + vec2(-8.0, -3.0), center + vec2(8.0, 4.0)),
+                2.0,
+                stroke,
+                StrokeKind::Middle,
+            );
+            painter.rect_stroke(
+                Rect::from_min_max(center + vec2(-4.5, 1.0), center + vec2(4.5, 8.5)),
+                0.5,
+                stroke,
+                StrokeKind::Middle,
+            );
+            painter.circle_filled(center + vec2(5.5, -0.5), 1.0, color);
+        }
+        ToolbarIcon::Export => {
+            // Save a copy: arrow down into a tray.
+            painter.add(egui::Shape::line(
+                vec![
+                    center + vec2(-7.5, 2.0),
+                    center + vec2(-7.5, 7.5),
+                    center + vec2(7.5, 7.5),
+                    center + vec2(7.5, 2.0),
+                ],
+                stroke,
+            ));
+            painter.line_segment([center + vec2(0.0, -8.0), center + vec2(0.0, 3.0)], stroke);
+            painter.line_segment([center + vec2(0.0, 3.0), center + vec2(-3.8, -0.8)], stroke);
+            painter.line_segment([center + vec2(0.0, 3.0), center + vec2(3.8, -0.8)], stroke);
+        }
+        ToolbarIcon::Reader => {
+            // Open book.
+            for side in [-1.0_f32, 1.0] {
+                painter.add(egui::Shape::line(
+                    vec![
+                        center + vec2(0.0, -5.0),
+                        center + vec2(7.5 * side, -7.0),
+                        center + vec2(7.5 * side, 6.0),
+                        center + vec2(0.0, 8.0),
+                    ],
+                    stroke,
+                ));
+            }
+            painter.line_segment([center + vec2(0.0, -5.0), center + vec2(0.0, 8.0)], stroke);
+        }
+        ToolbarIcon::Present => {
+            // Screen with a play mark.
+            let screen = Rect::from_center_size(center + vec2(0.0, -1.5), vec2(17.0, 12.0));
+            painter.rect_stroke(screen, 1.5, stroke, StrokeKind::Middle);
+            painter.line_segment([center + vec2(-3.5, 7.5), center + vec2(3.5, 7.5)], stroke);
+            painter.line_segment([center + vec2(0.0, 4.5), center + vec2(0.0, 7.5)], stroke);
+            painter.add(egui::Shape::convex_polygon(
+                vec![
+                    screen.center() + vec2(-2.0, -3.0),
+                    screen.center() + vec2(3.5, 0.0),
+                    screen.center() + vec2(-2.0, 3.0),
                 ],
                 color,
                 Stroke::NONE,
@@ -11561,6 +11912,21 @@ mod tests {
             assert_eq!(job.text, "Bold and italic with code and a link");
             assert!(job.sections.len() >= 4);
         });
+    }
+
+    #[test]
+    fn printing_reports_failures_instead_of_claiming_success() {
+        let dialog = PrintDialog {
+            printers: Vec::new(),
+            printer: "snapdf-test-no-such-printer".to_owned(),
+            page_range: String::new(),
+            copies: 1,
+        };
+        let message = send_to_printer(Path::new("Cargo.toml"), &dialog);
+        assert!(
+            message.starts_with("Printing failed") || message.starts_with("Could not start"),
+            "{message}"
+        );
     }
 
     #[test]

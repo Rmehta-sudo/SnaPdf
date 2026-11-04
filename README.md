@@ -245,9 +245,12 @@ The controls beside the annotation tools provide three focused views:
 | `Ctrl+Shift+T` | Restore the most recently closed tab |
 | `Ctrl+Tab` | Move to the next open PDF tab |
 | `Ctrl+Shift+Tab` | Move to the previous open PDF tab |
-| `Ctrl++` / `Ctrl+-` | Scale the document and application chrome |
+| `Ctrl++` or `Ctrl+=` / `Ctrl+-` | Zoom the document in / out |
+| `Ctrl+0` | Fit the page to the window width |
+| `Ctrl+G` | Go to a page number |
 | `Up` / `Down` | Scroll the document |
-| `Left` / `Right` | Previous / next page |
+| `Left` / `Right`, `Page Up` / `Page Down` | Previous / next page |
+| `Home` / `End` | First / last page |
 | `Ctrl+C` | Copy selected PDF text |
 | `Ctrl+Z` / `Ctrl+Shift+Z` | Undo / redo an annotation |
 | `Esc` | Exit Reader or Presentation mode |

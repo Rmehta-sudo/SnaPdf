@@ -7,6 +7,8 @@ use eframe::egui;
 use sha2::{Digest, Sha256};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
 pub const REPOSITORY: &str = "Rmehta-sudo/SnaPdf";
@@ -41,25 +43,63 @@ pub enum UpdateEvent {
     Installed(Result<(), String>),
 }
 
+/// Download progress shared with the UI, plus its cancel switch.
+#[derive(Default)]
+pub struct DownloadProgress {
+    downloaded: AtomicU64,
+    total: AtomicU64,
+    cancelled: AtomicBool,
+}
+
+impl DownloadProgress {
+    /// Bytes received and the expected size (0 when the server didn't say).
+    pub fn bytes(&self) -> (u64, u64) {
+        (
+            self.downloaded.load(Ordering::Relaxed),
+            self.total.load(Ordering::Relaxed),
+        )
+    }
+
+    pub fn cancel(&self) {
+        self.cancelled.store(true, Ordering::Relaxed);
+    }
+
+    fn reset(&self) {
+        self.downloaded.store(0, Ordering::Relaxed);
+        self.total.store(0, Ordering::Relaxed);
+        self.cancelled.store(false, Ordering::Relaxed);
+    }
+
+    fn is_cancelled(&self) -> bool {
+        self.cancelled.load(Ordering::Relaxed)
+    }
+}
+
+pub const CANCELLED: &str = "cancelled";
+
 pub struct UpdateWorker {
     commands: Sender<UpdateCommand>,
     pub events: Receiver<UpdateEvent>,
+    pub progress: Arc<DownloadProgress>,
 }
 
 impl UpdateWorker {
     pub fn spawn(ctx: egui::Context) -> Self {
         let (commands, command_receiver) = unbounded();
         let (event_sender, events) = unbounded();
+        let progress = Arc::new(DownloadProgress::default());
+        let worker_progress = Arc::clone(&progress);
         std::thread::Builder::new()
             .name("snapdf-update".to_owned())
             .spawn(move || {
                 for command in command_receiver {
-                    let event = match command {
-                        UpdateCommand::Check => UpdateEvent::Checked(check_latest()),
-                        UpdateCommand::Install(release, target) => {
-                            UpdateEvent::Installed(install(&release, &target))
-                        }
-                    };
+                    let event =
+                        match command {
+                            UpdateCommand::Check => UpdateEvent::Checked(check_latest()),
+                            UpdateCommand::Install(release, target) => UpdateEvent::Installed(
+                                install(&release, &target, &worker_progress, &ctx),
+                            ),
+                        };
                     if event_sender.send(event).is_err() {
                         return;
                     }
@@ -67,7 +107,11 @@ impl UpdateWorker {
                 }
             })
             .ok();
-        Self { commands, events }
+        Self {
+            commands,
+            events,
+            progress,
+        }
     }
 
     pub fn check(&self) {
@@ -75,6 +119,7 @@ impl UpdateWorker {
     }
 
     pub fn install(&self, release: Release, target: PathBuf) {
+        self.progress.reset();
         let _ = self.commands.send(UpdateCommand::Install(release, target));
     }
 }
@@ -94,17 +139,20 @@ pub fn relaunch_command() -> Option<PathBuf> {
         .or_else(self_update_target)
 }
 
-fn client() -> Result<reqwest::blocking::Client, String> {
+/// `total_timeout` bounds small API requests. Downloads pass `None`: on a
+/// slow link a 12 MB AppImage can legitimately take many minutes, and the
+/// user can cancel from Settings instead.
+fn client(total_timeout: Option<Duration>) -> Result<reqwest::blocking::Client, String> {
     reqwest::blocking::Client::builder()
         .user_agent(format!("SnaPdf/{CURRENT_VERSION}"))
-        .connect_timeout(Duration::from_secs(15))
-        .timeout(Duration::from_secs(600))
+        .connect_timeout(Duration::from_secs(20))
+        .timeout(total_timeout)
         .build()
         .map_err(|error| error.to_string())
 }
 
 fn check_latest() -> Result<Option<Release>, String> {
-    let response = client()?
+    let response = client(Some(Duration::from_secs(60)))?
         .get(format!(
             "https://api.github.com/repos/{REPOSITORY}/releases/latest"
         ))
@@ -167,12 +215,17 @@ pub fn is_newer(candidate: &str, current: &str) -> bool {
 /// Download the release AppImage beside `target`, verify it against the
 /// release's SHA256SUMS, and atomically rename it over `target`. The running
 /// process keeps its already-extracted copy, so replacing the file is safe.
-fn install(release: &Release, target: &Path) -> Result<(), String> {
+fn install(
+    release: &Release,
+    target: &Path,
+    progress: &DownloadProgress,
+    ctx: &egui::Context,
+) -> Result<(), String> {
     let (Some(appimage_url), Some(checksums_url)) = (&release.appimage_url, &release.checksums_url)
     else {
         return Err("this release has no AppImage for this computer".to_owned());
     };
-    let client = client()?;
+    let client = client(None)?;
     let checksums = client
         .get(checksums_url)
         .send()
@@ -190,6 +243,9 @@ fn install(release: &Release, target: &Path) -> Result<(), String> {
             .send()
             .and_then(|response| response.error_for_status())
             .map_err(|error| format!("could not download the update ({error})"))?;
+        progress
+            .total
+            .store(response.content_length().unwrap_or(0), Ordering::Relaxed);
         let mut file = std::fs::File::create(&partial)
             .map_err(|error| format!("could not write to {} ({error})", directory.display()))?;
         let mut hasher = Sha256::new();
@@ -204,11 +260,21 @@ fn install(release: &Release, target: &Path) -> Result<(), String> {
             hasher.update(&buffer[..read]);
             file.write_all(&buffer[..read])
                 .map_err(|error| format!("could not save the update ({error})"))?;
+            progress
+                .downloaded
+                .fetch_add(read as u64, Ordering::Relaxed);
+            ctx.request_repaint();
+            if progress.is_cancelled() {
+                return Err(CANCELLED.to_owned());
+            }
         }
         file.sync_all().map_err(|error| error.to_string())?;
         let actual = format!("{:x}", hasher.finalize());
         if actual != expected {
             return Err("the downloaded update failed checksum verification".to_owned());
+        }
+        if progress.is_cancelled() {
+            return Err(CANCELLED.to_owned());
         }
         use std::os::unix::fs::PermissionsExt as _;
         std::fs::set_permissions(&partial, std::fs::Permissions::from_mode(0o755))

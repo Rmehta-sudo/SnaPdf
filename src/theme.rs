@@ -14,7 +14,7 @@ pub const ACCENT: Color32 = Color32::from_rgb(105, 105, 105);
 pub const ACCENT_BLUE: Color32 = Color32::from_rgb(76, 141, 255);
 pub const ACCENT_BLUE_TEXT: Color32 = Color32::from_rgb(150, 192, 255);
 pub const ON_ACCENT: Color32 = Color32::WHITE;
-pub const MUTED: Color32 = Color32::from_rgb(154, 154, 154);
+pub const MUTED: Color32 = Color32::from_rgb(168, 168, 168);
 
 pub fn apply(ctx: &egui::Context) {
     ctx.set_theme(ThemePreference::Dark);

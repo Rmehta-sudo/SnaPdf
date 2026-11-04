@@ -28,6 +28,18 @@
   </provides>
   <content_rating type="oars-1.1"/>
   <releases>
+    <release version="0.4.5" date="2026-11-05">
+      <description>
+        <p>Annotations saved or exported by SnaPdf now appear correctly in other PDF viewers,
+        password-protected PDFs open after a prompt, and printing includes annotations.</p>
+        <p>Every dialog shares one centred style, the toolbar uses one consistent icon set, the
+        project tree aligns files under their folders, secondary text is easier to read, and the
+        Study chat has a clearer conversation switcher and a smaller default text size.</p>
+        <p>In-app updates show download progress, can be cancelled, and no longer give up on slow
+        connections. New shortcuts: Page Up/Down, Home/End, Ctrl+0 (fit width), and Ctrl+G
+        (go to page).</p>
+      </description>
+    </release>
     <release version="0.4.4" date="2026-11-04">
       <description>
         <p>New app icon: a colourful camera shutter with a page at its centre.</p>

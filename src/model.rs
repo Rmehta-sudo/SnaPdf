@@ -181,7 +181,7 @@ fn default_sidebar_scale_ratio() -> f32 {
 }
 
 fn default_chat_font_size() -> f32 {
-    16.0
+    14.0
 }
 
 impl Project {
@@ -496,7 +496,7 @@ mod tests {
         assert!((state.ui_scale - DEFAULT_UI_SCALE).abs() < f32::EPSILON);
         assert!((state.chrome_scale_ratio - DEFAULT_CHROME_SCALE_RATIO).abs() < f32::EPSILON);
         assert!((state.sidebar_scale_ratio - DEFAULT_SIDEBAR_SCALE_RATIO).abs() < f32::EPSILON);
-        assert!((state.chat_font_size - 16.0).abs() < f32::EPSILON);
+        assert!((state.chat_font_size - 14.0).abs() < f32::EPSILON);
         assert_eq!(state.chat_reasoning_effort, ReasoningEffort::Medium);
         assert_eq!(state.sidebar_file_icons, SidebarFileIcons::None);
     }
