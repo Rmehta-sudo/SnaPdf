@@ -6,7 +6,7 @@ use crate::instance::{self, LaunchTarget};
 use crate::model::{
     Annotation, AnnotationKind, AppState, DEFAULT_CHROME_SCALE_RATIO, DEFAULT_SIDEBAR_SCALE_RATIO,
     DEFAULT_UI_SCALE, PathBarStyle, RecentDocument, SidebarFileIcons, StudyChatSession,
-    is_discoverable_pdf, is_pdf,
+    ThemeChoice, is_discoverable_pdf, is_pdf,
 };
 use crate::ocr::{OcrCommand, OcrEvent, OcrWorker};
 use crate::pdf::{
@@ -651,10 +651,10 @@ impl SnaPdfApp {
         instance: Option<(crossbeam_channel::Receiver<Vec<LaunchTarget>>, PathBuf)>,
     ) -> Self {
         install_unicode_fallback_fonts(&creation.egui_ctx);
-        theme::apply(&creation.egui_ctx);
         let mut state = storage::load();
         state.prune_missing();
         state.normalize_recents();
+        theme::apply(&creation.egui_ctx, theme_style(&state, &creation.egui_ctx));
         let mut launch_pdfs = Vec::new();
         for target in launch_targets {
             match target {
@@ -869,11 +869,11 @@ impl SnaPdfApp {
             UpdateStatus::Checking | UpdateStatus::Installing(_)
         );
         let (status, color) = match &self.update_status {
-            UpdateStatus::Checking => ("Checking for updates…".to_owned(), theme::MUTED),
-            UpdateStatus::UpToDate => ("You're on the latest release.".to_owned(), SETTINGS_OK),
+            UpdateStatus::Checking => ("Checking for updates…".to_owned(), theme::muted()),
+            UpdateStatus::UpToDate => ("You're on the latest release.".to_owned(), settings_ok()),
             UpdateStatus::Available(release) => (
                 format!("Version {} is available.", release.version),
-                Color32::from_rgb(255, 196, 92),
+                theme::warning_text(),
             ),
             UpdateStatus::Installing(release) => {
                 let (done, total) = self.update_worker.progress.bytes();
@@ -890,13 +890,12 @@ impl SnaPdfApp {
                 };
                 (
                     format!("Downloading version {}: {detail}", release.version),
-                    theme::MUTED,
+                    theme::muted(),
                 )
             }
-            UpdateStatus::Failed(error) => (
-                format!("Couldn't update: {error}"),
-                Color32::from_rgb(235, 120, 110),
-            ),
+            UpdateStatus::Failed(error) => {
+                (format!("Couldn't update: {error}"), theme::error_text())
+            }
         };
         let mut start_update = false;
         let mut check = false;
@@ -908,7 +907,7 @@ impl SnaPdfApp {
                         RichText::new(format!("SnaPdf {}", update::CURRENT_VERSION))
                             .size(15.0)
                             .strong()
-                            .color(Color32::from_rgb(236, 236, 236)),
+                            .color(theme::ui_rgb(236, 236, 236)),
                     );
                     ui.horizontal(|ui| {
                         if busy {
@@ -928,9 +927,9 @@ impl SnaPdfApp {
                             if ui
                                 .add(
                                     egui::Button::new(
-                                        RichText::new("Update and restart").color(Color32::BLACK),
+                                        RichText::new("Update and restart").color(theme::ON_ACCENT),
                                     )
-                                    .fill(SETTINGS_ACCENT),
+                                    .fill(settings_accent()),
                                 )
                                 .clicked()
                             {
@@ -957,7 +956,7 @@ impl SnaPdfApp {
                         "This copy wasn't installed as the portable AppImage, so update it the way you installed it.",
                     )
                     .size(11.5)
-                    .color(theme::MUTED),
+                    .color(theme::muted()),
                 );
             }
         });
@@ -1010,7 +1009,7 @@ impl SnaPdfApp {
                     ui.label(
                         RichText::new("That password didn't work. Try again.")
                             .size(12.5)
-                            .color(Color32::from_rgb(235, 120, 110)),
+                            .color(theme::error_text()),
                     );
                 }
                 submit = response.lost_focus() && ui.input(|input| input.key_pressed(Key::Enter));
@@ -2721,8 +2720,8 @@ impl SnaPdfApp {
             .max_size(f32::INFINITY)
             .frame(
                 Frame::new()
-                    .fill(theme::SIDEBAR_BG)
-                    .stroke(Stroke::new(1.0, Color32::from_rgb(48, 48, 48)))
+                    .fill(theme::sidebar_bg())
+                    .stroke(Stroke::new(1.0, theme::ui_rgb(48, 48, 48)))
                     .inner_margin(Margin::same(10)),
             )
             .show(root, |ui| {
@@ -2877,7 +2876,7 @@ impl SnaPdfApp {
                             if !self.state.pinned_folders.is_empty()
                                 || !self.state.pinned_files.is_empty()
                             {
-                                sidebar_section_header(ui, "PINNED", "", theme::MUTED);
+                                sidebar_section_header(ui, "PINNED", "", theme::muted());
                                 for folder in self.state.pinned_folders.clone() {
                                     if let Some(index) = self
                                         .state
@@ -3095,7 +3094,7 @@ impl SnaPdfApp {
                                     !self.state.pinned_folders.contains(&project.root)
                                 });
                             if has_unpinned_projects || self.state.projects.is_empty() {
-                                sidebar_section_header(ui, "PROJECTS", "", theme::MUTED);
+                                sidebar_section_header(ui, "PROJECTS", "", theme::muted());
                             }
                             if self.state.projects.is_empty() {
                                 ui.add_space(6.0);
@@ -3103,7 +3102,7 @@ impl SnaPdfApp {
                                     RichText::new(
                                         "Add a course or research folder to browse its PDFs.",
                                     )
-                                    .color(theme::MUTED)
+                                    .color(theme::muted())
                                     .size(13.0 * explorer_factor),
                                 );
                                 ui.add_space(6.0);
@@ -3114,7 +3113,7 @@ impl SnaPdfApp {
                                                 .size(13.5 * explorer_factor)
                                                 .color(theme::ON_ACCENT),
                                         )
-                                        .fill(theme::ACCENT_BLUE)
+                                        .fill(theme::accent_blue())
                                         .corner_radius(CornerRadius::same(7)),
                                     )
                                     .clicked()
@@ -3393,14 +3392,14 @@ impl SnaPdfApp {
         ui.label(RichText::new(title).size(13.0 * scale).strong());
         ui.add_space(3.0);
         if self.current_path.is_none() {
-            ui.label(RichText::new("Open a PDF to view its sections.").color(theme::MUTED));
+            ui.label(RichText::new("Open a PDF to view its sections.").color(theme::muted()));
             return;
         }
         if self.outline.is_empty() {
             ui.label(
                 RichText::new("This PDF does not contain a bookmark outline.")
                     .size(12.5 * scale)
-                    .color(theme::MUTED),
+                    .color(theme::muted()),
             );
             return;
         }
@@ -3408,7 +3407,7 @@ impl SnaPdfApp {
             ui.label(
                 RichText::new(format!("{} navigable sections", self.outline.len()))
                     .size(11.0 * scale)
-                    .color(theme::MUTED),
+                    .color(theme::muted()),
             );
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 let all_collapsed = self
@@ -3478,13 +3477,13 @@ impl SnaPdfApp {
                         ui.painter().rect_filled(
                             rect,
                             CornerRadius::same(6),
-                            Color32::from_rgb(31, 34, 41),
+                            theme::ui_rgb(31, 34, 41),
                         );
                     }
                     let color = if item.target.is_some() {
-                        Color32::from_rgb(218, 220, 226)
+                        theme::ui_rgb(218, 220, 226)
                     } else {
-                        theme::MUTED
+                        theme::muted()
                     };
                     let max_chars = ((rect.width() - indent - 42.0) / 6.9).max(6.0) as usize;
                     if has_children {
@@ -3503,7 +3502,7 @@ impl SnaPdfApp {
                             ]
                         };
                         ui.painter()
-                            .add(egui::Shape::line(points, Stroke::new(1.25, theme::MUTED)));
+                            .add(egui::Shape::line(points, Stroke::new(1.25, theme::muted())));
                     }
                     ui.painter().text(
                         pos2(rect.left() + 22.0 + indent, rect.center().y),
@@ -3518,7 +3517,7 @@ impl SnaPdfApp {
                             Align2::RIGHT_CENTER,
                             (page + 1).to_string(),
                             FontId::proportional(10.5),
-                            theme::MUTED,
+                            theme::muted(),
                         );
                     }
                     response.clone().on_hover_text(&item.title);
@@ -3570,10 +3569,10 @@ impl SnaPdfApp {
         let documents = self.state.open_documents.clone();
         let mut activate = None;
         let mut close = None;
-        let tab_height = 32.0 * scale;
-        // Bottom-align so the active tab merges into the address bar and the
-        // strip's buttons sit level with the tab labels.
-        ui.with_layout(Layout::left_to_right(Align::Max), |ui| {
+        let tab_height = 38.0 * scale;
+        // Tabs fill the row height, so their bottoms meet the bar below; the
+        // strip's buttons centre on the tab labels instead of hugging the edge.
+        ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
             ui.spacing_mut().item_spacing.x = 0.0;
             // Edge keeps its tab actions at the far left of the strip; here that
             // slot toggles the project/outline sidebar.
@@ -3615,13 +3614,13 @@ impl SnaPdfApp {
                                 sw: 0,
                                 se: 0,
                             },
-                            theme::TOOLBAR_BG,
+                            theme::toolbar_bg(),
                         );
                     } else if response.hovered() || close_response.hovered() {
                         painter.rect_filled(
                             rect.shrink2(vec2(2.0, 3.0) * scale),
                             CornerRadius::same(6),
-                            Color32::from_rgb(40, 40, 40),
+                            theme::ui_rgb(40, 40, 40),
                         );
                     } else if active_index != Some(index + 1) && index + 1 < documents.len() {
                         painter.line_segment(
@@ -3629,7 +3628,7 @@ impl SnaPdfApp {
                                 pos2(rect.right(), rect.top() + 9.0 * scale),
                                 pos2(rect.right(), rect.bottom() - 9.0 * scale),
                             ],
-                            Stroke::new(1.0, Color32::from_rgb(64, 64, 64)),
+                            Stroke::new(1.0, theme::ui_rgb(64, 64, 64)),
                         );
                     }
                     let text_left = rect.left() + 12.0 * scale;
@@ -3639,9 +3638,9 @@ impl SnaPdfApp {
                         egui::TextFormat {
                             font_id: FontId::proportional(12.5 * scale),
                             color: if active {
-                                Color32::from_rgb(240, 240, 240)
+                                theme::ui_rgb(240, 240, 240)
                             } else {
-                                Color32::from_rgb(170, 170, 170)
+                                theme::ui_rgb(170, 170, 170)
                             },
                             ..Default::default()
                         },
@@ -3663,14 +3662,14 @@ impl SnaPdfApp {
                             painter.circle_filled(
                                 close_rect.center(),
                                 9.0 * scale,
-                                Color32::from_rgb(64, 64, 64),
+                                theme::ui_rgb(64, 64, 64),
                             );
                         }
                         paint_toolbar_icon(
                             painter,
                             close_rect.center(),
                             ToolbarIcon::Close,
-                            Color32::from_rgb(200, 200, 200),
+                            theme::ui_rgb(200, 200, 200),
                         );
                     }
                     if close_response.clicked() || response.middle_clicked() {
@@ -3685,7 +3684,7 @@ impl SnaPdfApp {
                 self.open_file_dialog();
             }
             // Window-level actions live in the strip's right corner, as in Edge.
-            ui.with_layout(Layout::right_to_left(Align::Max), |ui| {
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 if chrome_button(ui, ToolbarIcon::Settings, false, true, "Settings").clicked() {
                     self.pdf_default_application = current_pdf_default_application();
                     self.show_view_settings = true;
@@ -3731,7 +3730,7 @@ impl SnaPdfApp {
                 RichText::new("SEARCH")
                     .size(11.5 * scale)
                     .strong()
-                    .color(theme::MUTED),
+                    .color(theme::muted()),
             );
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 if ui
@@ -3806,7 +3805,7 @@ impl SnaPdfApp {
                     "Results update as you type: current file, open tabs, and the current project.",
                 )
                 .size(12.0 * scale)
-                .color(theme::MUTED),
+                .color(theme::muted()),
             );
             return;
         }
@@ -3826,7 +3825,7 @@ impl SnaPdfApp {
                 ui.label(
                     RichText::new("No matches in the open PDF.")
                         .size(12.0 * scale)
-                        .color(theme::MUTED),
+                        .color(theme::muted()),
                 );
             } else {
                 let matches = self.search_matches.clone();
@@ -3860,13 +3859,13 @@ impl SnaPdfApp {
             ui.label(
                 RichText::new("Searching open tabs...")
                     .size(12.0 * scale)
-                    .color(theme::MUTED),
+                    .color(theme::muted()),
             );
         } else if self.search_tabs_expanded && self.tab_search_matches.is_empty() {
             ui.label(
                 RichText::new("No matches in open tabs.")
                     .size(12.0 * scale)
-                    .color(theme::MUTED),
+                    .color(theme::muted()),
             );
         } else if self.search_tabs_expanded {
             let matches = self.tab_search_matches.clone();
@@ -3914,13 +3913,13 @@ impl SnaPdfApp {
             ui.label(
                 RichText::new("Searching project PDFs...")
                     .size(12.0 * scale)
-                    .color(theme::MUTED),
+                    .color(theme::muted()),
             );
         } else if self.search_project_expanded && self.workspace_search_matches.is_empty() {
             ui.label(
                 RichText::new("No matches in the current project.")
                     .size(12.0 * scale)
-                    .color(theme::MUTED),
+                    .color(theme::muted()),
             );
         } else if self.search_project_expanded {
             let matches = self.workspace_search_matches.clone();
@@ -3957,12 +3956,16 @@ impl SnaPdfApp {
         }
         let toolbar_factor = interface_region_scale(self.state.chrome_scale_ratio);
         egui::Panel::top("tab-strip")
-            .frame(Frame::new().fill(theme::TAB_STRIP_BG).inner_margin(Margin {
-                left: 6,
-                right: 6,
-                top: 5,
-                bottom: 0,
-            }))
+            .frame(
+                Frame::new()
+                    .fill(theme::tab_strip_bg())
+                    .inner_margin(Margin {
+                        left: 6,
+                        right: 6,
+                        top: 6,
+                        bottom: 0,
+                    }),
+            )
             .show(root, |ui| {
                 apply_region_scale(ui, toolbar_factor);
                 self.document_tabs(ui);
@@ -3970,7 +3973,7 @@ impl SnaPdfApp {
 
         if self.state.path_bar == PathBarStyle::Bar {
             egui::Panel::top("address-bar")
-                .frame(Frame::new().fill(theme::TOOLBAR_BG).inner_margin(Margin {
+                .frame(Frame::new().fill(theme::toolbar_bg()).inner_margin(Margin {
                     left: 8,
                     right: 8,
                     top: 5,
@@ -3988,7 +3991,7 @@ impl SnaPdfApp {
         egui::Panel::top("toolbar")
             .frame(
                 Frame::new()
-                    .fill(theme::TOOLBAR_BG)
+                    .fill(theme::toolbar_bg())
                     .inner_margin(Margin::symmetric(8, 1)),
             )
             .show(root, |ui| {
@@ -4067,7 +4070,7 @@ impl SnaPdfApp {
                 }
                 ui.add_space(4.0 * scale);
                 Frame::new()
-                    .fill(theme::ADDRESS_BG)
+                    .fill(theme::address_bg())
                     .corner_radius(CornerRadius::same(15))
                     .inner_margin(Margin::symmetric(6, 0))
                     .show(ui, |ui| {
@@ -4086,7 +4089,11 @@ impl SnaPdfApp {
                             {
                                 self.open_current_directory();
                             }
-                            ui.label(RichText::new("File").size(12.5 * scale).color(theme::MUTED));
+                            ui.label(
+                                RichText::new("File")
+                                    .size(12.5 * scale)
+                                    .color(theme::muted()),
+                            );
                             toolbar_divider(ui);
                             ScrollArea::horizontal()
                                 .id_salt("path-actions-scroll")
@@ -4149,7 +4156,7 @@ impl SnaPdfApp {
         let font = FontId::proportional(12.5 * scale);
         let text_width = ui
             .painter()
-            .layout_no_wrap(label.clone(), font.clone(), theme::MUTED)
+            .layout_no_wrap(label.clone(), font.clone(), theme::muted())
             .size()
             .x
             .min(190.0 * scale);
@@ -4161,13 +4168,13 @@ impl SnaPdfApp {
             ui.painter().rect_filled(
                 rect.shrink(1.0),
                 CornerRadius::same(6),
-                Color32::from_rgb(54, 54, 54),
+                theme::ui_rgb(54, 54, 54),
             );
         }
         let color = if hovered {
-            Color32::from_rgb(235, 235, 235)
+            theme::ui_rgb(235, 235, 235)
         } else {
-            Color32::from_rgb(200, 200, 200)
+            theme::ui_rgb(200, 200, 200)
         };
         paint_folder_icon(
             ui.painter(),
@@ -4301,7 +4308,7 @@ impl SnaPdfApp {
         ui.label(
             RichText::new(format!("of {}", self.page_sizes.len()))
                 .size(13.0 * scale)
-                .color(theme::MUTED),
+                .color(theme::muted()),
         );
     }
 
@@ -4771,8 +4778,8 @@ impl SnaPdfApp {
             .max_size(f32::INFINITY)
             .frame(
                 Frame::new()
-                    .fill(CHAT_CANVAS)
-                    .stroke(Stroke::new(1.0, CHAT_DIVIDER))
+                    .fill(chat_canvas())
+                    .stroke(Stroke::new(1.0, chat_divider()))
                     .inner_margin(Margin::ZERO),
             )
             .show(root, |ui| {
@@ -4782,7 +4789,7 @@ impl SnaPdfApp {
                     let provider = self.study_chat.provider;
 
                     Frame::new()
-                        .fill(CHAT_HEADER)
+                        .fill(chat_header())
                         .inner_margin(Margin::symmetric(16, 11))
                         .show(ui, |ui| {
                             let mut begin_rename = false;
@@ -4845,7 +4852,7 @@ impl SnaPdfApp {
                                             egui::Label::new(
                                                 RichText::new(&account_name)
                                                     .size(chat_meta_text_size(chat_font_size))
-                                                    .color(CHAT_MUTED),
+                                                    .color(chat_muted()),
                                             )
                                             .wrap(),
                                         );
@@ -5033,7 +5040,7 @@ impl SnaPdfApp {
                     ui.painter().hline(
                         divider.x_range(),
                         divider.bottom(),
-                        Stroke::new(1.0, CHAT_DIVIDER),
+                        Stroke::new(1.0, chat_divider()),
                     );
 
                     let connected = self
@@ -5116,7 +5123,7 @@ impl SnaPdfApp {
                     }
 
                     Frame::new()
-                        .fill(CHAT_CANVAS)
+                        .fill(chat_canvas())
                         .inner_margin(Margin::symmetric(16, 12))
                         .show(ui, |ui| {
                             let mut remove = None;
@@ -5128,8 +5135,8 @@ impl SnaPdfApp {
                                         ui.horizontal(|ui| {
                                             for (index, attachment) in self.study_chat.attachments.iter().enumerate() {
                                                 Frame::new()
-                                                    .fill(CHAT_FIELD)
-                                                    .stroke(Stroke::new(1.0, Color32::from_rgb(64, 64, 64)))
+                                                    .fill(chat_field())
+                                                    .stroke(Stroke::new(1.0, theme::ui_rgb(64, 64, 64)))
                                                     .corner_radius(CornerRadius::same(10))
                                                     .inner_margin(Margin::symmetric(8, 5))
                                                     .show(ui, |ui| {
@@ -5141,7 +5148,7 @@ impl SnaPdfApp {
                                                                     elide(&attachment.name, 20)
                                                                 ))
                                                                 .size(chat_meta_text_size(chat_font_size))
-                                                                .color(Color32::from_rgb(218, 218, 218)),
+                                                                .color(theme::ui_rgb(218, 218, 218)),
                                                             );
                                                             if ui.add(egui::Button::new("×").frame(false)).clicked() {
                                                                 remove = Some(index);
@@ -5159,8 +5166,8 @@ impl SnaPdfApp {
 
                             let mut send_with_enter = false;
                             Frame::new()
-                                .fill(CHAT_FIELD)
-                                .stroke(Stroke::new(1.0, Color32::from_rgb(64, 64, 64)))
+                                .fill(chat_field())
+                                .stroke(Stroke::new(1.0, theme::ui_rgb(64, 64, 64)))
                                 .corner_radius(CornerRadius::same(22))
                                 .inner_margin(Margin::symmetric(12, 9))
                                 .show(ui, |ui| {
@@ -5268,7 +5275,7 @@ impl SnaPdfApp {
         egui::CentralPanel::default()
             .frame(
                 Frame::new()
-                    .fill(theme::CANVAS_BG)
+                    .fill(theme::canvas_bg())
                     .inner_margin(Margin::ZERO),
             )
             .show(root, |ui| {
@@ -6082,7 +6089,7 @@ impl SnaPdfApp {
             .show(ctx, |ui| {
                 Frame::new()
                     .fill(Color32::from_rgba_unmultiplied(29, 29, 29, 232))
-                    .stroke(Stroke::new(1.0, Color32::from_rgb(70, 70, 70)))
+                    .stroke(Stroke::new(1.0, theme::ui_rgb(70, 70, 70)))
                     .corner_radius(CornerRadius::same(7))
                     .inner_margin(Margin::same(2))
                     .show(ui, |ui| {
@@ -6131,7 +6138,7 @@ impl SnaPdfApp {
         let mut close = false;
         let mut open_system_folder = false;
         Frame::new()
-            .fill(theme::CANVAS_BG)
+            .fill(theme::canvas_bg())
             .inner_margin(Margin::symmetric(18, 16))
             .show(ui, |ui| {
                 ui.horizontal(|ui| {
@@ -6144,7 +6151,7 @@ impl SnaPdfApp {
                                 pdf_total
                             ))
                             .size(12.0)
-                            .color(theme::MUTED),
+                            .color(theme::muted()),
                         );
                     });
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
@@ -6163,8 +6170,8 @@ impl SnaPdfApp {
                 });
                 ui.add_space(12.0);
                 Frame::new()
-                    .fill(Color32::from_rgb(26, 26, 26))
-                    .stroke(Stroke::new(1.0, Color32::from_rgb(52, 52, 52)))
+                    .fill(theme::ui_rgb(26, 26, 26))
+                    .stroke(Stroke::new(1.0, theme::ui_rgb(52, 52, 52)))
                     .corner_radius(CornerRadius::same(5))
                     .inner_margin(Margin::ZERO)
                     .show(ui, |ui| {
@@ -6173,7 +6180,7 @@ impl SnaPdfApp {
                         ui.painter().rect_filled(
                             header,
                             CornerRadius::same(5),
-                            Color32::from_rgb(34, 34, 34),
+                            theme::ui_rgb(34, 34, 34),
                         );
                         let location_x = header.left() + header.width() * 0.62;
                         ui.painter().text(
@@ -6181,14 +6188,14 @@ impl SnaPdfApp {
                             Align2::LEFT_CENTER,
                             "Name",
                             FontId::proportional(11.0),
-                            theme::MUTED,
+                            theme::muted(),
                         );
                         ui.painter().text(
                             pos2(location_x, header.center().y),
                             Align2::LEFT_CENTER,
                             "Location / count",
                             FontId::proportional(11.0),
-                            theme::MUTED,
+                            theme::muted(),
                         );
                         ScrollArea::vertical()
                             .id_salt("folder-browser")
@@ -6199,14 +6206,14 @@ impl SnaPdfApp {
                                         ui.spinner();
                                         ui.label(
                                             RichText::new("Scanning all nested folders...")
-                                                .color(theme::MUTED),
+                                                .color(theme::muted()),
                                         );
                                     });
                                     ui.add_space(8.0);
                                 } else if entries.is_empty() {
                                     ui.label(
                                         RichText::new("No PDF files were found here.")
-                                            .color(theme::MUTED),
+                                            .color(theme::muted()),
                                     );
                                 }
                                 for entry in entries {
@@ -6216,27 +6223,32 @@ impl SnaPdfApp {
                                     );
                                     ui.painter().line_segment(
                                         [rect.left_bottom(), rect.right_bottom()],
-                                        Stroke::new(1.0, Color32::from_rgb(42, 42, 42)),
+                                        Stroke::new(1.0, theme::ui_rgb(42, 42, 42)),
                                     );
                                     if response.hovered() {
                                         ui.painter().rect_filled(
                                             rect,
                                             0.0,
-                                            Color32::from_rgb(43, 43, 43),
+                                            theme::ui_rgb(43, 43, 43),
                                         );
                                     }
                                     let center = pos2(rect.left() + 15.0, rect.center().y);
                                     if entry.is_directory {
-                                        paint_folder_icon(ui.painter(), center, theme::MUTED, 1.0);
+                                        paint_folder_icon(
+                                            ui.painter(),
+                                            center,
+                                            theme::muted(),
+                                            1.0,
+                                        );
                                     } else {
-                                        paint_file_icon(ui.painter(), center, theme::MUTED, 1.0);
+                                        paint_file_icon(ui.painter(), center, theme::muted(), 1.0);
                                     }
                                     ui.painter().text(
                                         pos2(rect.left() + 34.0, rect.center().y),
                                         Align2::LEFT_CENTER,
                                         file_name(&entry.path),
                                         FontId::proportional(13.0),
-                                        Color32::from_rgb(214, 214, 214),
+                                        theme::ui_rgb(214, 214, 214),
                                     );
                                     let detail = if entry.is_directory {
                                         format!("{} PDFs", entry.pdf_count)
@@ -6253,7 +6265,7 @@ impl SnaPdfApp {
                                         Align2::LEFT_CENTER,
                                         elide(&detail, 44),
                                         FontId::proportional(11.5),
-                                        theme::MUTED,
+                                        theme::muted(),
                                     );
                                     if response.clicked() {
                                         if entry.is_directory {
@@ -6551,6 +6563,7 @@ impl SnaPdfApp {
         let mut chat_font_size = self.state.chat_font_size;
         let mut file_icons = self.state.sidebar_file_icons;
         let mut path_bar = self.state.path_bar;
+        let mut theme_choice = self.state.theme;
         let mut changed = false;
         let mut set_default_pdf_viewer = false;
         let mut close = false;
@@ -6565,8 +6578,8 @@ impl SnaPdfApp {
             .backdrop_color(Color32::from_black_alpha(130))
             .frame(
                 Frame::new()
-                    .fill(SETTINGS_BG)
-                    .stroke(Stroke::new(1.0, Color32::from_rgb(58, 58, 58)))
+                    .fill(settings_bg())
+                    .stroke(Stroke::new(1.0, theme::ui_rgb(58, 58, 58)))
                     .corner_radius(CornerRadius::same(12))
                     .shadow(egui::Shadow {
                         offset: [0, 10],
@@ -6589,7 +6602,7 @@ impl SnaPdfApp {
                         sw: 12,
                         se: 0,
                     },
-                    SETTINGS_NAV_BG,
+                    settings_nav_bg(),
                 );
                 // Category navigation.
                 ui.scope_builder(
@@ -6603,7 +6616,7 @@ impl SnaPdfApp {
                                 RichText::new("Settings")
                                     .size(19.0)
                                     .strong()
-                                    .color(Color32::from_rgb(240, 240, 240)),
+                                    .color(theme::ui_rgb(240, 240, 240)),
                             );
                         });
                         ui.add_space(14.0);
@@ -6635,7 +6648,7 @@ impl SnaPdfApp {
                                 RichText::new(self.settings_page.label())
                                     .size(17.0)
                                     .strong()
-                                    .color(Color32::from_rgb(240, 240, 240)),
+                                    .color(theme::ui_rgb(240, 240, 240)),
                             );
                             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                                 if chrome_button(ui, ToolbarIcon::Close, false, true, "Close (Esc)")
@@ -6678,7 +6691,7 @@ impl SnaPdfApp {
                                         if is_default {
                                             ui.label(
                                                 RichText::new("✓ Default")
-                                                    .color(SETTINGS_OK),
+                                                    .color(settings_ok()),
                                             );
                                         } else if ui
                                             .button("Make default")
@@ -6691,6 +6704,24 @@ impl SnaPdfApp {
                             });
                         }
                         SettingsPage::Appearance => {
+                            settings_card(ui, |ui| {
+                                settings_row(
+                                    ui,
+                                    "Theme",
+                                    "Light suits reading; Match system follows your desktop.",
+                                    |ui| {
+                                        changed |= settings_segmented(
+                                            ui,
+                                            &mut theme_choice,
+                                            &[
+                                                (ThemeChoice::Light, "Light"),
+                                                (ThemeChoice::Dark, "Dark"),
+                                                (ThemeChoice::System, "Match system"),
+                                            ],
+                                        );
+                                    },
+                                );
+                            });
                             settings_card(ui, |ui| {
                                 settings_card_title(
                                     ui,
@@ -6875,6 +6906,7 @@ impl SnaPdfApp {
             self.state.chat_font_size = chat_font_size;
             self.state.sidebar_file_icons = file_icons;
             self.state.path_bar = path_bar;
+            self.state.theme = theme_choice;
             self.state.sidebar_file_icons_initialized = true;
             if self.state.hide_study_chat {
                 self.study_chat.visible = false;
@@ -7177,7 +7209,7 @@ impl SnaPdfApp {
                     ui.painter().rect_filled(
                         rect,
                         CornerRadius::same(8),
-                        Color32::from_rgb(48, 48, 48),
+                        theme::ui_rgb(48, 48, 48),
                     );
                 }
                 paint_vscode_pdf_icon(ui.painter(), rect.left_center() + vec2(18.0, 0.0), 1.1);
@@ -7186,18 +7218,14 @@ impl SnaPdfApp {
                     Align2::LEFT_CENTER,
                     &app.name,
                     FontId::proportional(14.0),
-                    Color32::from_rgb(228, 228, 228),
+                    theme::ui_rgb(228, 228, 228),
                 );
                 if response.clicked() {
                     selected = Some(app.clone());
                 }
             }
             if let Some(error) = &self.open_with_error {
-                ui.label(
-                    RichText::new(error)
-                        .size(12.5)
-                        .color(Color32::from_rgb(235, 120, 110)),
-                );
+                ui.label(RichText::new(error).size(12.5).color(theme::error_text()));
             }
         });
         if close {
@@ -7275,7 +7303,7 @@ impl SnaPdfApp {
             |ui| {
                 let action_frame = |ui: &mut egui::Ui, label: &str, shortcut: &str| {
                     let response = Frame::new()
-                        .stroke(Stroke::new(1.0, Color32::from_rgb(58, 58, 58)))
+                        .stroke(Stroke::new(1.0, theme::ui_rgb(58, 58, 58)))
                         .corner_radius(CornerRadius::same(18))
                         .inner_margin(Margin::symmetric(14, 8))
                         .show(ui, |ui| {
@@ -7284,7 +7312,7 @@ impl SnaPdfApp {
                                 ui.label(RichText::new(label).size(14.0));
                                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                                     ui.label(
-                                        RichText::new(shortcut).size(11.5).color(theme::MUTED),
+                                        RichText::new(shortcut).size(11.5).color(theme::muted()),
                                     );
                                 });
                             });
@@ -7323,6 +7351,11 @@ impl SnaPdfApp {
 impl eframe::App for SnaPdfApp {
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.frame_number = self.frame_number.wrapping_add(1);
+        // Follows a Settings change or, with "Match system", the desktop.
+        let style = theme_style(&self.state, ctx);
+        if style != theme::style() {
+            theme::apply(ctx, style);
+        }
         self.receive_instance_handoffs(ctx);
         self.receive_update_events(ctx);
         self.handle_events(ctx);
@@ -7385,16 +7418,16 @@ fn rail_button(ui: &mut egui::Ui, selected: bool, icon: RailIcon) -> Response {
             rect,
             CornerRadius::same(5),
             if selected {
-                Color32::from_rgb(55, 55, 55)
+                theme::ui_rgb(55, 55, 55)
             } else {
-                Color32::from_rgb(39, 39, 39)
+                theme::ui_rgb(39, 39, 39)
             },
         );
     }
     let color = if selected {
-        Color32::from_rgb(224, 224, 224)
+        theme::ui_rgb(224, 224, 224)
     } else {
-        Color32::from_rgb(148, 148, 148)
+        theme::ui_rgb(148, 148, 148)
     };
     let center = rect.center();
     match icon {
@@ -7492,7 +7525,9 @@ fn build_pdf_tree(root: &Path, files: &[PathBuf]) -> PdfTreeNode {
 }
 
 /// Item counts and other sidebar metadata: quieter than names, still legible.
-const SIDEBAR_COUNT: Color32 = Color32::from_rgb(172, 172, 172);
+fn sidebar_count() -> Color32 {
+    theme::ui_rgb(172, 172, 172)
+}
 
 /// Left offset of a project-tree row; shallow steps keep deep files readable.
 fn tree_indent(depth: usize) -> f32 {
@@ -7640,12 +7675,12 @@ fn directory_row(
         ui.painter().rect_filled(
             rect.shrink2(vec2(1.0, 0.0)),
             CornerRadius::same(5),
-            theme::PANEL_BG,
+            theme::panel_bg(),
         );
     }
     let x = rect.left() + indent * scale;
     let y = rect.center().y;
-    let muted = theme::MUTED;
+    let muted = theme::muted();
     let chevron = if expanded {
         [
             pos2(x, y - 2.0 * scale),
@@ -7669,7 +7704,7 @@ fn directory_row(
         Align2::RIGHT_CENTER,
         count.to_string(),
         FontId::proportional(11.5 * scale),
-        SIDEBAR_COUNT,
+        sidebar_count(),
     );
     let label_right = if response.hovered() {
         rect.right() - 34.0 * scale
@@ -7682,7 +7717,7 @@ fn directory_row(
         name,
         label_right - (x + 32.0 * scale),
         FontId::proportional(13.0 * scale),
-        Color32::from_rgb(232, 232, 232),
+        theme::ui_rgb(232, 232, 232),
     );
     let options = sidebar_options_button(ui, rect, &response);
     SidebarRowResponse {
@@ -7710,11 +7745,11 @@ fn project_header(
         painter.rect_filled(
             rect.shrink2(vec2(1.0, 1.0)),
             CornerRadius::same(6),
-            theme::PANEL_BG,
+            theme::panel_bg(),
         );
     }
 
-    let icon_color = theme::MUTED;
+    let icon_color = theme::muted();
     let chevron_x = rect.left() + 8.0 * scale;
     let center_y = rect.center().y;
     let chevron = if expanded {
@@ -7732,7 +7767,7 @@ fn project_header(
     };
     painter.add(egui::Shape::line(
         chevron.to_vec(),
-        Stroke::new(1.5 * scale, theme::MUTED),
+        Stroke::new(1.5 * scale, theme::muted()),
     ));
     paint_folder_icon(
         painter,
@@ -7746,7 +7781,7 @@ fn project_header(
         Align2::RIGHT_CENTER,
         count.to_string(),
         FontId::proportional(12.0 * scale),
-        SIDEBAR_COUNT,
+        sidebar_count(),
     );
     let text_left = rect.left() + 51.0 * scale;
     let truncated = paint_elided_label(
@@ -7755,7 +7790,7 @@ fn project_header(
         name,
         count_rect.left() - 8.0 * scale - text_left,
         FontId::proportional(14.0 * scale),
-        Color32::from_rgb(218, 220, 225),
+        theme::ui_rgb(218, 220, 225),
     );
     let options = sidebar_options_button(ui, rect, &response);
     SidebarRowResponse {
@@ -7785,20 +7820,20 @@ fn nav_row(
         painter.rect_filled(
             rect.shrink2(vec2(1.0, 1.0)),
             CornerRadius::same(8),
-            theme::ACCENT.gamma_multiply(0.42),
+            theme::accent().gamma_multiply(0.42),
         );
     } else if response.hovered() {
         painter.rect_filled(
             rect.shrink2(vec2(1.0, 1.0)),
             CornerRadius::same(8),
-            theme::PANEL_BG,
+            theme::panel_bg(),
         );
     }
 
     let icon_color = if selected {
-        Color32::WHITE
+        theme::strong_text()
     } else {
-        theme::MUTED
+        theme::muted()
     };
     let is_pdf = matches!(icon, NavIcon::Recent | NavIcon::File);
     let show_icon = !is_pdf || file_icons != SidebarFileIcons::None;
@@ -7823,9 +7858,9 @@ fn nav_row(
         rect.right() - reserved - text_left,
         FontId::proportional(13.5 * scale),
         if selected {
-            Color32::WHITE
+            theme::strong_text()
         } else {
-            Color32::from_rgb(194, 196, 200)
+            theme::ui_rgb(194, 196, 200)
         },
     );
     let options = sidebar_options_button(ui, rect, &response);
@@ -7852,7 +7887,7 @@ fn sidebar_options_button(ui: &mut egui::Ui, row_rect: Rect, row: &Response) -> 
         egui::Button::new(
             RichText::new(if visible { "..." } else { "" })
                 .size(14.0 * scale)
-                .color(Color32::from_rgb(205, 208, 219)),
+                .color(theme::ui_rgb(205, 208, 219)),
         )
         .frame(false)
         .corner_radius(CornerRadius::same(6)),
@@ -7873,8 +7908,8 @@ fn sidebar_options_popup(
         .width(172.0)
         .frame(
             Frame::new()
-                .fill(Color32::from_rgb(29, 31, 37))
-                .stroke(Stroke::new(1.0, Color32::from_rgb(61, 64, 75)))
+                .fill(theme::ui_rgb(29, 31, 37))
+                .stroke(Stroke::new(1.0, theme::ui_rgb(61, 64, 75)))
                 .corner_radius(CornerRadius::same(8))
                 .inner_margin(Margin::same(5)),
         )
@@ -7891,8 +7926,8 @@ fn sidebar_options_popup(
         .width(172.0)
         .frame(
             Frame::new()
-                .fill(Color32::from_rgb(29, 31, 37))
-                .stroke(Stroke::new(1.0, Color32::from_rgb(61, 64, 75)))
+                .fill(theme::ui_rgb(29, 31, 37))
+                .stroke(Stroke::new(1.0, theme::ui_rgb(61, 64, 75)))
                 .corner_radius(CornerRadius::same(8))
                 .inner_margin(Margin::same(5)),
         )
@@ -7918,35 +7953,34 @@ fn sidebar_options_contents(
     pinned: bool,
 ) -> Option<SidebarMenuAction> {
     let action = if include_file_actions
-        && popup_menu_row(ui, "Open with...", Color32::from_rgb(225, 227, 234))
+        && popup_menu_row(ui, "Open with...", theme::ui_rgb(225, 227, 234))
     {
         Some(SidebarMenuAction::OpenWith)
     } else if include_file_actions
-        && popup_menu_row(ui, "Open in Files", Color32::from_rgb(225, 227, 234))
+        && popup_menu_row(ui, "Open in Files", theme::ui_rgb(225, 227, 234))
     {
         Some(SidebarMenuAction::OpenInFiles)
     } else if popup_menu_row(
         ui,
         if pinned { "Unpin" } else { "Pin to top" },
-        Color32::from_rgb(225, 227, 234),
+        theme::ui_rgb(225, 227, 234),
     ) {
         Some(if pinned {
             SidebarMenuAction::Unpin
         } else {
             SidebarMenuAction::Pin
         })
-    } else if popup_menu_row(ui, "Rename display name", Color32::from_rgb(225, 227, 234)) {
+    } else if popup_menu_row(ui, "Rename display name", theme::ui_rgb(225, 227, 234)) {
         Some(SidebarMenuAction::Rename)
     } else if can_reset_name
-        && popup_menu_row(ui, "Reset display name", Color32::from_rgb(225, 227, 234))
+        && popup_menu_row(ui, "Reset display name", theme::ui_rgb(225, 227, 234))
     {
         Some(SidebarMenuAction::ResetName)
     } else if let Some(remove_label) = remove_label {
         ui.add_space(3.0);
         ui.separator();
         ui.add_space(3.0);
-        popup_menu_row(ui, remove_label, Color32::from_rgb(238, 126, 132))
-            .then_some(SidebarMenuAction::Remove)
+        popup_menu_row(ui, remove_label, theme::error_text()).then_some(SidebarMenuAction::Remove)
     } else {
         None
     };
@@ -7960,7 +7994,7 @@ fn popup_menu_row(ui: &mut egui::Ui, text: &str, color: Color32) -> bool {
     let (rect, response) = ui.allocate_exact_size(vec2(ui.available_width(), 28.0), Sense::click());
     if response.hovered() {
         ui.painter()
-            .rect_filled(rect, CornerRadius::same(7), Color32::from_rgb(44, 47, 56));
+            .rect_filled(rect, CornerRadius::same(7), theme::ui_rgb(44, 47, 56));
     }
     ui.painter().text(
         pos2(rect.left() + 9.0, rect.center().y),
@@ -8089,14 +8123,14 @@ fn sidebar_section_header(ui: &mut egui::Ui, title: &str, subtitle: &str, accent
         Align2::RIGHT_CENTER,
         subtitle,
         FontId::proportional(11.5 * scale),
-        SIDEBAR_COUNT,
+        sidebar_count(),
     );
     ui.painter().line_segment(
         [
             pos2(rect.left(), rect.bottom()),
             pos2(rect.right(), rect.bottom()),
         ],
-        Stroke::new(1.0, Color32::from_rgb(39, 42, 49)),
+        Stroke::new(1.0, theme::ui_rgb(39, 42, 49)),
     );
     ui.add_space(3.0);
 }
@@ -8110,9 +8144,9 @@ fn search_result_row(ui: &mut egui::Ui, title: &str, excerpt: &str, selected: bo
             rect,
             CornerRadius::same(5),
             if selected {
-                Color32::from_rgb(53, 53, 53)
+                theme::ui_rgb(53, 53, 53)
             } else {
-                Color32::from_rgb(42, 42, 42)
+                theme::ui_rgb(42, 42, 42)
             },
         );
     }
@@ -8121,14 +8155,14 @@ fn search_result_row(ui: &mut egui::Ui, title: &str, excerpt: &str, selected: bo
         Align2::LEFT_TOP,
         title,
         FontId::proportional(11.0 * scale),
-        theme::MUTED,
+        theme::muted(),
     );
     ui.painter().text(
         pos2(rect.left() + 8.0 * scale, rect.top() + 25.0 * scale),
         Align2::LEFT_TOP,
         elide(excerpt, 42),
         FontId::proportional(12.5 * scale),
-        Color32::from_rgb(216, 216, 216),
+        theme::ui_rgb(216, 216, 216),
     );
     response
 }
@@ -8144,7 +8178,7 @@ fn collapsible_section_header(
         ui.allocate_exact_size(vec2(ui.available_width(), 30.0 * scale), Sense::click());
     if response.hovered() {
         ui.painter()
-            .rect_filled(rect, CornerRadius::same(5), Color32::from_rgb(40, 40, 40));
+            .rect_filled(rect, CornerRadius::same(5), theme::ui_rgb(40, 40, 40));
     }
     let x = rect.left() + 7.0;
     let center = rect.center().y;
@@ -8163,21 +8197,21 @@ fn collapsible_section_header(
     };
     ui.painter().add(egui::Shape::line(
         chevron.to_vec(),
-        Stroke::new(1.25, theme::MUTED),
+        Stroke::new(1.25, theme::muted()),
     ));
     ui.painter().text(
         pos2(x + 16.0, center),
         Align2::LEFT_CENTER,
         title,
         FontId::proportional(11.5 * scale),
-        theme::MUTED,
+        theme::muted(),
     );
     ui.painter().text(
         pos2(rect.right() - 6.0, center),
         Align2::RIGHT_CENTER,
         count.to_string(),
         FontId::proportional(10.5 * scale),
-        theme::MUTED,
+        theme::muted(),
     );
     response.on_hover_text(if expanded {
         "Collapse recents"
@@ -8480,8 +8514,8 @@ fn selection_action_bar(
         ))
         .show(ctx, |ui| {
             Frame::new()
-                .fill(Color32::from_rgb(31, 31, 31))
-                .stroke(Stroke::new(1.0, Color32::from_rgb(70, 70, 70)))
+                .fill(theme::ui_rgb(31, 31, 31))
+                .stroke(Stroke::new(1.0, theme::ui_rgb(70, 70, 70)))
                 .corner_radius(CornerRadius::same(7))
                 .inner_margin(Margin::symmetric(5, 4))
                 .show(ui, |ui| {
@@ -8536,8 +8570,8 @@ fn show_comment_card(
         .fixed_pos(anchor + vec2(14.0, 10.0))
         .show(ctx, |ui| {
             Frame::new()
-                .fill(Color32::from_rgb(32, 32, 32))
-                .stroke(Stroke::new(1.0, Color32::from_rgb(72, 72, 72)))
+                .fill(theme::ui_rgb(32, 32, 32))
+                .stroke(Stroke::new(1.0, theme::ui_rgb(72, 72, 72)))
                 .corner_radius(CornerRadius::same(8))
                 .inner_margin(Margin::same(9))
                 .show(ui, |ui| {
@@ -8547,7 +8581,7 @@ fn show_comment_card(
                             RichText::new("Comment")
                                 .size(11.0)
                                 .strong()
-                                .color(theme::MUTED),
+                                .color(theme::muted()),
                         );
                         if pinned {
                             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
@@ -8561,7 +8595,7 @@ fn show_comment_card(
                     ui.label(
                         RichText::new(text)
                             .size(13.0)
-                            .color(Color32::from_rgb(225, 225, 225)),
+                            .color(theme::ui_rgb(225, 225, 225)),
                     );
                 });
         });
@@ -8633,9 +8667,9 @@ fn mini_mode_icon_button(ui: &mut egui::Ui, icon: ModeControlIcon, help: &str) -
     let (rect, response) = ui.allocate_exact_size(vec2(21.0, 21.0), Sense::click());
     if response.hovered() {
         ui.painter()
-            .rect_filled(rect, CornerRadius::same(5), Color32::from_rgb(54, 54, 54));
+            .rect_filled(rect, CornerRadius::same(5), theme::ui_rgb(54, 54, 54));
     }
-    let color = Color32::from_rgb(214, 214, 214);
+    let color = theme::ui_rgb(214, 214, 214);
     let center = rect.center();
     match icon {
         ModeControlIcon::Exit => {
@@ -8667,11 +8701,21 @@ fn mini_mode_icon_button(ui: &mut egui::Ui, icon: ModeControlIcon, help: &str) -
     response.on_hover_text(help)
 }
 
-const SETTINGS_BG: Color32 = Color32::from_rgb(32, 32, 32);
-const SETTINGS_NAV_BG: Color32 = Color32::from_rgb(26, 26, 26);
-const SETTINGS_CARD: Color32 = Color32::from_rgb(42, 42, 42);
-const SETTINGS_OK: Color32 = Color32::from_rgb(120, 200, 140);
-const SETTINGS_ACCENT: Color32 = Color32::from_rgb(120, 180, 255);
+fn settings_bg() -> Color32 {
+    theme::ui_rgb(32, 32, 32)
+}
+fn settings_nav_bg() -> Color32 {
+    theme::ui_rgb(26, 26, 26)
+}
+fn settings_card_fill() -> Color32 {
+    theme::field_bg()
+}
+fn settings_ok() -> Color32 {
+    theme::success_text()
+}
+fn settings_accent() -> Color32 {
+    theme::accent_blue()
+}
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum SettingsPage {
@@ -8697,9 +8741,9 @@ fn settings_nav_item(ui: &mut egui::Ui, label: &str, selected: bool) -> Response
             rect,
             CornerRadius::same(7),
             if selected {
-                Color32::from_rgb(48, 48, 48)
+                theme::ui_rgb(48, 48, 48)
             } else {
-                Color32::from_rgb(38, 38, 38)
+                theme::ui_rgb(38, 38, 38)
             },
         );
     }
@@ -8710,7 +8754,7 @@ fn settings_nav_item(ui: &mut egui::Ui, label: &str, selected: bool) -> Response
                 vec2(3.0, rect.height() - 18.0),
             ),
             CornerRadius::same(2),
-            SETTINGS_ACCENT,
+            settings_accent(),
         );
     }
     ui.painter().text(
@@ -8719,9 +8763,9 @@ fn settings_nav_item(ui: &mut egui::Ui, label: &str, selected: bool) -> Response
         label,
         FontId::proportional(14.0),
         if selected {
-            Color32::from_rgb(245, 245, 245)
+            theme::ui_rgb(245, 245, 245)
         } else {
-            Color32::from_rgb(190, 190, 190)
+            theme::ui_rgb(190, 190, 190)
         },
     );
     response
@@ -8729,7 +8773,7 @@ fn settings_nav_item(ui: &mut egui::Ui, label: &str, selected: bool) -> Response
 
 fn settings_card(ui: &mut egui::Ui, add_contents: impl FnOnce(&mut egui::Ui)) {
     Frame::new()
-        .fill(SETTINGS_CARD)
+        .fill(settings_card_fill())
         .corner_radius(CornerRadius::same(10))
         .inner_margin(Margin::symmetric(16, 12))
         .show(ui, |ui| {
@@ -8744,15 +8788,15 @@ fn settings_card_title(ui: &mut egui::Ui, title: &str, description: &str) {
         RichText::new(title)
             .size(14.0)
             .strong()
-            .color(Color32::from_rgb(236, 236, 236)),
+            .color(theme::ui_rgb(236, 236, 236)),
     );
-    ui.label(RichText::new(description).size(12.0).color(theme::MUTED));
+    ui.label(RichText::new(description).size(12.0).color(theme::muted()));
 }
 
 fn settings_divider(ui: &mut egui::Ui) {
     let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), 1.0), Sense::hover());
     ui.painter()
-        .rect_filled(rect, 0.0, Color32::from_rgb(54, 54, 54));
+        .rect_filled(rect, 0.0, theme::ui_rgb(54, 54, 54));
 }
 
 /// A settings row: title and optional description on the left, its control
@@ -8771,10 +8815,10 @@ fn settings_row(
             ui.label(
                 RichText::new(title)
                     .size(13.5)
-                    .color(Color32::from_rgb(230, 230, 230)),
+                    .color(theme::ui_rgb(230, 230, 230)),
             );
             if !description.is_empty() {
-                ui.label(RichText::new(description).size(11.5).color(theme::MUTED));
+                ui.label(RichText::new(description).size(11.5).color(theme::muted()));
             }
         });
         ui.with_layout(Layout::right_to_left(Align::Center), add_control);
@@ -8795,15 +8839,15 @@ fn settings_slider(
         egui::Label::new(
             RichText::new(format(*value))
                 .size(12.5)
-                .color(Color32::from_rgb(200, 200, 200)),
+                .color(theme::ui_rgb(200, 200, 200)),
         ),
     );
     ui.scope(|ui| {
         let visuals = ui.visuals_mut();
-        visuals.widgets.inactive.bg_fill = Color32::from_rgb(74, 74, 74);
-        visuals.widgets.inactive.fg_stroke.color = Color32::from_rgb(235, 235, 235);
-        visuals.widgets.hovered.fg_stroke.color = Color32::WHITE;
-        visuals.selection.bg_fill = SETTINGS_ACCENT;
+        visuals.widgets.inactive.bg_fill = theme::ui_rgb(74, 74, 74);
+        visuals.widgets.inactive.fg_stroke.color = theme::ui_rgb(235, 235, 235);
+        visuals.widgets.hovered.fg_stroke.color = theme::strong_text();
+        visuals.selection.bg_fill = settings_accent();
         visuals.slider_trailing_fill = true;
         ui.add(
             egui::Slider::new(value, range)
@@ -8822,7 +8866,7 @@ fn toggle_switch(ui: &mut egui::Ui, on: &mut bool) -> Response {
         response.mark_changed();
     }
     let t = ui.ctx().animate_bool_responsive(response.id, *on);
-    let track = Color32::from_rgb(80, 80, 80).lerp_to_gamma(SETTINGS_ACCENT, t);
+    let track = theme::ui_rgb(80, 80, 80).lerp_to_gamma(settings_accent(), t);
     ui.painter()
         .rect_filled(rect, CornerRadius::same(10), track);
     let knob_x = egui::lerp(rect.left() + 10.0..=rect.right() - 10.0, t);
@@ -8830,9 +8874,9 @@ fn toggle_switch(ui: &mut egui::Ui, on: &mut bool) -> Response {
         pos2(knob_x, rect.center().y),
         7.0,
         if *on {
-            Color32::from_rgb(20, 20, 20)
+            theme::ui_rgb(20, 20, 20)
         } else {
-            Color32::from_rgb(220, 220, 220)
+            theme::ui_rgb(220, 220, 220)
         },
     );
     response
@@ -8845,7 +8889,7 @@ fn settings_segmented<T: Copy + PartialEq>(
 ) -> bool {
     let mut changed = false;
     Frame::new()
-        .fill(Color32::from_rgb(30, 30, 30))
+        .fill(theme::ui_rgb(30, 30, 30))
         .corner_radius(CornerRadius::same(8))
         .inner_margin(Margin::same(3))
         .show(ui, |ui| {
@@ -8863,12 +8907,12 @@ fn settings_segmented<T: Copy + PartialEq>(
                     let selected = *value == *option;
                     let response = ui.add(
                         egui::Button::new(RichText::new(*label).size(12.5).color(if selected {
-                            Color32::from_rgb(245, 245, 245)
+                            theme::ui_rgb(245, 245, 245)
                         } else {
-                            Color32::from_rgb(170, 170, 170)
+                            theme::ui_rgb(170, 170, 170)
                         }))
                         .fill(if selected {
-                            Color32::from_rgb(64, 64, 64)
+                            theme::ui_rgb(64, 64, 64)
                         } else {
                             Color32::TRANSPARENT
                         })
@@ -8885,12 +8929,22 @@ fn settings_segmented<T: Copy + PartialEq>(
     changed
 }
 
+/// The palette to show: 0 for dark, otherwise the chosen light style.
+fn theme_style(state: &AppState, ctx: &egui::Context) -> u8 {
+    let light = match state.theme {
+        ThemeChoice::Light => true,
+        ThemeChoice::Dark => false,
+        ThemeChoice::System => ctx.system_theme() != Some(egui::Theme::Dark),
+    };
+    u8::from(light)
+}
+
 /// Shared surface for every dialog: the Settings panel's colour, corners
 /// and shadow.
 fn dialog_frame() -> Frame {
     Frame::new()
-        .fill(SETTINGS_BG)
-        .stroke(Stroke::new(1.0, Color32::from_rgb(58, 58, 58)))
+        .fill(settings_bg())
+        .stroke(Stroke::new(1.0, theme::ui_rgb(58, 58, 58)))
         .corner_radius(CornerRadius::same(12))
         .shadow(egui::Shadow {
             offset: [0, 10],
@@ -8913,7 +8967,7 @@ fn dialog_header(ui: &mut egui::Ui, title: &str) -> bool {
             RichText::new(title)
                 .size(16.0)
                 .strong()
-                .color(Color32::from_rgb(240, 240, 240)),
+                .color(theme::ui_rgb(240, 240, 240)),
         );
         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
             chrome_button(ui, ToolbarIcon::Close, false, true, "Close (Esc)").clicked()
@@ -8987,19 +9041,19 @@ fn dialog_text(ui: &mut egui::Ui, text: impl Into<String>) {
     ui.label(
         RichText::new(text.into())
             .size(13.5)
-            .color(Color32::from_rgb(214, 214, 214)),
+            .color(theme::ui_rgb(214, 214, 214)),
     );
 }
 
 fn dialog_hint(ui: &mut egui::Ui, text: impl Into<String>) {
-    ui.label(RichText::new(text.into()).size(12.0).color(theme::MUTED));
+    ui.label(RichText::new(text.into()).size(12.0).color(theme::muted()));
 }
 
 fn dialog_field_label(ui: &mut egui::Ui, text: &str) {
     ui.label(
         RichText::new(text)
             .size(12.5)
-            .color(Color32::from_rgb(200, 200, 200)),
+            .color(theme::ui_rgb(200, 200, 200)),
     );
 }
 
@@ -9018,7 +9072,7 @@ fn primary_button(ui: &mut egui::Ui, label: &str, enabled: bool) -> Response {
     ui.add_enabled(
         enabled,
         egui::Button::new(RichText::new(label).size(13.5).color(theme::ON_ACCENT))
-            .fill(theme::ACCENT_BLUE)
+            .fill(theme::accent_blue())
             .stroke(Stroke::NONE)
             .corner_radius(CornerRadius::same(8))
             .min_size(vec2(84.0, 32.0)),
@@ -9030,9 +9084,9 @@ fn secondary_button(ui: &mut egui::Ui, label: &str) -> Response {
         egui::Button::new(
             RichText::new(label)
                 .size(13.5)
-                .color(Color32::from_rgb(225, 225, 225)),
+                .color(theme::ui_rgb(225, 225, 225)),
         )
-        .fill(Color32::from_rgb(52, 52, 52))
+        .fill(theme::ui_rgb(52, 52, 52))
         .stroke(Stroke::NONE)
         .corner_radius(CornerRadius::same(8))
         .min_size(vec2(76.0, 32.0)),
@@ -9069,20 +9123,20 @@ fn chrome_button(
             rect.shrink(1.0),
             CornerRadius::same(6),
             if selected {
-                theme::ACCENT_BLUE.gamma_multiply(0.28)
+                theme::accent_blue().gamma_multiply(0.28)
             } else {
-                Color32::from_rgb(54, 54, 54)
+                theme::ui_rgb(54, 54, 54)
             },
         );
     }
     let color = if !enabled {
-        Color32::from_rgb(92, 92, 92)
+        theme::ui_rgb(92, 92, 92)
     } else if selected {
-        theme::ACCENT_BLUE_TEXT
+        theme::accent_blue_text()
     } else if hovered {
-        Color32::from_rgb(240, 240, 240)
+        theme::ui_rgb(240, 240, 240)
     } else {
-        Color32::from_rgb(222, 222, 222)
+        theme::ui_rgb(222, 222, 222)
     };
     paint_toolbar_icon(ui.painter(), rect.center(), icon, color);
     if help.is_empty() {
@@ -9116,14 +9170,14 @@ fn annotation_color_dot(ui: &mut egui::Ui, color: &mut Color32) {
         ui.painter().rect_filled(
             rect.shrink(1.0),
             CornerRadius::same(6),
-            Color32::from_rgb(54, 54, 54),
+            theme::ui_rgb(54, 54, 54),
         );
     }
     ui.painter().circle(
         rect.center(),
         6.5 * scale,
         *color,
-        Stroke::new(1.5, Color32::from_rgb(230, 230, 230)),
+        Stroke::new(1.5, theme::ui_rgb(230, 230, 230)),
     );
     let response = response.on_hover_text("Annotation colour");
     egui::Popup::menu(&response).show(|ui| {
@@ -9142,7 +9196,7 @@ fn annotation_color_dot(ui: &mut egui::Ui, color: &mut Color32) {
                     8.0,
                     preset,
                     if preset == *color {
-                        Stroke::new(2.0, Color32::WHITE)
+                        Stroke::new(2.0, theme::strong_text())
                     } else {
                         Stroke::NONE
                     },
@@ -9166,7 +9220,7 @@ fn toolbar_divider(ui: &mut egui::Ui) {
             pos2(rect.center().x, rect.top() + 7.0 * scale),
             pos2(rect.center().x, rect.bottom() - 7.0 * scale),
         ],
-        Stroke::new(1.0, Color32::from_rgb(70, 70, 70)),
+        Stroke::new(1.0, theme::ui_rgb(70, 70, 70)),
     );
 }
 
@@ -9177,15 +9231,15 @@ fn chat_icon_button(ui: &mut egui::Ui, icon: ToolbarIcon, enabled: bool, help: &
     let (rect, response) = ui.allocate_exact_size(vec2(30.0, 28.0), Sense::click());
     let hovered = enabled && response.hovered();
     let color = if !enabled {
-        Color32::from_rgb(88, 88, 88)
+        theme::ui_rgb(88, 88, 88)
     } else if hovered {
-        Color32::from_rgb(245, 245, 245)
+        theme::ui_rgb(245, 245, 245)
     } else {
-        Color32::from_rgb(196, 196, 196)
+        theme::ui_rgb(196, 196, 196)
     };
     if hovered {
         ui.painter()
-            .rect_filled(rect.shrink(1.0), CornerRadius::same(7), CHAT_HOVER);
+            .rect_filled(rect.shrink(1.0), CornerRadius::same(7), chat_hover());
     }
     paint_toolbar_icon(ui.painter(), rect.center(), icon, color);
     response.on_hover_text(help)
@@ -9211,16 +9265,30 @@ fn bounded_panel_content<R>(
     add_contents(&mut content)
 }
 
-const CHAT_CANVAS: Color32 = theme::SIDEBAR_BG;
-const CHAT_HEADER: Color32 = theme::SIDEBAR_BG;
-const CHAT_DIVIDER: Color32 = Color32::from_rgb(48, 48, 48);
+fn chat_canvas() -> Color32 {
+    theme::sidebar_bg()
+}
+fn chat_header() -> Color32 {
+    theme::sidebar_bg()
+}
+fn chat_divider() -> Color32 {
+    theme::ui_rgb(48, 48, 48)
+}
 /// Raised surfaces inside the chat panel: composer, chips, prompt bubbles.
-const CHAT_FIELD: Color32 = Color32::from_rgb(52, 52, 52);
+fn chat_field() -> Color32 {
+    theme::ui_rgb(52, 52, 52)
+}
 /// Hover highlight for buttons on the panel or inside the composer.
-const CHAT_HOVER: Color32 = Color32::from_rgb(66, 66, 66);
+fn chat_hover() -> Color32 {
+    theme::ui_rgb(66, 66, 66)
+}
 const CHAT_ACCENT: Color32 = Color32::from_rgb(16, 163, 127);
-const CHAT_TEXT: Color32 = Color32::from_rgb(236, 236, 236);
-const CHAT_MUTED: Color32 = Color32::from_rgb(166, 166, 166);
+fn chat_text() -> Color32 {
+    theme::ui_rgb(236, 236, 236)
+}
+fn chat_muted() -> Color32 {
+    theme::ui_rgb(166, 166, 166)
+}
 
 fn chat_control_text_size(base: f32) -> f32 {
     (base * 0.78).clamp(10.5, 22.0)
@@ -9261,7 +9329,7 @@ fn chat_empty_state(ui: &mut egui::Ui, text_size: f32) {
             RichText::new("What are you studying?")
                 .size((text_size + 1.5).clamp(13.0, 30.0))
                 .strong()
-                .color(CHAT_TEXT),
+                .color(chat_text()),
         );
         ui.add_space(4.0);
         ui.add(
@@ -9270,7 +9338,7 @@ fn chat_empty_state(ui: &mut egui::Ui, text_size: f32) {
                     "Ask a question, attach a PDF, or capture a figure without leaving the page.",
                 )
                 .size(chat_control_text_size(text_size))
-                .color(CHAT_MUTED),
+                .color(chat_muted()),
             )
             .wrap()
             .halign(Align::Center),
@@ -9300,7 +9368,7 @@ fn chat_status(ui: &mut egui::Ui, status: &str, busy: bool, text_size: f32) {
             egui::Label::new(
                 RichText::new(status)
                     .size(chat_meta_text_size(text_size))
-                    .color(CHAT_MUTED),
+                    .color(chat_muted()),
             )
             .wrap(),
         );
@@ -9323,7 +9391,7 @@ fn chat_message(ui: &mut egui::Ui, message: &ChatMessage, streaming: bool, text_
                 ui.vertical(|ui| {
                     ui.set_width(bubble_width);
                     Frame::new()
-                        .fill(CHAT_FIELD)
+                        .fill(chat_field())
                         .corner_radius(CornerRadius::same(18))
                         .inner_margin(Margin::symmetric(13, 10))
                         .show(ui, |ui| {
@@ -9357,7 +9425,7 @@ fn chat_message(ui: &mut egui::Ui, message: &ChatMessage, streaming: bool, text_
                             ui.label(
                                 RichText::new("Generating…")
                                     .size(chat_control_text_size(text_size))
-                                    .color(CHAT_MUTED),
+                                    .color(chat_muted()),
                             );
                         });
                     } else {
@@ -9455,7 +9523,7 @@ fn chat_message_attachments(ui: &mut egui::Ui, message: &ChatMessage, text_size:
     ui.horizontal_wrapped(|ui| {
         for attachment in &message.attachments {
             Frame::new()
-                .fill(Color32::from_rgb(57, 57, 57))
+                .fill(theme::ui_rgb(57, 57, 57))
                 .corner_radius(CornerRadius::same(7))
                 .inner_margin(Margin::symmetric(7, 4))
                 .show(ui, |ui| {
@@ -9466,7 +9534,7 @@ fn chat_message_attachments(ui: &mut egui::Ui, message: &ChatMessage, text_size:
                             elide(&attachment.name, 26)
                         ))
                         .size(chat_meta_text_size(text_size))
-                        .color(Color32::from_rgb(207, 207, 207)),
+                        .color(theme::ui_rgb(207, 207, 207)),
                     );
                 });
         }
@@ -9478,10 +9546,10 @@ fn chat_copy_button(ui: &mut egui::Ui, help: &str, text_size: f32) -> Response {
     let (rect, response) = ui.allocate_exact_size(vec2(58.0, 24.0), Sense::click());
     let color = if response.hovered() {
         ui.painter()
-            .rect_filled(rect, CornerRadius::same(7), CHAT_FIELD);
-        CHAT_TEXT
+            .rect_filled(rect, CornerRadius::same(7), chat_field());
+        chat_text()
     } else {
-        CHAT_MUTED
+        chat_muted()
     };
     paint_toolbar_icon(
         ui.painter(),
@@ -9527,7 +9595,7 @@ fn chat_block_copy_button(ui: &mut egui::Ui, block_rect: Rect, text: &str) -> bo
     );
     let (rect, response) = overlay.allocate_exact_size(button_rect.size(), Sense::click());
     let fill = if response.hovered() {
-        Color32::from_rgb(64, 64, 64)
+        theme::ui_rgb(64, 64, 64)
     } else {
         Color32::from_rgba_unmultiplied(48, 48, 48, 230)
     };
@@ -9538,14 +9606,14 @@ fn chat_block_copy_button(ui: &mut egui::Ui, block_rect: Rect, text: &str) -> bo
         overlay.painter(),
         pos2(rect.left() + 9.0, rect.center().y),
         ToolbarIcon::Copy,
-        Color32::from_rgb(205, 205, 205),
+        theme::ui_rgb(205, 205, 205),
     );
     overlay.painter().text(
         pos2(rect.left() + 17.0, rect.center().y),
         Align2::LEFT_CENTER,
         "Copy",
         FontId::proportional(8.5),
-        Color32::from_rgb(210, 210, 210),
+        theme::ui_rgb(210, 210, 210),
     );
     if response.clicked() {
         ui.ctx().copy_text(text.to_owned());
@@ -9568,14 +9636,18 @@ fn chat_send_button(ui: &mut egui::Ui, enabled: bool) -> Response {
             CHAT_ACCENT
         }
     } else {
-        Color32::from_rgb(73, 73, 73)
+        theme::ui_rgb(73, 73, 73)
     };
     ui.painter().circle_filled(rect.center(), 14.0, fill);
     paint_toolbar_icon(
         ui.painter(),
         rect.center(),
         ToolbarIcon::Send,
-        if enabled { Color32::WHITE } else { CHAT_MUTED },
+        if enabled {
+            Color32::WHITE
+        } else {
+            chat_muted()
+        },
     );
     response.on_hover_text("Send message (Enter)")
 }
@@ -9590,14 +9662,14 @@ fn chat_action_button(
     let (rect, response) = ui.allocate_exact_size(vec2(width, 28.0), Sense::click());
     if response.hovered() {
         ui.painter()
-            .rect_filled(rect, CornerRadius::same(14), CHAT_HOVER);
+            .rect_filled(rect, CornerRadius::same(14), chat_hover());
     }
     ui.painter().text(
         rect.center(),
         Align2::CENTER_CENTER,
         label,
         FontId::proportional(chat_control_text_size(text_size)),
-        CHAT_TEXT,
+        chat_text(),
     );
     response.on_hover_text(help)
 }
@@ -9615,9 +9687,9 @@ fn chat_history_button(
         rect,
         CornerRadius::same(8),
         if response.hovered() {
-            CHAT_HOVER
+            chat_hover()
         } else {
-            CHAT_FIELD
+            chat_field()
         },
     );
     let font = FontId::proportional(chat_control_text_size(text_size));
@@ -9625,7 +9697,7 @@ fn chat_history_button(
         ui.painter(),
         label,
         &font,
-        CHAT_TEXT,
+        chat_text(),
         (width - 40.0).max(0.0),
     );
     ui.painter().text(
@@ -9633,7 +9705,7 @@ fn chat_history_button(
         Align2::LEFT_CENTER,
         fitted,
         font,
-        CHAT_TEXT,
+        chat_text(),
     );
     let center = pos2(rect.right() - 11.0, rect.center().y + 1.0);
     ui.painter().add(egui::Shape::convex_polygon(
@@ -9642,7 +9714,7 @@ fn chat_history_button(
             center + vec2(3.5, -2.0),
             center + vec2(0.0, 2.5),
         ],
-        CHAT_MUTED,
+        chat_muted(),
         Stroke::NONE,
     ));
     response.on_hover_text(help)
@@ -9716,12 +9788,12 @@ fn chat_dropdown_button(
             CHAT_ACCENT
         }
     } else if response.hovered() {
-        CHAT_HOVER
+        chat_hover()
     } else {
         Color32::TRANSPARENT
     };
     ui.painter().rect_filled(rect, CornerRadius::same(14), fill);
-    let text_color = if accent { Color32::WHITE } else { CHAT_TEXT };
+    let text_color = if accent { Color32::WHITE } else { chat_text() };
     let font = FontId::proportional(chat_control_text_size(text_size));
     let fitted_label = fitted_chat_control_text(
         ui.painter(),
@@ -9744,7 +9816,7 @@ fn chat_dropdown_button(
             center + vec2(3.5, -2.0),
             center + vec2(0.0, 2.5),
         ],
-        if accent { Color32::WHITE } else { CHAT_MUTED },
+        if accent { Color32::WHITE } else { chat_muted() },
         Stroke::NONE,
     ));
     response.on_hover_text(help)
@@ -9760,21 +9832,21 @@ fn chat_header_provider_button(
     let font = FontId::proportional(font_size);
     let label_width = ui
         .painter()
-        .layout_no_wrap(label.to_owned(), font.clone(), CHAT_TEXT)
+        .layout_no_wrap(label.to_owned(), font.clone(), chat_text())
         .size()
         .x;
     let width = (label_width + 34.0).clamp(92.0, 160.0);
     let (rect, response) = ui.allocate_exact_size(vec2(width, 31.0), Sense::click());
     if response.hovered() {
         ui.painter()
-            .rect_filled(rect, CornerRadius::same(8), CHAT_FIELD);
+            .rect_filled(rect, CornerRadius::same(8), chat_field());
     }
     ui.painter().text(
         pos2(rect.left() + 13.0, rect.center().y),
         Align2::LEFT_CENTER,
         label,
         font,
-        CHAT_TEXT,
+        chat_text(),
     );
     let center = pos2(rect.right() - 13.0, rect.center().y + 1.0);
     ui.painter().add(egui::Shape::convex_polygon(
@@ -9783,7 +9855,7 @@ fn chat_header_provider_button(
             center + vec2(3.5, -2.0),
             center + vec2(0.0, 2.5),
         ],
-        CHAT_MUTED,
+        chat_muted(),
         Stroke::NONE,
     ));
     response.on_hover_text(help)
@@ -9819,8 +9891,8 @@ fn render_chat_markdown(ui: &mut egui::Ui, markdown: &str, base_size: f32) {
                 index += 1;
             }
             let response = Frame::new()
-                .fill(Color32::from_rgb(24, 24, 24))
-                .stroke(Stroke::new(1.0, Color32::from_rgb(60, 60, 60)))
+                .fill(theme::ui_rgb(24, 24, 24))
+                .stroke(Stroke::new(1.0, theme::ui_rgb(60, 60, 60)))
                 .corner_radius(CornerRadius::same(8))
                 .inner_margin(Margin {
                     left: 9,
@@ -9835,7 +9907,7 @@ fn render_chat_markdown(ui: &mut egui::Ui, markdown: &str, base_size: f32) {
                             RichText::new(&code)
                                 .monospace()
                                 .size((base_size - 1.0).max(10.0))
-                                .color(Color32::from_rgb(220, 220, 220)),
+                                .color(theme::ui_rgb(220, 220, 220)),
                         )
                         .wrap()
                         .selectable(true),
@@ -9860,7 +9932,7 @@ fn render_chat_markdown(ui: &mut egui::Ui, markdown: &str, base_size: f32) {
                     2 => base_size + 4.0,
                     _ => base_size + 2.0,
                 },
-                Color32::from_rgb(248, 248, 248),
+                theme::ui_rgb(248, 248, 248),
                 true,
             );
             ui.add_space(3.0);
@@ -9888,14 +9960,14 @@ fn render_chat_markdown(ui: &mut egui::Ui, markdown: &str, base_size: f32) {
                 })
                 .show(ui, |ui| {
                     ui.set_width(ui.available_width().max(1.0));
-                    render_chat_rich_text(ui, &quote_text, base_size, CHAT_TEXT, false);
+                    render_chat_rich_text(ui, &quote_text, base_size, chat_text(), false);
                 });
             ui.painter().line_segment(
                 [
                     quote_response.response.rect.left_top(),
                     quote_response.response.rect.left_bottom(),
                 ],
-                Stroke::new(2.0, Color32::from_rgb(104, 104, 104)),
+                Stroke::new(2.0, theme::ui_rgb(104, 104, 104)),
             );
             let _ = chat_block_copy_button(ui, quote_response.response.rect, &quote_text);
             ui.add_space(4.0);
@@ -9928,7 +10000,7 @@ fn render_chat_markdown(ui: &mut egui::Ui, markdown: &str, base_size: f32) {
                 ui.label(RichText::new("•").size(base_size + 2.0).color(CHAT_ACCENT));
                 ui.vertical(|ui| {
                     ui.set_width(ui.available_width().max(1.0));
-                    render_chat_rich_text(ui, item, base_size, CHAT_TEXT, false);
+                    render_chat_rich_text(ui, item, base_size, chat_text(), false);
                 });
             });
             index += 1;
@@ -9943,7 +10015,7 @@ fn render_chat_markdown(ui: &mut egui::Ui, markdown: &str, base_size: f32) {
                 );
                 ui.vertical(|ui| {
                     ui.set_width(ui.available_width().max(1.0));
-                    render_chat_rich_text(ui, item, base_size, CHAT_TEXT, false);
+                    render_chat_rich_text(ui, item, base_size, chat_text(), false);
                 });
             });
             index += 1;
@@ -9959,7 +10031,7 @@ fn render_chat_markdown(ui: &mut egui::Ui, markdown: &str, base_size: f32) {
             paragraph.push(lines[index].trim());
             index += 1;
         }
-        render_chat_rich_text(ui, &paragraph.join(" "), base_size, CHAT_TEXT, false);
+        render_chat_rich_text(ui, &paragraph.join(" "), base_size, chat_text(), false);
     }
 }
 
@@ -10045,9 +10117,9 @@ fn render_markdown_table(ui: &mut egui::Ui, table: &MarkdownTable, base_size: f3
     let width = (ui.available_width() - 2.0).max(1.0);
     let cell_width = (width / columns as f32).max(42.0);
     Frame::new()
-        .stroke(Stroke::new(1.0, Color32::from_rgb(61, 61, 61)))
+        .stroke(Stroke::new(1.0, theme::ui_rgb(61, 61, 61)))
         .corner_radius(CornerRadius::same(6))
-        .fill(Color32::from_rgb(31, 31, 31))
+        .fill(theme::ui_rgb(31, 31, 31))
         .inner_margin(Margin::ZERO)
         .show(ui, |ui| {
             let mut cells = Vec::new();
@@ -10063,11 +10135,11 @@ fn render_markdown_table(ui: &mut egui::Ui, table: &MarkdownTable, base_size: f3
                         for cell in row {
                             let response = Frame::new()
                                 .fill(if row_index == 0 {
-                                    Color32::from_rgb(39, 39, 39)
+                                    theme::ui_rgb(39, 39, 39)
                                 } else if row_index % 2 == 0 {
-                                    Color32::from_rgb(34, 34, 34)
+                                    theme::ui_rgb(34, 34, 34)
                                 } else {
-                                    Color32::from_rgb(30, 30, 30)
+                                    theme::ui_rgb(30, 30, 30)
                                 })
                                 .inner_margin(Margin::symmetric(8, 6))
                                 .show(ui, |ui| {
@@ -10077,7 +10149,7 @@ fn render_markdown_table(ui: &mut egui::Ui, table: &MarkdownTable, base_size: f3
                                         ui,
                                         cell,
                                         base_size,
-                                        CHAT_TEXT,
+                                        chat_text(),
                                         row_index == 0,
                                     );
                                 })
@@ -10088,7 +10160,7 @@ fn render_markdown_table(ui: &mut egui::Ui, table: &MarkdownTable, base_size: f3
                     }
                 });
 
-            let border = Stroke::new(1.0, Color32::from_rgb(61, 61, 61));
+            let border = Stroke::new(1.0, theme::ui_rgb(61, 61, 61));
             for (row_index, rect) in cells {
                 if rect.right() < grid.response.rect.right() - 0.5 {
                     ui.painter()
@@ -10273,7 +10345,7 @@ fn render_display_math(ui: &mut egui::Ui, formula: &str, base_size: f32) -> Rect
     match strip_boxed(formula) {
         Some(unboxed) => {
             Frame::new()
-                .fill(Color32::from_rgb(38, 52, 47))
+                .fill(theme::ui_rgb(38, 52, 47))
                 .stroke(Stroke::new(1.0, CHAT_ACCENT.gamma_multiply(0.45)))
                 .corner_radius(CornerRadius::same(10))
                 .inner_margin(margin)
@@ -10292,7 +10364,14 @@ fn render_display_math(ui: &mut egui::Ui, formula: &str, base_size: f32) -> Rect
 }
 
 fn render_chat_math(ui: &mut egui::Ui, formula: &str, size: f32, display: bool) {
-    let cache_id = egui::Id::new(("chat-math", formula, (size * 2.0).round() as i32, display));
+    // Math is rasterised in the text colour, so each theme gets its own image.
+    let cache_id = egui::Id::new((
+        "chat-math",
+        formula,
+        (size * 2.0).round() as i32,
+        display,
+        theme::is_light(),
+    ));
     let cached = ui
         .ctx()
         .data_mut(|data| data.get_temp::<CachedChatMath>(cache_id));
@@ -10301,7 +10380,7 @@ fn render_chat_math(ui: &mut egui::Ui, formula: &str, size: f32, display: bool) 
         let mut options = PngOptions::new();
         options.font_size_pt = Dim::from_i64(size.round().max(10.0) as i64);
         options.dpi = Dim::from_i64(144);
-        options.color = LatexColor::rgb(CHAT_TEXT.r(), CHAT_TEXT.g(), CHAT_TEXT.b());
+        options.color = LatexColor::rgb(chat_text().r(), chat_text().g(), chat_text().b());
         options.display = display;
         let png = latex_to_png(formula, font, &options).ok()?;
         let image = image::load_from_memory(&png).ok()?.into_rgba8();
@@ -10336,7 +10415,7 @@ fn render_chat_math(ui: &mut egui::Ui, formula: &str, size: f32, display: bool) 
             RichText::new(formula)
                 .monospace()
                 .size(size)
-                .color(CHAT_TEXT),
+                .color(chat_text()),
         );
     }
 }
@@ -10569,9 +10648,7 @@ fn append_markdown_span(
         rich = rich.italics();
     }
     if code {
-        rich = rich
-            .monospace()
-            .background_color(Color32::from_rgb(55, 55, 55));
+        rich = rich.monospace().background_color(theme::ui_rgb(55, 55, 55));
     }
     if strikethrough {
         rich = rich.strikethrough();
@@ -10641,7 +10718,7 @@ fn paint_toolbar_icon(
         ToolbarIcon::FolderPlus => {
             paint_folder_icon(painter, center + vec2(-1.5, 0.5), color, 0.95);
             let plus = center + vec2(6.5, 5.0);
-            painter.circle_filled(plus, 4.6, theme::SIDEBAR_BG);
+            painter.circle_filled(plus, 4.6, theme::sidebar_bg());
             painter.line_segment([plus - vec2(3.0, 0.0), plus + vec2(3.0, 0.0)], stroke);
             painter.line_segment([plus - vec2(0.0, 3.0), plus + vec2(0.0, 3.0)], stroke);
         }
@@ -10658,7 +10735,7 @@ fn paint_toolbar_icon(
                 stroke,
             ));
             let arrow = center + vec2(6.0, 2.0);
-            painter.circle_filled(arrow, 4.8, theme::SIDEBAR_BG);
+            painter.circle_filled(arrow, 4.8, theme::sidebar_bg());
             painter.line_segment([arrow + vec2(0.0, 3.5), arrow - vec2(0.0, 3.5)], stroke);
             painter.line_segment([arrow - vec2(0.0, 3.5), arrow + vec2(-2.8, -0.8)], stroke);
             painter.line_segment([arrow - vec2(0.0, 3.5), arrow + vec2(2.8, -0.8)], stroke);
@@ -10723,7 +10800,7 @@ fn paint_toolbar_icon(
                 })
                 .collect::<Vec<_>>();
             painter.add(egui::Shape::convex_polygon(teeth, color, Stroke::NONE));
-            painter.circle_filled(center, 4.35, theme::PANEL_BG);
+            painter.circle_filled(center, 4.35, theme::panel_bg());
             painter.circle_stroke(center, 4.35, Stroke::new(1.05, color));
             painter.circle_filled(center, 1.5, color);
         }
@@ -10778,7 +10855,7 @@ fn paint_toolbar_icon(
             painter.add(egui::Shape::convex_polygon(plane, color, Stroke::NONE));
             painter.line_segment(
                 [center + vec2(-3.8, 0.0), center + vec2(1.0, 0.0)],
-                Stroke::new(1.0, theme::PANEL_BG),
+                Stroke::new(1.0, theme::panel_bg()),
             );
         }
         ToolbarIcon::NewChat => {
@@ -11080,7 +11157,7 @@ fn path_breadcrumbs(ui: &mut egui::Ui, path: Option<&Path>) -> Option<Breadcrumb
         ui.label(
             RichText::new("No document open")
                 .size(13.0 * scale)
-                .color(theme::MUTED),
+                .color(theme::muted()),
         );
         return None;
     };
@@ -11101,7 +11178,7 @@ fn path_breadcrumbs(ui: &mut egui::Ui, path: Option<&Path>) -> Option<Breadcrumb
                 egui::Button::new(
                     RichText::new(label)
                         .size(13.0 * scale)
-                        .color(Color32::from_rgb(177, 177, 177)),
+                        .color(theme::ui_rgb(177, 177, 177)),
                 )
                 .frame(false)
                 .corner_radius(CornerRadius::same(4)),
@@ -11122,7 +11199,7 @@ fn path_breadcrumbs(ui: &mut egui::Ui, path: Option<&Path>) -> Option<Breadcrumb
             ui.label(
                 RichText::new("/")
                     .size(13.0 * scale)
-                    .color(Color32::from_rgb(92, 92, 92)),
+                    .color(theme::ui_rgb(92, 92, 92)),
             );
         }
     }
@@ -11382,7 +11459,7 @@ fn paint_annotations(
                     Align2::LEFT_CENTER,
                     elide(&file_name(path), 24),
                     FontId::proportional(11.0),
-                    Color32::from_rgb(38, 38, 42),
+                    theme::ui_rgb(38, 38, 42),
                 );
             }
             _ => {}
@@ -11417,7 +11494,7 @@ fn paint_annotations(
                 painter.circle_filled(
                     pos2(center.x + offset, center.y),
                     1.2,
-                    Color32::from_rgb(38, 38, 42),
+                    theme::ui_rgb(38, 38, 42),
                 );
             }
         }
@@ -11468,8 +11545,8 @@ fn annotation_context_menu(
             .width(184.0)
             .frame(
                 Frame::new()
-                    .fill(Color32::from_rgb(29, 29, 29))
-                    .stroke(Stroke::new(1.0, Color32::from_rgb(65, 65, 65)))
+                    .fill(theme::ui_rgb(29, 29, 29))
+                    .stroke(Stroke::new(1.0, theme::ui_rgb(65, 65, 65)))
                     .corner_radius(CornerRadius::same(7))
                     .inner_margin(Margin::same(5)),
             )
@@ -11483,7 +11560,12 @@ fn annotation_context_menu(
                     AnnotationKind::Stamp { .. } => ("STAMP", "Delete stamp"),
                     AnnotationKind::Attachment { .. } => ("ATTACHMENT", "Delete attachment"),
                 };
-                ui.label(RichText::new(kind).size(10.5).strong().color(theme::MUTED));
+                ui.label(
+                    RichText::new(kind)
+                        .size(10.5)
+                        .strong()
+                        .color(theme::muted()),
+                );
                 ui.add_space(3.0);
                 if matches!(&annotation.kind, AnnotationKind::Highlight { .. }) {
                     let label = if child_comment.is_some() {
@@ -11491,7 +11573,7 @@ fn annotation_context_menu(
                     } else {
                         "Add comment"
                     };
-                    if popup_menu_row(ui, label, Color32::from_rgb(225, 227, 234)) {
+                    if popup_menu_row(ui, label, theme::ui_rgb(225, 227, 234)) {
                         if let Some(comment_id) = child_comment {
                             action = Some(AnnotationContextAction::EditComment(comment_id));
                         } else if let Some(position) = annotation_comment_position(annotation) {
@@ -11505,12 +11587,12 @@ fn annotation_context_menu(
                     }
                 }
                 if matches!(&annotation.kind, AnnotationKind::Note { .. })
-                    && popup_menu_row(ui, "Edit comment", Color32::from_rgb(225, 227, 234))
+                    && popup_menu_row(ui, "Edit comment", theme::ui_rgb(225, 227, 234))
                 {
                     action = Some(AnnotationContextAction::EditComment(annotation.id));
                     ui.close();
                 }
-                if popup_menu_row(ui, delete_label, Color32::from_rgb(238, 126, 132)) {
+                if popup_menu_row(ui, delete_label, theme::error_text()) {
                     action = Some(AnnotationContextAction::Delete(annotation.id));
                     ui.close();
                 }
@@ -12080,7 +12162,7 @@ mod tests {
                 ui,
                 "**Bold** and *italic* with `code` and [a link](https://example.com)",
                 13.0,
-                CHAT_TEXT,
+                chat_text(),
                 false,
             );
             assert_eq!(job.text, "Bold and italic with code and a link");

@@ -47,6 +47,9 @@ pub struct AppState {
     /// Visual treatment for PDF entries in the sidebar.
     #[serde(default)]
     pub sidebar_file_icons: SidebarFileIcons,
+    /// Light, dark, or following the desktop.
+    #[serde(default)]
+    pub theme: ThemeChoice,
     /// Where the open file's folder path is shown.
     #[serde(default)]
     pub path_bar: PathBarStyle,
@@ -88,6 +91,15 @@ pub struct StudyChatSession {
     pub messages: HashMap<ChatProvider, Vec<ChatMessage>>,
     #[serde(default)]
     pub last_opened: u64,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub enum ThemeChoice {
+    /// Reading apps are light; it is the default for every install.
+    #[default]
+    Light,
+    Dark,
+    System,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
@@ -512,6 +524,7 @@ mod tests {
         assert_eq!(state.chat_reasoning_effort, ReasoningEffort::Medium);
         assert_eq!(state.sidebar_file_icons, SidebarFileIcons::None);
         assert_eq!(state.path_bar, PathBarStyle::Bar);
+        assert_eq!(state.theme, ThemeChoice::Light);
     }
 
     #[test]

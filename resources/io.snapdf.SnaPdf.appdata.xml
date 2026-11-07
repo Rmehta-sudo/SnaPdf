@@ -28,6 +28,13 @@
   </provides>
   <content_rating type="oars-1.1"/>
   <releases>
+    <release version="0.4.7" date="2026-11-07">
+      <description>
+        <p>New light theme with soft blue-grey surfaces, now the default. Choose Light, Dark, or
+        Match system in Settings; PDF pages always keep their real colours.</p>
+        <p>The tab strip is taller, with its buttons centred on the tabs.</p>
+      </description>
+    </release>
     <release version="0.4.6" date="2026-11-05">
       <description>
         <p>Choose how the file path is shown: the full path bar under the tabs (default) or a
